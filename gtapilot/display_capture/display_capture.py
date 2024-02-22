@@ -1,4 +1,3 @@
-import cv2 as cv
 import numpy as np
 import dxcam
 
@@ -10,7 +9,6 @@ class DisplayCapture:
 
     def getScreenshot(self):
         frame = self.camera.get_latest_frame()
-        frame = cv.cvtColor(frame, cv.COLOR_RGB2BGR)
 
         return frame
 

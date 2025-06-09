@@ -1,16 +1,17 @@
-import numpy as np
-import dxcam
+import bettercam
+
+from gtapilot.ipc.vision_ipc import VisionIPCPublisher
 
 
-class DisplayCapture:
-    def __init__(self, display=0):
-        self.camera = dxcam.create(output_idx=display)
-        self.camera.start()
+TARGET_FPS = 20
+TARGET_FRAME_TIME = 1 / TARGET_FPS
 
-    def getScreenshot(self):
-        frame = self.camera.get_latest_frame()
 
-        return frame
+def main(display=0):
+    visionIPCPublisher = VisionIPCPublisher()
+    camera = bettercam.create(output_idx=display, output_color="RGB")
+    camera.start(target_fps=TARGET_FPS)
 
-    def __del__(self):
-        self.camera.stop()
+    while True:
+        frame = camera.get_latest_frame()
+        visionIPCPublisher.publish_frame(frame)

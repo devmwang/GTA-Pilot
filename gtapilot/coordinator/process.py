@@ -5,12 +5,12 @@ from setproctitle import setproctitle
 from typing import List
 
 
-def launcher(module, name):
+def launcher(module, name, args):
     module = import_module(module)
 
     setproctitle(name)
 
-    module.main()
+    module.main(**args)
 
 
 class BaseProcess(ABC):
@@ -26,23 +26,24 @@ class BaseProcess(ABC):
         self.start()
 
     def stop(self):
-        if self.process == None:
+        if self.process is None:
             return None
 
         # TODO: Initiate process shutdown and confirm
 
 
 class PythonProcess(BaseProcess):
-    def __init__(self, name, module):
+    def __init__(self, name, module, args=None):
         self.name = name
         self.module = module
+        self.args = args if args is not None else {}
 
     def start(self):
-        if self.process != None:
+        if self.process is not None:
             return None
 
         self.process = Process(
-            name=self.name, target=launcher, args=(self.module, self.name)
+            name=self.name, target=launcher, args=(self.module, self.name, self.args)
         )
         self.process.start()
 
@@ -54,5 +55,5 @@ def startAllProcesses(processes: List[BaseProcess]):
 
 def waitForProcesses(processes: List[BaseProcess]):
     for process in processes:
-        if process.process != None:
+        if process.process is not None:
             process.process.join()

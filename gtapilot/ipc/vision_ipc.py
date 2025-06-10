@@ -5,10 +5,10 @@ import threading
 import collections
 import time
 
-DEFAULT_ZMQ_HOST_PUB = "*"  # Publisher binds to all interfaces
-DEFAULT_ZMQ_HOST_SUB = "127.0.0.1"  # Subscriber connects to localhost by default
-DEFAULT_ZMQ_PORT = 5555
-DEFAULT_ZMQ_TOPIC = b"frames"  # Topic for frame data
+DEFAULT_VIPC_ZMQ_HOST_PUB = "*"  # Publisher binds to all interfaces
+DEFAULT_VIPC_ZMQ_HOST_SUB = "127.0.0.1"  # Subscriber connects to localhost by default
+DEFAULT_VIPC_ZMQ_PORT = 5555
+DEFAULT_VIPC_ZMQ_TOPIC = b"frames"  # Topic for frame data
 
 
 class VisionIPCPublisher:
@@ -17,12 +17,14 @@ class VisionIPCPublisher:
     This acts as the single producer in the system.
     """
 
-    def __init__(self, host=DEFAULT_ZMQ_HOST_PUB, port=DEFAULT_ZMQ_PORT):
+    def __init__(self, host=DEFAULT_VIPC_ZMQ_HOST_PUB, port=DEFAULT_VIPC_ZMQ_PORT):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.bind_addr = f"tcp://{host}:{port}"
         try:
             self.socket.bind(self.bind_addr)
+            # Allow time for connection to establish
+            time.sleep(0.1)
             print(f"VisionIPCPublisher bound to {self.bind_addr}")
         except zmq.error.ZMQError as e:
             print(f"Error binding publisher socket to {self.bind_addr}: {e}")
@@ -30,7 +32,7 @@ class VisionIPCPublisher:
             self.context.term()
             raise
 
-    def publish_frame(self, frame: np.ndarray, topic=DEFAULT_ZMQ_TOPIC):
+    def publish_frame(self, frame: np.ndarray, topic=DEFAULT_VIPC_ZMQ_TOPIC):
         if not isinstance(frame, np.ndarray):
             print("Error: Frame to publish is not a NumPy array.")
             return
@@ -64,9 +66,9 @@ class VisionIPCSubscriber:
 
     def __init__(
         self,
-        host=DEFAULT_ZMQ_HOST_SUB,
-        port=DEFAULT_ZMQ_PORT,
-        topic=DEFAULT_ZMQ_TOPIC,
+        host=DEFAULT_VIPC_ZMQ_HOST_SUB,
+        port=DEFAULT_VIPC_ZMQ_PORT,
+        topic=DEFAULT_VIPC_ZMQ_TOPIC,
         conflate=False,
         buffer_size=10,
         socket_timeout_ms=1000,
@@ -233,33 +235,3 @@ class VisionIPCSubscriber:
             except Exception as e:
                 print(f"Exception during ZMQ context term: {e}")
         print(f"VisionIPCSubscriber for topic '{self._topic_bytes.decode()}' closed.")
-
-
-# class VisionIPC:
-#     def __init__(self, buffer_size=10):
-#         self.buffer_size = buffer_size
-#         self.frames = []
-#         self.lock = threading.Lock()
-#         self.frame_available = threading.Condition(self.lock)
-
-#     def enqueue_frame(self, frame):
-#         with self.lock:
-#             if len(self.frames) >= self.buffer_size:
-#                 self.frames.pop(0)  # Remove the oldest frame
-#             self.frames.append(frame)
-#             self.frame_available.notify()  # Notify any waiting consumers
-
-#     def dequeue_frame(self):
-#         with self.lock:
-#             while not self.frames:
-#                 self.frame_available.wait()  # Wait for a frame to be available
-#             return self.frames.pop(0)  # Return the oldest frame
-
-#     def get_latest_frames(self, count=1):
-#         with self.lock:
-#             return self.frames[-count:]  # Return the latest 'count' frames
-
-# # Example usage:
-# # vision_ipc = VisionIPC()
-# # vision_ipc.enqueue_frame(captured_frame)
-# # latest_frame = vision_ipc.dequeue_frame()

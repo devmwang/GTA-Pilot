@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 DEFAULT_MSG_ZMQ_HOST_PUB = "*"  # Publisher binds to all interfaces
 DEFAULT_MSG_ZMQ_HOST_SUB = "127.0.0.1"  # Subscriber connects to localhost by default
-DEFAULT_MSG_ZMQ_PORT = "5556"
+DEFAULT_MSG_ZMQ_PORT = "55551"
 
 
 class Message:

@@ -7,7 +7,7 @@ import time
 
 DEFAULT_VIPC_ZMQ_HOST_PUB = "127.0.0.1"  # Publisher binds to all interfaces
 DEFAULT_VIPC_ZMQ_HOST_SUB = "127.0.0.1"  # Subscriber connects to localhost by default
-DEFAULT_VIPC_ZMQ_PORT = 5555
+DEFAULT_VIPC_ZMQ_PORT = "55550"
 DEFAULT_VIPC_ZMQ_TOPIC = b"frames"  # Topic for frame data
 
 
@@ -27,6 +27,7 @@ class VisionIPCPublisher:
             # Allow time for connection to establish
             time.sleep(0.1)
             print(f"VisionIPCPublisher bound to {self.bind_addr}")
+
         except zmq.ZMQError as e:
             print(f"Error binding publisher socket to {self.bind_addr}: {e}")
             # Clean up context if bind fails in constructor

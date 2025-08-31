@@ -213,7 +213,7 @@ class VisionIPCSubscriber:
             print("Joining subscriber receive thread...")
             self._receive_thread.join(
                 timeout=(
-                    max(2.0, (self.socket.rcvtimeo / 1000.0) * 2)
+                    max(2.0, (int(self.socket.rcvtimeo) / 1000.0) * 2)
                     if hasattr(self.socket, "rcvtimeo")
                     else 2.0
                 )

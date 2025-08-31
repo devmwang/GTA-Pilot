@@ -1,12 +1,14 @@
 from gtapilot.config import BLACKBOX_ENABLED
 
+from typing import List
 from gtapilot.coordinator.process import (
     startAllProcesses,
     waitForProcesses,
+    BaseProcess,
     PythonProcess,
 )
 
-processes = [
+processes: List[BaseProcess] = [
     PythonProcess(
         "DisplayCapture",
         "gtapilot.display_capture.display_capture",

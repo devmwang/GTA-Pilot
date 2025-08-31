@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 DEFAULT_MSG_ZMQ_HOST_PUB = "*"  # Publisher binds to all interfaces
 DEFAULT_MSG_ZMQ_HOST_SUB = "127.0.0.1"  # Subscriber connects to localhost by default
-DEFAULT_MSG_ZMQ_PORT = 5556
+DEFAULT_MSG_ZMQ_PORT = "5556"
 
 
 class Message:
@@ -35,7 +35,7 @@ class PubMaster:
 
 
 class SubMaster:
-    def __init__(self, ports: Optional[list[int]] = None):
+    def __init__(self, ports: Optional[list[str]] = None):
         if ports is None:
             ports = [DEFAULT_MSG_ZMQ_PORT]
 
@@ -93,7 +93,7 @@ class SubMaster:
 
 
 class MessagingSystem:
-    def __init__(self, pub_port: int = 5556):
+    def __init__(self, pub_port: str = "5556"):
         self.pub_master = PubMaster(pub_port)
         self.sub_master = SubMaster([pub_port])
 

@@ -10,7 +10,13 @@ def launcher(module, name, args):
 
     setproctitle(name)
 
-    module.main(**args)
+    # Resolve main function from imported module and ensure it's callable.
+    main_func = getattr(module, "main", None)
+    if not callable(main_func):
+        raise AttributeError(
+            f"Module '{getattr(module, '__name__', str(module))}' has no callable 'main' attribute"
+        )
+    main_func(**args)
 
 
 class BaseProcess(ABC):

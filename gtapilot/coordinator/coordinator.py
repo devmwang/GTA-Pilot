@@ -1,10 +1,10 @@
+from gtapilot.config import BLACKBOX_ENABLED
+
 from gtapilot.coordinator.process import (
     startAllProcesses,
     waitForProcesses,
     PythonProcess,
 )
-
-# from gtapilot.ipc.vision_ipc import VisionIPC
 
 processes = [
     PythonProcess(
@@ -14,6 +14,9 @@ processes = [
     ),
     PythonProcess("Visualizer", "gtapilot.visualizer.visualizer"),
 ]
+
+if BLACKBOX_ENABLED:
+    processes.append(PythonProcess("Blackbox", "gtapilot.blackbox.blackbox"))
 
 system_processes = {process.name: process for process in processes}
 

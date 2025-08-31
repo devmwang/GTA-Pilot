@@ -5,7 +5,7 @@ import threading
 import collections
 import time
 
-DEFAULT_VIPC_ZMQ_HOST_PUB = "*"  # Publisher binds to all interfaces
+DEFAULT_VIPC_ZMQ_HOST_PUB = "127.0.0.1"  # Publisher binds to all interfaces
 DEFAULT_VIPC_ZMQ_HOST_SUB = "127.0.0.1"  # Subscriber connects to localhost by default
 DEFAULT_VIPC_ZMQ_PORT = 5555
 DEFAULT_VIPC_ZMQ_TOPIC = b"frames"  # Topic for frame data
@@ -21,12 +21,13 @@ class VisionIPCPublisher:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.bind_addr = f"tcp://{host}:{port}"
+
         try:
             self.socket.bind(self.bind_addr)
             # Allow time for connection to establish
             time.sleep(0.1)
             print(f"VisionIPCPublisher bound to {self.bind_addr}")
-        except zmq.error.ZMQError as e:
+        except zmq.ZMQError as e:
             print(f"Error binding publisher socket to {self.bind_addr}: {e}")
             # Clean up context if bind fails in constructor
             self.context.term()
@@ -44,7 +45,7 @@ class VisionIPCPublisher:
 
         try:
             self.socket.send_multipart([topic, metadata_bytes, frame_bytes])
-        except zmq.error.ZMQError as e:
+        except zmq.ZMQError as e:
             print(f"Error sending frame: {e}")
         except Exception as e:
             print(f"Unexpected error publishing frame: {e}")
@@ -97,7 +98,7 @@ class VisionIPCSubscriber:
             print(
                 f"VisionIPCSubscriber connected to {self.connect_addr} on topic '{self._topic_bytes.decode()}'"
             )
-        except zmq.error.ZMQError as e:
+        except zmq.ZMQError as e:
             print(
                 f"Error connecting/subscribing subscriber socket to {self.connect_addr}: {e}"
             )
@@ -143,12 +144,12 @@ class VisionIPCSubscriber:
                         with self._buffer_lock:
                             self._buffer.append(frame)
                             self._frame_available_condition.notify_all()
-            except zmq.error.Again:  # Timeout (RCVTIMEO)
+            except zmq.Again:  # Timeout (RCVTIMEO)
                 continue  # Loop again to check self._running
-            except zmq.error.ContextTerminated:
+            except zmq.ContextTerminated:
                 print("Subscriber context terminated, stopping receive thread.")
                 break
-            except zmq.error.ZMQError as e:
+            except zmq.ZMQError as e:
                 if self._running:  # Only log if not part of a normal shutdown
                     print(f"ZMQError in subscriber receive thread: {e}")
                 break

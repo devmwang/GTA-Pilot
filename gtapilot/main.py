@@ -1,6 +1,6 @@
 from multiprocessing import freeze_support
 
-from coordinator.coordinator import main
+from gtapilot.coordinator.coordinator import main
 
 # Launch coordinator
 if __name__ == "__main__":

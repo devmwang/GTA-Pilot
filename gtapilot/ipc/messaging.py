@@ -35,7 +35,7 @@ class PubMaster:
 
 
 class SubMaster:
-    def __init__(self, ports: list[int] = None):
+    def __init__(self, ports: Optional[list[int]] = None):
         if ports is None:
             ports = [DEFAULT_MSG_ZMQ_PORT]
 

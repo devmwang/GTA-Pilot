@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
-from multiprocessing import Process
 from importlib import import_module
-from setproctitle import setproctitle
+from multiprocessing import Process
 from typing import List
+
+from setproctitle import setproctitle
 
 
 def launcher(module, name, args):
@@ -24,18 +25,22 @@ class BaseProcess(ABC):
     process = None
 
     @abstractmethod
-    def start(self):
+    def start(self, shutdown_event=None):
         pass
 
-    def restart(self):
+    def restart(self, shutdown_event=None):
         self.stop()
-        self.start()
+        self.start(shutdown_event=shutdown_event)
 
     def stop(self):
         if self.process is None:
             return None
 
-        # TODO: Initiate process shutdown and confirm
+        # Actual graceful stop is coordinated via a shared shutdown_event.
+        # This method here is only for a forced terminate fallback.
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=2)
 
 
 class PythonProcess(BaseProcess):
@@ -44,22 +49,16 @@ class PythonProcess(BaseProcess):
         self.module = module
         self.args = args if args is not None else {}
 
-    def start(self):
+    def start(self, shutdown_event=None):
         if self.process is not None:
             return None
 
+        launch_args = dict(self.args)
+        if shutdown_event is not None:
+            # Inject only if the user code accepts it; safe to always include.
+            launch_args["shutdown_event"] = shutdown_event
+
         self.process = Process(
-            name=self.name, target=launcher, args=(self.module, self.name, self.args)
+            name=self.name, target=launcher, args=(self.module, self.name, launch_args)
         )
         self.process.start()
-
-
-def startAllProcesses(processes: List[BaseProcess]):
-    for process in processes:
-        process.start()
-
-
-def waitForProcesses(processes: List[BaseProcess]):
-    for process in processes:
-        if process.process is not None:
-            process.process.join()

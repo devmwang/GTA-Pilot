@@ -3,24 +3,37 @@ import signal
 import sys
 import threading
 from multiprocessing import Event
-from typing import List
+from typing import List, Optional
 
 from gtapilot.config import BLACKBOX_ENABLED
 from gtapilot.coordinator.process import BaseProcess, PythonProcess
 
-processes: List[BaseProcess] = [
-    PythonProcess(
-        "DisplayCapture",
-        "gtapilot.display_capture.display_capture",
-        {"display": 1},
-    ),
-    PythonProcess("Visualizer", "gtapilot.visualizer.visualizer"),
-]
 
-if BLACKBOX_ENABLED:
-    processes.append(PythonProcess("Blackbox", "gtapilot.blackbox.blackbox"))
+def build_processes(video_override: Optional[str] = None) -> List[BaseProcess]:
+    procs: List[BaseProcess] = []
+    if video_override:
+        procs.append(
+            PythonProcess(
+                "DisplayOverride",
+                "gtapilot.display_capture.display_override",
+                {"video_path": video_override},
+            )
+        )
+    else:
+        procs.append(
+            PythonProcess(
+                "DisplayCapture",
+                "gtapilot.display_capture.display_capture",
+                {"display": 1},
+            )
+        )
 
-system_processes = {process.name: process for process in processes}
+    # Visualizer always included for now
+    procs.append(PythonProcess("Visualizer", "gtapilot.visualizer.visualizer"))
+
+    if BLACKBOX_ENABLED:
+        procs.append(PythonProcess("Blackbox", "gtapilot.blackbox.blackbox"))
+    return procs
 
 
 def _esc_listener(shutdown_event):
@@ -40,7 +53,7 @@ def _esc_listener(shutdown_event):
         print("ESC hotkey unsupported on this platform; use Ctrl+C to exit.")
 
 
-def main():
+def main(video_override: Optional[str] = None):
     shutdown_event = Event()
 
     def _signal_handler(signum, frame):
@@ -61,12 +74,19 @@ def main():
     )
     esc_thread.start()
 
-    print("Starting system processes. Press ESC for graceful shutdown (or Ctrl+C).")
+    processes = build_processes(video_override=video_override)
+    system_processes = {process.name: process for process in processes}
 
-    # Start all processes with shutdown event
+    if video_override:
+        print(
+            f"Starting system processes using video override '{video_override}'. Press ESC for graceful shutdown (or Ctrl+C)."
+        )
+    else:
+        print(
+            "Starting system processes with live display capture. Press ESC for graceful shutdown (or Ctrl+C)."
+        )
+
     startAllProcesses(processes, shutdown_event=shutdown_event)
-
-    # Wait until shutdown triggered
     waitForProcesses(processes, shutdown_event=shutdown_event)
 
     print("Coordinator shutdown complete.")

@@ -1,8 +1,32 @@
+import argparse
+import os
 from multiprocessing import freeze_support
 
-from gtapilot.coordinator.coordinator import main
+from gtapilot.coordinator.coordinator import main as coordinator_main
 
-# Launch coordinator
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="GTA Pilot coordinator entrypoint")
+    parser.add_argument(
+        "--video-override",
+        dest="video_override",
+        metavar="PATH",
+        help="Path to a video file (e.g. .mp4). If provided, uses video frames instead of live display capture.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     freeze_support()
-    main()
+
+    args = parse_args()
+    video_override = args.video_override
+
+    if video_override:
+        # Basic validation (do not attempt to open here to keep startup fast)
+        if not os.path.isfile(video_override):
+            raise FileNotFoundError(
+                f"--video-override file not found: {video_override}"
+            )
+
+    coordinator_main(video_override=video_override)

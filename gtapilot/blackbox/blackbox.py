@@ -1,11 +1,11 @@
-import cv2
 import io
 import json
 import tarfile
 import time
 
-from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
+import cv2
 
+from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
 
 SESSION_TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR = "blackbox-recordings"
@@ -14,7 +14,7 @@ TAR_FILEPATH = f"{OUTPUT_DIR}/{OUTPUT_PREFIX}_frames.tar"
 METADATA_FILEPATH = f"{OUTPUT_DIR}/{OUTPUT_PREFIX}_metadata.json"
 
 
-def main():
+def main(shutdown_event=None):
     visionIPCSubscriber = VisionIPCSubscriber()
 
     all_frame_metadata = []  # List to store metadata for all captured frames
@@ -23,6 +23,8 @@ def main():
     try:
         with tarfile.open(TAR_FILEPATH, "w") as tar_out_file:
             while True:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    break
                 frame = visionIPCSubscriber.receive_frame(blocking=True)
 
                 if frame is not None:
@@ -61,6 +63,7 @@ def main():
                         )
 
     finally:
+        visionIPCSubscriber.close()
         if all_frame_metadata:
             # Save metadata to JSON file
             with open(METADATA_FILEPATH, "w") as metadata_file:

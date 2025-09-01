@@ -28,8 +28,8 @@ def build_processes(video_override: Optional[str] = None) -> List[BaseProcess]:
             )
         )
 
-    # Visualizer always included for now
-    procs.append(PythonProcess("Visualizer", "gtapilot.visualizer.visualizer"))
+    # Visualization always included for now
+    procs.append(PythonProcess("Visualization", "gtapilot.visualization.visualization"))
 
     if BLACKBOX_ENABLED:
         procs.append(PythonProcess("Blackbox", "gtapilot.blackbox.blackbox"))

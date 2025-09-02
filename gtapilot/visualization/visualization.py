@@ -5,7 +5,7 @@ import cv2
 from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
 
 
-def main(shutdown_event=None):
+def main():
     visionIPCSubscriber = VisionIPCSubscriber()
 
     fps = 0
@@ -13,8 +13,6 @@ def main(shutdown_event=None):
     fps_start_time = time.time()
 
     while True:
-        if shutdown_event is not None and shutdown_event.is_set():
-            break
         frame = visionIPCSubscriber.receive_frame(blocking=True)
 
         if frame is not None:
@@ -52,8 +50,6 @@ def main(shutdown_event=None):
         if key & 0xFF == ord("q"):
             break
         if key == 27:  # ESC pressed inside window
-            if shutdown_event is not None:
-                shutdown_event.set()
             break
 
     visionIPCSubscriber.close()

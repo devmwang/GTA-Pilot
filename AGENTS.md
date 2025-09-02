@@ -28,13 +28,19 @@ uv run ./gtapilot/main.py
 uv run ./gtapilot/main.py --video-override path/to/video.mp4
 ```
 
-Graceful shutdown signals: ESC key (console listener on Windows via `msvcrt`), ESC / 'q' in OpenCV visualization window, or Ctrl+C (SIGINT). All propagate by setting a shared `multiprocessing.Event` (`shutdown_event`).
+Shutdown triggers (supervisor model):
+
+-   ESC key in coordinator console (Windows via `msvcrt`)
+-   Ctrl+C / SIGINT / SIGTERM to coordinator
+-   Any child process exiting (normal return or crash) — e.g. visualization window ESC/'q' closes that process
+
+After the first trigger the coordinator force-terminates remaining processes. There is no shared `shutdown_event` anymore.
 
 ## 3. Processes & Responsibilities
 
 Coordinator (`gtapilot.coordinator.coordinator.main`):
 
--   Builds list of `PythonProcess` objects (see `gtapilot.coordinator.process`), starts them, monitors shutdown event, joins, force-terminates stragglers.
+-   Builds list of `PythonProcess` objects (see `gtapilot.coordinator.process`), starts them, monitors liveness, and on ANY child exit or external trigger performs a single shutdown cascade (terminate + join timeout) recording root cause.
 
 Workers launched (current set):
 
@@ -65,22 +71,29 @@ Writes BMP frames into a TAR archive plus JSON metadata file inside `blackbox-re
 
 ## 6. Safe Extension Patterns
 
-Adding a new worker today (e.g., experimental analytics):
+Adding a new worker (e.g., experimental analytics):
 
-1. Create `gtapilot/<new_module>.py` with `def main(shutdown_event=None, **kwargs):`.
-2. Minimal loop pattern:
-    ```python
-    def main(shutdown_event=None):
-      # init resources
-      while True:
-        if shutdown_event and shutdown_event.is_set():
-          break
-        # work
-    ```
-3. Register in `build_processes` (preserve ordering; cheap producers first, consumers later is fine here).
-4. Keep imports light; delay heavy imports until inside `main` if they may become optional.
+1. Create `gtapilot/<new_module>.py` exposing `def main(**kwargs):` (no shutdown_event).
+2. Loop pattern:
 
-Introducing ML (future): add `torch` only to `pyproject` when first ML worker lands; ensure each ML worker lazily loads model after process spawn inside its `main` to avoid parent CUDA init.
+```python
+def main():
+  # init resources
+  try:
+    while True:
+      # work
+      pass
+  finally:
+    # release resources (may be skipped if force terminated)
+    pass
+```
+
+3. Register in `build_processes` (ordering: producers then consumers is fine).
+4. To end intentionally, break/return; coordinator will cascade shutdown.
+5. Avoid `os._exit` (coordinator handles exit codes).
+6. Heavy imports inside `main()` only.
+
+Introducing ML (future): add `torch` only when first ML worker lands; load models lazily inside the worker.
 
 ## 7. Testing Strategy (To Be Implemented)
 
@@ -105,13 +118,14 @@ Future ML guidance (when added): single NHWC→NCHW conversion, `.contiguous()`,
 
 1. Do not rename existing `main` functions without adjusting coordinator references.
 2. Preserve argument names used in `build_processes` (e.g., `video_path`, `display`).
-3. Always ensure new long-running loops check `shutdown_event` each iteration.
+3. There is no shared shutdown event; loops run until they exit voluntarily or crash.
 4. On IPC modifications, document change in both this file and `copilot-instructions.md`.
 5. Add minimal inline type hints for new public functions.
+6. If a worker needs grace to flush state, implement periodic incremental flush (do NOT reintroduce a global Event).
 
 ## 10. Logging & Diagnostics Roadmap
 
-Current state: `print()` statements. Roadmap PR (small, self-contained): introduce `logging` with process-aware format (e.g., `%(asctime)s %(processName)s %(levelname)s %(message)s`). Avoid coupling logging config into worker import side effects—configure once in coordinator before spawning (stdout separation). For Windows, ensure flush on critical messages before shutdown.
+Current state: plain `print()`; coordinator prefixes with `[Coordinator]`. Roadmap: introduce `logging` configured once before spawning with process name in format. Avoid logger setup in worker import scope.
 
 ## 11. Commit Message Template
 
@@ -138,7 +152,15 @@ Impact: perf, memory, compatibility (mention if any IPC contract changes)
 -   Hard-coding display index incorrectly (currently `1`); if user has single monitor, may need `0`—make configurable in future PR.
 -   Assuming Torch exists (it does not yet). Do not import `torch` until added as dependency.
 
-## 14. Roadmap (Explicit – Not Yet Implemented)
+## 14. Shutdown Semantics (Current Model)
+
+-   Triggers: ESC key (Windows console), SIGINT/SIGTERM, any child process exit (exitcode 0 or non-zero), coordinator internal error.
+-   First trigger recorded; subsequent triggers ignored (idempotent).
+-   Termination: forceful `terminate()`; child `finally` blocks may not run.
+-   Blackbox metadata could lose last <1s of entries on abrupt terminate (future incremental flush improvement).
+-   Soft-stop control channel is a roadmap item; do not add ad-hoc global events.
+
+## 15. Roadmap (Explicit – Not Yet Implemented)
 
 | Feature            | Outline                                                           | Notes                                                                 |
 | ------------------ | ----------------------------------------------------------------- | --------------------------------------------------------------------- |
@@ -150,7 +172,7 @@ Impact: perf, memory, compatibility (mention if any IPC contract changes)
 
 Do not reference roadmap features as if they already exist in user-facing docs or code.
 
-## 15. When Unsure
+## 16. When Unsure
 
 1. Re-read `copilot-instructions.md` (kept in sync with this file).
 2. Inspect modules in order of data flow: `display_capture/` → `ipc/vision_ipc.py` → `visualization/` → `blackbox/`.

@@ -10,7 +10,7 @@ at approximately the video's native FPS.
 """
 
 
-def main(video_path: str, shutdown_event=None):
+def main(video_path: str):
     publisher = VisionIPCPublisher()
 
     cap = cv2.VideoCapture(video_path)
@@ -27,8 +27,6 @@ def main(video_path: str, shutdown_event=None):
     try:
         next_frame_time = time.perf_counter()
         while True:
-            if shutdown_event is not None and shutdown_event.is_set():
-                break
 
             # Maintain timing based on captured video FPS
             now = time.perf_counter()

@@ -8,15 +8,13 @@ TARGET_FPS = 20
 TARGET_FRAME_TIME = 1 / TARGET_FPS
 
 
-def main(display=0, shutdown_event=None):
+def main(display=0):
     visionIPCPublisher = VisionIPCPublisher()
     camera = bettercam.create(output_idx=display, output_color="RGB")
     camera.start(target_fps=TARGET_FPS)
 
     try:
         while True:
-            if shutdown_event is not None and shutdown_event.is_set():
-                break
             frame = camera.get_latest_frame()
             if frame is not None:
                 visionIPCPublisher.publish_frame(frame)

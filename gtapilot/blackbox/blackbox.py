@@ -14,7 +14,7 @@ TAR_FILEPATH = f"{OUTPUT_DIR}/{OUTPUT_PREFIX}_frames.tar"
 METADATA_FILEPATH = f"{OUTPUT_DIR}/{OUTPUT_PREFIX}_metadata.json"
 
 
-def main(shutdown_event=None):
+def main():
     visionIPCSubscriber = VisionIPCSubscriber()
 
     all_frame_metadata = []  # List to store metadata for all captured frames
@@ -23,8 +23,6 @@ def main(shutdown_event=None):
     try:
         with tarfile.open(TAR_FILEPATH, "w") as tar_out_file:
             while True:
-                if shutdown_event is not None and shutdown_event.is_set():
-                    break
                 frame = visionIPCSubscriber.receive_frame(blocking=True)
 
                 if frame is not None:

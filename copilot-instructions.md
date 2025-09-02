@@ -14,7 +14,7 @@ Implemented today:
 2. High-throughput frame transport over ZeroMQ PUB/SUB (`gtapilot.ipc.vision_ipc`).
 3. Frame pipeline: capture/override -> publish (RGB uint8, NHWC) -> subscribe -> display / record.
 
-Not yet implemented (treat as roadmap, do NOT reference as existing code): depth estimation, object detection / segmentation workers, a separate control messaging IPC, CUDA model loading, Torch tensors, heartbeat messages.
+Not yet implemented (treat as roadmap, do NOT reference as existing code): depth estimation, object detection / segmentation workers, a separate control messaging / soft-stop IPC, CUDA model loading, Torch tensors, heartbeat messages.
 
 ## Python & Environment
 
@@ -41,9 +41,13 @@ uv run ./gtapilot/main.py                 # live display capture (default displa
 uv run ./gtapilot/main.py --video-override path/to/video.mp4
 ```
 
-Graceful shutdown options:
+Shutdown triggers (supervisor model):
 
--   Press ESC in console (Windows-only listener thread) or window ESC / q (visualization window) or Ctrl+C.
+-   ESC key in coordinator console (Windows-only listener thread)
+-   Ctrl+C / SIGINT / SIGTERM to coordinator
+-   Any child process exiting (normal exit or crash) — closing visualization window (ESC / q) counts
+
+Workers no longer receive a shared shutdown Event; they run until they exit. Coordinator detects the first exit/trigger and force-terminates remaining processes (idempotent shutdown cascade).
 
 ### Blackbox Recording
 
@@ -55,7 +59,7 @@ Artifacts:
 
 ## Process Architecture
 
-Process spawning logic lives in `gtapilot.coordinator.coordinator.build_processes` returning a list of `PythonProcess` objects (wrapper in `gtapilot.coordinator.process`). Each target module must expose a top-level `main(**kwargs)` function. A shared `multiprocessing.Event` (`shutdown_event`) is injected automatically if the worker signature allows it.
+Process spawning logic lives in `gtapilot.coordinator.coordinator.build_processes` returning a list of `PythonProcess` objects (wrapper in `gtapilot.coordinator.process`). Each target module must expose a top-level `main(**kwargs)` function. No shared shutdown Event is injected anymore.
 
 Process naming: The OS process title is set via `setproctitle` inside the generic `launcher` before invoking the worker `main`.
 
@@ -79,19 +83,24 @@ Assistant guidance when modifying:
 For any new worker-style module to be launched by the coordinator:
 
 ```python
-def main(shutdown_event=None, **kwargs):
+def main(**kwargs):
     # Initialize resources (cameras, subscribers, files)
-    while True:
-        if shutdown_event is not None and shutdown_event.is_set():
-            break
-        # ...work loop...
+    try:
+        while True:
+            # ...work loop...
+            pass
+    finally:
+        # Release resources (may not run if force terminated)
+        pass
 ```
+
+To intentionally end the system from a worker, just `break` or `return`; the coordinator will observe the exit and cascade shutdown.
 
 Avoid global side effects at import time (keep heavy initialization inside `main`).
 
 ## Logging & Diagnostics
 
-Current code prints directly (`print`). When adding features, prefer the standard `logging` module with module-level loggers named after the process (e.g., `logging.getLogger("DisplayCapture")`). Keep prints in legacy modules until refactor PR introduces unified logging.
+Current code prints directly (`print`). Coordinator prefixes its own messages with `[Coordinator]`. When adding features, prefer transitioning to `logging` centrally configured in the coordinator (future PR); avoid per-worker logging setup at import time.
 
 ## Adding Future ML (Roadmap Notes)
 
@@ -138,6 +147,9 @@ A: `uv run ./gtapilot/main.py --video-override path/to/file.mp4`.
 Q: I see no blackbox output.  
 A: Set `BLACKBOX_ENABLED = True` in `gtapilot/config.py` before launching.
 
+Q: How do workers know when to stop now?  
+A: They don't receive a shared event—any worker can simply exit; coordinator detects it and stops the rest.
+
 Q: Where do I change the display being captured?  
 A: In `build_processes` the display capture is constructed with `{"display": 1}`; adjust there or parameterize.
 
@@ -146,10 +158,11 @@ A: Experiment with `VisionIPCSubscriber(conflate=True)` in visualization to drop
 
 ## Glossary (Trimmed to Current Needs)
 
--   **Coordinator**: Parent process that spawns and monitors child processes.
+-   **Coordinator**: Parent process that spawns and monitors child processes; enforces global shutdown on first trigger.
 -   **Vision IPC**: ZeroMQ PUB/SUB channel transporting raw RGB frames.
 -   **Publisher**: Single producer of frames (capture or video override).
 -   **Subscriber**: Any consumer (visualization, blackbox, future ML workers).
+    -- **Cascade shutdown**: Supervisor-driven termination of all remaining processes after first trigger.
 -   **Conflate**: ZeroMQ socket option keeping only the most recent message.
 
 ## When Unsure

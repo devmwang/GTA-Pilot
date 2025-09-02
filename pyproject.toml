@@ -3,7 +3,7 @@ name = "gtapilot"
 version = "0.1.0"
 description = ""
 authors = [{ name = "Michael Wang", email = "41971562+devmwang@users.noreply.github.com" }]
-requires-python = "~=3.14"
+requires-python = "~=3.13"
 readme = "README.md"
 dependencies = [
     "bettercam==1.0.0",

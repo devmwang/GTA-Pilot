@@ -12,6 +12,8 @@ dependencies = [
     "opencv-python==4.11.0.86",
     "pyzmq==27.0.2",
     "setproctitle==1.3.6",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
 ]
 
 [project.urls]
@@ -20,3 +22,16 @@ Repository = "https://github.com/devmwang/GTAP"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]

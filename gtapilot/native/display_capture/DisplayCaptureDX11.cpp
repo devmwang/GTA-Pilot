@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -46,24 +47,26 @@ struct DupCtx {
     ComPtr<IDXGIOutputDuplication> dup;
     UINT W = 0, H = 0;
 
-    void init() {
+    void init_with_output(ComPtr<IDXGIOutput> output) {
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT |
                      D3D11_CREATE_DEVICE_SINGLETHREADED;
 #ifdef _DEBUG
         flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
+        // Create device on the adapter that owns the chosen output
+        ComPtr<IDXGIAdapter> adapter;
+        hrx(output->GetParent(
+                __uuidof(IDXGIAdapter),
+                reinterpret_cast<void **>(adapter.ReleaseAndGetAddressOf())),
+            "GetParent IDXGIAdapter");
         D3D_FEATURE_LEVEL fl;
-        hrx(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-                              nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx),
+        hrx(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                              flags, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl,
+                              &ctx),
             "D3D11CreateDevice");
-        ComPtr<IDXGIDevice> dxgiDev;
-        hrx(dev.As(&dxgiDev), "QI IDXGIDevice");
-        ComPtr<IDXGIAdapter> adp;
-        hrx(dxgiDev->GetAdapter(&adp), "GetAdapter");
-        ComPtr<IDXGIOutput> out;
-        hrx(adp->EnumOutputs(0, &out), "EnumOutputs");
+
         ComPtr<IDXGIOutput1> out1;
-        hrx(out.As(&out1), "QI IDXGIOutput1");
+        hrx(output.As(&out1), "QI IDXGIOutput1");
         hrx(out1->DuplicateOutput(dev.Get(), &dup), "DuplicateOutput");
         DXGI_OUTDUPL_DESC desc{};
         dup->GetDesc(&desc);
@@ -161,12 +164,47 @@ struct ScopedTimerResolution {
     bool _active;
 };
 
-int main() {
+static ComPtr<IDXGIOutput> select_output_by_index(int index, int &out_count) {
+    out_count = 0;
+    ComPtr<IDXGIFactory1> factory;
+    hrx(CreateDXGIFactory1(
+            __uuidof(IDXGIFactory1),
+            reinterpret_cast<void **>(factory.ReleaseAndGetAddressOf())),
+        "CreateDXGIFactory1");
+    for (UINT a = 0;; ++a) {
+        ComPtr<IDXGIAdapter> adp;
+        if (factory->EnumAdapters(a, &adp) == DXGI_ERROR_NOT_FOUND)
+            break;
+        for (UINT o = 0;; ++o) {
+            ComPtr<IDXGIOutput> out;
+            if (adp->EnumOutputs(o, &out) == DXGI_ERROR_NOT_FOUND)
+                break;
+            if (index < 0 || out_count == index) {
+                return out;
+            }
+            ++out_count;
+        }
+    }
+    return nullptr;
+}
+
+int main(int argc, char **argv) {
     try {
         // Improve sleep precision to ~1 ms to reduce frame pacing jitter.
         ScopedTimerResolution _timerRes(1);
         // Slightly elevate thread priority to reduce scheduling latency.
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+        // Parse CLI for --display-id
+        int requestedDisplay = -1; // -1 means default (first)
+        for (int i = 1; i < argc; ++i) {
+            const char *arg = argv[i];
+            if (strcmp(arg, "--display-id") == 0 && i + 1 < argc) {
+                requestedDisplay = std::atoi(argv[++i]);
+            } else if (strncmp(arg, "--display-id=", 13) == 0) {
+                requestedDisplay = std::atoi(arg + 13);
+            }
+        }
 
         // RAW publish size (defaults to 1920x1080); override with
         // GTAPILOT_RAW_SIZE=WxH
@@ -181,8 +219,26 @@ int main() {
         std::cout << "[DisplayCaptureDX11] RAW size " << rawW << "x" << rawH
                   << "\n";
 
+        // Select output
+        int totalOutputs = 0;
+        ComPtr<IDXGIOutput> chosenOutput = select_output_by_index(
+            requestedDisplay < 0 ? 0 : requestedDisplay, totalOutputs);
+        if (!chosenOutput) {
+            std::cerr << "[DisplayCaptureDX11] No display outputs found or "
+                         "index out of range.\n";
+            return 1;
+        }
+
+        // Describe selected output
+        DXGI_OUTPUT_DESC odesc{};
+        chosenOutput->GetDesc(&odesc);
+        std::wstring devName(odesc.DeviceName);
+        std::wcout << L"[DisplayCaptureDX11] Selected display #"
+                   << (requestedDisplay < 0 ? 0 : requestedDisplay) << L" ("
+                   << devName << L")" << std::endl;
+
         DupCtx cap;
-        cap.init();
+        cap.init_with_output(chosenOutput);
         auto dev = cap.dev;
         auto ctx = cap.ctx;
         UINT W = cap.W, H = cap.H;

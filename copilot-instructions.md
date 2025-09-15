@@ -37,7 +37,8 @@ If `pyzmq` complains about missing wheels on Windows, ensure build tools are pre
 Primary entrypoint (with argument parsing):
 
 ```bash
-uv run ./gtapilot/main.py                 # live display capture (default display index = 1 inside module call)
+uv run ./gtapilot/main.py                               # live display capture (defaults to first/primary display)
+uv run ./gtapilot/main.py --display-id 1                # live capture from specific display (0-based index)
 uv run ./gtapilot/main.py --video-override path/to/video.mp4
 ```
 
@@ -151,7 +152,7 @@ Q: How do workers know when to stop now?
 A: They don't receive a shared event—any worker can simply exit; coordinator detects it and stops the rest.
 
 Q: Where do I change the display being captured?  
-A: In `build_processes` the display capture is constructed with `{"display": 1}`; adjust there or parameterize.
+A: Pass `--display-id N` to `gtapilot/main.py` (0-based). Example: `uv run ./gtapilot/main.py --display-id 1`.
 
 Q: Frames look slow.  
 A: Experiment with `VisionIPCSubscriber(conflate=True)` in visualization to drop backlog and keep latest frame.

@@ -13,6 +13,12 @@ def parse_args():
         metavar="PATH",
         help="Path to a video file (e.g. .mp4). If provided, uses video frames instead of live display capture.",
     )
+    parser.add_argument(
+        "--display-id",
+        dest="display_id",
+        type=int,
+        help="Index of the display to capture (0-based). Defaults to primary display if omitted.",
+    )
     return parser.parse_args()
 
 
@@ -29,4 +35,4 @@ if __name__ == "__main__":
                 f"--video-override file not found: {video_override}"
             )
 
-    coordinator_main(video_override=video_override)
+    coordinator_main(video_override=video_override, display_id=args.display_id)

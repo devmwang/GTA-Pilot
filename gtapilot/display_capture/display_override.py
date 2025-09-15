@@ -28,11 +28,11 @@ def main(video_path: str):
         next_frame_time = time.perf_counter()
         while True:
 
-            # Maintain timing based on captured video FPS
+            # Maintain timing based on captured video FPS with drift correction
             now = time.perf_counter()
             if now < next_frame_time:
                 # Sleep only the remaining time slice to keep schedule
-                time.sleep(max(0, next_frame_time - now))
+                time.sleep(max(0.0, next_frame_time - now))
 
             ret, frame_bgr = cap.read()
             if not ret:
@@ -44,7 +44,11 @@ def main(video_path: str):
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             publisher.publish_frame(frame_rgb)
 
+            # Schedule next deadline; if we fell behind by >1 frame, reset to avoid drift
             next_frame_time += frame_interval
+            now = time.perf_counter()
+            if now - next_frame_time > frame_interval:
+                next_frame_time = now + frame_interval
     finally:
         try:
             cap.release()

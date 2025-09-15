@@ -1,9 +1,12 @@
-import zmq
-import numpy as np
-import pickle
-import threading
 import collections
+import json
+import threading
 import time
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+import zmq
 
 DEFAULT_VIPC_ZMQ_HOST_PUB = "127.0.0.1"  # Publisher binds to all interfaces
 DEFAULT_VIPC_ZMQ_HOST_SUB = "127.0.0.1"  # Subscriber connects to localhost by default
@@ -13,14 +16,25 @@ DEFAULT_VIPC_ZMQ_TOPIC = b"frames"  # Topic for frame data
 
 class VisionIPCPublisher:
     """
-    Publishes frames (NumPy arrays) over ZeroMQ.
+    Publishes JPEG frames (NumPy arrays) over ZeroMQ.
     This acts as the single producer in the system.
     """
 
-    def __init__(self, host=DEFAULT_VIPC_ZMQ_HOST_PUB, port=DEFAULT_VIPC_ZMQ_PORT):
+    def __init__(
+        self,
+        host=DEFAULT_VIPC_ZMQ_HOST_PUB,
+        port=DEFAULT_VIPC_ZMQ_PORT,
+        topic=DEFAULT_VIPC_ZMQ_TOPIC,
+        resize_to: Optional[Tuple[int, int]] = (1920, 1080),
+        sndhwm: int = 1,  # Drop excess when subscriber is slow
+    ):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
+        self.socket.setsockopt(zmq.SNDHWM, sndhwm)
         self.bind_addr = f"tcp://{host}:{port}"
+        self._topic_bytes = topic if isinstance(topic, bytes) else topic.encode("utf-8")
+        self.resize_to = resize_to
+        self._frame_id = 1
 
         try:
             self.socket.bind(self.bind_addr)
@@ -34,36 +48,66 @@ class VisionIPCPublisher:
             self.context.term()
             raise
 
-    def publish_frame(self, frame: np.ndarray, topic=DEFAULT_VIPC_ZMQ_TOPIC):
-        if not isinstance(frame, np.ndarray):
-            print("Error: Frame to publish is not a NumPy array.")
+    def publish_frame(self, frame: np.ndarray):
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            print("Error: Frame to publish is not a RGB np.uint8 HxWx3 array.")
             return
 
-        metadata = {"dtype": str(frame.dtype), "shape": frame.shape}
-        # Using a specific pickle protocol can be useful for cross-version compatibility
-        metadata_bytes = pickle.dumps(metadata, protocol=pickle.HIGHEST_PROTOCOL)
-        frame_bytes = frame.tobytes()
+        if self.resize_to is not None:
+            w, h = int(self.resize_to[0]), int(self.resize_to[1])
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            h, w = frame.shape[:2]
+
+        # Ensure contiguous RGB uint8
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8, copy=False)
+
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+
+        # metadata = {"dtype": str(frame.dtype), "shape": frame.shape, "frame_id": self.frame_id}
+        metadata = {
+            "encoding": "raw",
+            "w": int(w),
+            "h": int(h),
+            "channels": 3,
+            "dtype": "uint8",
+            "frame_id": int(self._frame_id),
+        }
+        self._frame_id += 1
+
+        metadata_bytes = json.dumps(metadata).encode("utf-8")
 
         try:
-            self.socket.send_multipart([topic, metadata_bytes, frame_bytes])
+            self.socket.send_multipart(
+                [self._topic_bytes, metadata_bytes, memoryview(frame).cast("B")]
+            )
+
         except zmq.ZMQError as e:
             print(f"Error sending frame: {e}")
+
         except Exception as e:
             print(f"Unexpected error publishing frame: {e}")
 
     def close(self):
         print("Closing VisionIPCPublisher.")
+
         if hasattr(self, "socket") and not self.socket.closed:
             self.socket.close()
+
         if hasattr(self, "context") and not self.context.closed:
             self.context.term()
+
         print("VisionIPCPublisher closed.")
 
 
 class VisionIPCSubscriber:
     """
-    Subscribes to frames published by VisionIPCPublisher.
-    Maintains an internal buffer of recently received frames.
+    JPEG-only subscriber for frames published by the native D3D11 capture or VisionIPCPublisher (display override).
+    Topic payload is [topic, json_meta, raw_bytes].
+      meta = {"encoding":"raw","w":1920,"h":1080,"channels":3,"dtype":"uint8","frame_id":<int>}
+    Output frames are RGB np.uint8 HxWx3
     """
 
     def __init__(
@@ -71,40 +115,28 @@ class VisionIPCSubscriber:
         host=DEFAULT_VIPC_ZMQ_HOST_SUB,
         port=DEFAULT_VIPC_ZMQ_PORT,
         topic=DEFAULT_VIPC_ZMQ_TOPIC,
-        conflate=False,
         buffer_size=10,
         socket_timeout_ms=1000,
-    ):  # Timeout for ZMQ socket receive
-
+        rcvhwm=1,
+        latestOnly=False,
+    ):
         if buffer_size <= 0:
-            raise ValueError("buffer_size must be positive for VisionIPCSubscriber.")
-
+            raise ValueError("buffer_size must be positive.")
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
-
-        if conflate:
-            self.socket.setsockopt(zmq.CONFLATE, 1)
-
-        self.socket.setsockopt(
-            zmq.LINGER, 0
-        )  # Don't wait for pending messages on close
-        self.socket.setsockopt(zmq.RCVTIMEO, socket_timeout_ms)  # Timeout for recv
-
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.RCVTIMEO, socket_timeout_ms)
+        self.socket.setsockopt(zmq.RCVHWM, rcvhwm)
+        if latestOnly:
+            # Can't use ZMQ_CONFLATE with multipart messages; it corrupts
+            # message boundaries and trigger libzmq assertions.
+            # Emulate "latest only" behavior via a maxlen=1 application buffer.
+            buffer_size = 1
         self.connect_addr = f"tcp://{host}:{port}"
         self._topic_bytes = topic if isinstance(topic, bytes) else topic.encode("utf-8")
 
-        try:
-            self.socket.connect(self.connect_addr)
-            self.socket.subscribe(self._topic_bytes)
-            print(
-                f"VisionIPCSubscriber connected to {self.connect_addr} on topic '{self._topic_bytes.decode()}'"
-            )
-        except zmq.ZMQError as e:
-            print(
-                f"Error connecting/subscribing subscriber socket to {self.connect_addr}: {e}"
-            )
-            self.context.term()
-            raise
+        self.socket.connect(self.connect_addr)
+        self.socket.subscribe(self._topic_bytes)
 
         self._buffer = collections.deque(maxlen=buffer_size)
         self._buffer_lock = threading.Lock()
@@ -116,124 +148,72 @@ class VisionIPCSubscriber:
         )
         self._receive_thread.start()
 
-    def _deserialize_frame(self, metadata_bytes, frame_bytes):
-        try:
-            metadata = pickle.loads(metadata_bytes)
-            dtype = np.dtype(metadata["dtype"])
-            shape = metadata["shape"]
-            if frame_bytes is None or not isinstance(frame_bytes, bytes):
-                print("Error: frame_bytes is invalid during deserialization.")
-                return None
-            return np.frombuffer(frame_bytes, dtype=dtype).reshape(shape)
-        except Exception as e:
-            print(f"Error deserializing frame: {e}")
-            return None
-
     def _continuously_receive(self):
-        print(
-            f"Subscriber receive thread started for topic '{self._topic_bytes.decode()}'."
-        )
         while self._running:
+            # print("Running")
             try:
-                # RCVTIMEO on socket makes recv_multipart non-blocking indefinitely
-                topic, metadata_bytes, frame_bytes = self.socket.recv_multipart()
+                topic, metadata_bytes, raw_bytes = self.socket.recv_multipart()
 
-                # We only subscribed to one topic, but good practice to check if more were added
-                if topic == self._topic_bytes:
-                    frame = self._deserialize_frame(metadata_bytes, frame_bytes)
-                    if frame is not None:
-                        with self._buffer_lock:
-                            self._buffer.append(frame)
-                            self._frame_available_condition.notify_all()
-            except zmq.Again:  # Timeout (RCVTIMEO)
-                continue  # Loop again to check self._running
+                if topic != self._topic_bytes:
+                    continue
+
+                metadata = json.loads(metadata_bytes.decode("utf-8"))
+                w, h = int(metadata["w"]), int(metadata["h"])
+                arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+
+                if arr is None or arr.size != w * h * 3:
+                    continue
+
+                rgb = arr.reshape(h, w, 3)
+
+                with self._buffer_lock:
+                    self._buffer.append(rgb)
+                    self._frame_available_condition.notify_all()
+
+            except zmq.Again:
+                continue
+
             except zmq.ContextTerminated:
-                print("Subscriber context terminated, stopping receive thread.")
                 break
-            except zmq.ZMQError as e:
-                if self._running:  # Only log if not part of a normal shutdown
-                    print(f"ZMQError in subscriber receive thread: {e}")
-                break
-            except Exception as e:
-                if self._running:
-                    print(f"Unexpected error in subscriber receive thread: {e}")
-                    time.sleep(0.1)  # Avoid tight loop on unexpected persistent errors
-        print(
-            f"Subscriber receive thread stopped for topic '{self._topic_bytes.decode()}'."
-        )
+
+            except Exception:
+                time.sleep(0.001)
+                continue
 
     def receive_frame(self, blocking=True, timeout_sec=None):
-        """
-        Retrieves a single frame (oldest) from the internal buffer.
-        If blocking is True, waits until a frame is available or timeout occurs.
-        """
         with self._buffer_lock:
             if not blocking and not self._buffer:
                 return None
 
             if blocking:
-                # Wait only if buffer is empty and thread is supposed to be running
+                end = None if timeout_sec is None else time.time() + timeout_sec
+
                 while not self._buffer and self._running:
-                    wait_success = self._frame_available_condition.wait(
-                        timeout=timeout_sec
-                    )
-                    if not wait_success and timeout_sec is not None:  # Timeout occurred
-                        return None
-                    # If woken up but still no buffer and not running, exit
-                    if not self._running and not self._buffer:
+                    rem = None if end is None else max(0.0, end - time.time())
+
+                    if not self._frame_available_condition.wait(timeout=rem):
                         return None
 
             if self._buffer:
                 return self._buffer.popleft()
+
             return None
 
-    def get_latest_frames(self, count=1):
-        """
-        Returns up to 'count' latest frames from the internal buffer.
-        The frames are returned as a list, with the most recent frame at the end.
-        """
-        if count <= 0:
-            return []
-        with self._buffer_lock:
-            num_to_get = min(count, len(self._buffer))
-            if num_to_get == 0:
-                return []
-            # Convert deque to list and take the last 'num_to_get' elements
-            return list(self._buffer)[-num_to_get:]
-
     def close(self):
-        print(
-            f"Attempting to close VisionIPCSubscriber for topic '{self._topic_bytes.decode()}'."
-        )
         self._running = False
 
         with self._buffer_lock:
-            self._frame_available_condition.notify_all()  # Wake up waiting threads
+            self._frame_available_condition.notify_all()
 
         if self._receive_thread and self._receive_thread.is_alive():
-            print("Joining subscriber receive thread...")
-            self._receive_thread.join(
-                timeout=(
-                    max(2.0, (int(self.socket.rcvtimeo) / 1000.0) * 2)
-                    if hasattr(self.socket, "rcvtimeo")
-                    else 2.0
-                )
-            )
-            if self._receive_thread.is_alive():
-                print("Warning: Subscriber receive thread did not terminate cleanly.")
+            self._receive_thread.join(timeout=2.0)
 
-        print("Closing subscriber ZMQ socket and context.")
-        if hasattr(self, "socket") and not self.socket.closed:
-            try:
-                # Unsubscribe before closing if not done automatically
-                # self.socket.unsubscribe(self._topic_bytes) # Usually not needed
+        try:
+            if hasattr(self, "socket") and not self.socket.closed:
                 self.socket.close()
-            except Exception as e:
-                print(f"Exception during ZMQ socket close: {e}")
 
-        if hasattr(self, "context") and not self.context.closed:
-            try:
+            if hasattr(self, "context") and not self.context.closed:
                 self.context.term()
-            except Exception as e:
-                print(f"Exception during ZMQ context term: {e}")
-        print(f"VisionIPCSubscriber for topic '{self._topic_bytes.decode()}' closed.")
+
+        except Exception:
+            pass

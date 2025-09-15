@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from importlib import import_module
 from multiprocessing import Process
 import os
+import subprocess
 import sys
 import traceback
 
@@ -25,7 +26,9 @@ def launcher(module, name, args):
                 f"Module '{getattr(module_obj, '__name__', str(module_obj))}' has no callable 'main' attribute"
             )
         main_func(**args)
-    except Exception:  # noqa: BLE001 broad by design to convert any failure to exitcode!=0
+    except (
+        Exception
+    ):  # noqa: BLE001 broad by design to convert any failure to exitcode!=0
         try:
             traceback.print_exc()
             sys.stderr.flush()
@@ -86,3 +89,35 @@ class PythonProcess(BaseProcess):
             args=(self.module, self.name, launch_args),
         )
         self.process.start()
+
+
+class ExecutableProcess(BaseProcess):
+    def __init__(self, name: str, exe_path: str, args: list[str] | None = None):
+        self.name = name
+        self.exe_path = exe_path
+        self.args = args or []
+        self._popen: subprocess.Popen | None = None
+
+    def start(self):
+        if self._popen is not None:
+            return
+
+        self._popen = subprocess.Popen([self.exe_path, *self.args])
+
+    def alive(self) -> bool:
+        return bool(self._popen and self._popen.poll() is None)
+
+    @property
+    def exitcode(self):
+        return None if self._popen is None else self._popen.poll()
+
+    def stop(self, grace_timeout: float = 1.5):
+        if not self._popen:
+            return
+
+        try:
+            self._popen.terminate()
+            self._popen.wait(timeout=grace_timeout)
+
+        except Exception:
+            pass

@@ -3,10 +3,11 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import List, Optional
 
 from gtapilot.config import BLACKBOX_ENABLED
-from gtapilot.coordinator.process import BaseProcess, PythonProcess
+from gtapilot.coordinator.process import BaseProcess, PythonProcess, ExecutableProcess
 
 
 def build_processes(video_override: Optional[str] = None) -> List[BaseProcess]:
@@ -21,12 +22,24 @@ def build_processes(video_override: Optional[str] = None) -> List[BaseProcess]:
         )
     else:
         procs.append(
-            PythonProcess(
-                "DisplayCapture",
-                "gtapilot.display_capture.display_capture",
-                {"display": 1},
+            ExecutableProcess(
+                "DisplayCaptureDX11",
+                str(
+                    (
+                        Path(__file__).resolve().parents[2]
+                        / "bin"
+                        / "DisplayCaptureDX11.exe"
+                    )
+                ),
             )
         )
+        # procs.append(
+        #     PythonProcess(
+        #         "DisplayCapture",
+        #         "gtapilot.display_capture.display_capture",
+        #         {"display": 1},
+        #     )
+        # )
 
     # Visualization always included for now
     procs.append(PythonProcess("Visualization", "gtapilot.visualization.visualization"))
@@ -43,7 +56,7 @@ def main(video_override: Optional[str] = None):
     trigger a full system shutdown cascade:
       * ESC key pressed in console (Windows)
       * SIGINT/SIGTERM received
-      * Any child process exits for any reason (exitcode 0 or non‑zero)
+      * Any child process exits for any reason (exitcode 0 or non-zero)
     Remaining processes are forcefully terminated (terminate + join timeout).
     """
 
@@ -52,7 +65,9 @@ def main(video_override: Optional[str] = None):
     print("[Coordinator] Launching processes: " + ", ".join(p.name for p in processes))
 
     shutting_down = False
-    shutdown_origin = None  # dict with keys: type, process, exitcode, timestamp, message
+    shutdown_origin = (
+        None  # dict with keys: type, process, exitcode, timestamp, message
+    )
     cascade_executed = False
     poll_interval = 0.05
     shutdown_start_ts: float | None = None
@@ -61,7 +76,12 @@ def main(video_override: Optional[str] = None):
     def log(msg: str):
         print(f"[Coordinator] {msg}")
 
-    def mark_shutdown(origin_type: str, process_name: str | None = None, exitcode=None, message: str | None = None):
+    def mark_shutdown(
+        origin_type: str,
+        process_name: str | None = None,
+        exitcode=None,
+        message: str | None = None,
+    ):
         nonlocal shutting_down, shutdown_origin, shutdown_start_ts
         if shutting_down:
             return
@@ -126,7 +146,9 @@ def main(video_override: Optional[str] = None):
             if not shutting_down:
                 for p in processes:
                     if p.exitcode is not None:
-                        mark_shutdown("child_exit", process_name=p.name, exitcode=p.exitcode)
+                        mark_shutdown(
+                            "child_exit", process_name=p.name, exitcode=p.exitcode
+                        )
                         break
 
             # Execute cascade once when shutdown begins
@@ -135,13 +157,19 @@ def main(video_override: Optional[str] = None):
                 # Terminate every still‑alive process (those already exited are skipped)
                 survivors = [p for p in processes if p.alive()]
                 if survivors:
-                    log("Terminating remaining processes: " + ", ".join(p.name for p in survivors))
+                    log(
+                        "Terminating remaining processes: "
+                        + ", ".join(p.name for p in survivors)
+                    )
                 for p in survivors:
                     p.stop()
                 # Second pass: log any still alive
                 stubborn = [p for p in processes if p.alive()]
                 if stubborn:
-                    log("Processes still alive after initial terminate: " + ", ".join(p.name for p in stubborn))
+                    log(
+                        "Processes still alive after initial terminate: "
+                        + ", ".join(p.name for p in stubborn)
+                    )
 
             # Exit condition: all processes have exitcode assigned AND (if shutting_down) cascade executed
             if shutting_down and all(p.exitcode is not None for p in processes):

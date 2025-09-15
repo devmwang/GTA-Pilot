@@ -1,0 +1,8 @@
+[
+    {
+        "directory": "D:/Code/GTA-Pilot/build/clangd",
+        "command": "C:\\PROGRA~1\\LLVM\\bin\\CLANG_~1.EXE -DNOMINMAX -DUNICODE -DWIN32_LEAN_AND_MEAN -D_UNICODE -isystem D:/Code/GTA-Pilot/build/clangd/vcpkg_installed/x64-windows/include -O3 -DNDEBUG -std=gnu++20 -D_DLL -D_MT -Xclang --dependent-lib=msvcrt -o CMakeFiles\\DisplayCaptureDX11.dir\\display_capture\\DisplayCaptureDX11.cpp.obj -c D:\\Code\\GTA-Pilot\\gtapilot\\native\\display_capture\\DisplayCaptureDX11.cpp",
+        "file": "D:/Code/GTA-Pilot/gtapilot/native/display_capture/DisplayCaptureDX11.cpp",
+        "output": "D:/Code/GTA-Pilot/build/clangd/CMakeFiles/DisplayCaptureDX11.dir/display_capture/DisplayCaptureDX11.cpp.obj"
+    }
+]

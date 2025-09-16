@@ -1,0 +1,7 @@
+[submodule "gtapilot/external/pybind11"]
+	path = gtapilot/external/pybind11
+	url = ../../pybind/pybind11
+	branch = stable
+[submodule "gtapilot/external/json"]
+	path = gtapilot/external/json
+	url = https://github.com/nlohmann/json

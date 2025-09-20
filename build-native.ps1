@@ -99,6 +99,24 @@ Initialize-VSEnvironment
 $repoRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '.')
 Write-Host "Repository root: $repoRoot" -ForegroundColor DarkCyan
 
+$pythonExe = $null
+$venvPythonCandidates = @(
+    (Join-Path $repoRoot '.venv/Scripts/python.exe')
+    (Join-Path $repoRoot '.venv/bin/python')
+)
+foreach ($candidate in $venvPythonCandidates) {
+    if (Test-Path $candidate) {
+        $pythonExe = $candidate
+        break
+    }
+}
+if (-not $pythonExe) {
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCmd) {
+        $pythonExe = $pythonCmd.Source
+    }
+}
+
 Push-Location $repoRoot
 try {
     $ninjaPreset = 'ninja-multi'
@@ -114,8 +132,15 @@ try {
     if (-not (Test-Path $compileDb)) {
         throw "Expected compile database not found at '$compileDb'."
     }
+
     $rootCompileDb = Join-Path $repoRoot 'compile_commands.json'
-    Copy-Item -Path $compileDb -Destination $rootCompileDb -Force
+    $sanitizer = Join-Path $repoRoot 'tools/sanitize_compile_commands.py'
+    if ((Test-Path $sanitizer) -and $pythonExe) {
+        Invoke-LoggedCommand -Executable $pythonExe -Arguments @($sanitizer, $compileDb, '-o', $rootCompileDb)
+    } else {
+        Copy-Item -Path $compileDb -Destination $rootCompileDb -Force
+        Write-Host "Sanitizer unavailable; raw compile_commands copied." -ForegroundColor DarkYellow
+    }
     Write-Host "compile_commands.json updated at $rootCompileDb" -ForegroundColor Green
 
     Publish-Binaries -PresetName $ninjaPreset -Configuration $Configuration -Destination $binDir

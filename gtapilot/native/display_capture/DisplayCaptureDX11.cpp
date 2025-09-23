@@ -23,8 +23,9 @@
 #include <zmq.hpp>
 
 #pragma comment(lib, "winmm.lib")
+static constexpr const char *VISION_IPC_ADDRESS = "tcp://127.0.0.1:55550";
 static constexpr const char *FRAMES_GPU_TOPIC = "frames_gpu";
-static constexpr const char *FRAMES_RAW_TOPIC = "frames";
+static constexpr const char *FRAMES_CPU_TOPIC = "frames_cpu";
 
 using Microsoft::WRL::ComPtr;
 using json = nlohmann::json;
@@ -272,8 +273,8 @@ int main(int argc, char **argv) {
         zmq::socket_t pubRAW(zctx, zmq::socket_type::pub);
         pubGPU.set(zmq::sockopt::sndhwm, 1);
         pubRAW.set(zmq::sockopt::sndhwm, 1);
-        pubGPU.bind("tcp://127.0.0.1:55551"); // frames_gpu
-        pubRAW.bind("tcp://127.0.0.1:55550"); // frames_raw
+        pubGPU.bind(VISION_IPC_ADDRESS);
+        pubRAW.bind(VISION_IPC_ADDRESS);
 
         // Use nanoseconds to avoid integer rounding; target period = 50 ms @ 20
         // FPS
@@ -287,9 +288,6 @@ int main(int argc, char **argv) {
         auto next_deadline = std::chrono::steady_clock::now() + period;
 
         while (true) {
-            // Start work for this frame
-            auto frame_begin = std::chrono::steady_clock::now();
-
             ComPtr<ID3D11Texture2D> src = cap.acquire();
             if (!src) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -310,7 +308,7 @@ int main(int argc, char **argv) {
                 hrx(s.mtx->ReleaseSync(/*Key*/ 0), "Release writer mutex");
 
                 // Publish GPU handle (only if we actually wrote the slot)
-                json meta = {
+                json metadata = {
                     {"slot", slot},
                     {"handle", (uint64_t)s.shared},
                     {"w", s.W},
@@ -320,11 +318,13 @@ int main(int argc, char **argv) {
                     {"qpc", (uint64_t)std::chrono::high_resolution_clock::now()
                                 .time_since_epoch()
                                 .count()}};
-                std::string m = meta.dump();
-                zmq::message_t t(FRAMES_GPU_TOPIC, strlen(FRAMES_GPU_TOPIC)),
-                    j(m.data(), m.size());
-                pubGPU.send(t, zmq::send_flags::sndmore);
-                pubGPU.send(j, zmq::send_flags::none);
+                std::string m = metadata.dump();
+                zmq::message_t topic_payload(FRAMES_GPU_TOPIC,
+                                             strlen(FRAMES_GPU_TOPIC));
+                zmq::message_t metadata_payload(m.data(), m.size());
+
+                pubGPU.send(topic_payload, zmq::send_flags::sndmore);
+                pubGPU.send(metadata_payload, zmq::send_flags::none);
             }
 
             // RAW CPU path (single GPU->CPU copy)
@@ -345,8 +345,9 @@ int main(int argc, char **argv) {
                                  {"h", rawH},         {"channels", 3},
                                  {"dtype", "uint8"},  {"frame_id", fid}};
                 std::string metadata_bytes = metadata.dump();
-                zmq::message_t topic_payload(FRAMES_RAW_TOPIC,
-                                             strlen(FRAMES_RAW_TOPIC));
+
+                zmq::message_t topic_payload(FRAMES_CPU_TOPIC,
+                                             strlen(FRAMES_CPU_TOPIC));
                 zmq::message_t metadata_payload(metadata_bytes.data(),
                                                 metadata_bytes.size());
                 zmq::message_t frame_payload(rgb.data(), rgb.size());

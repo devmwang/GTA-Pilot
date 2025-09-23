@@ -1,0 +1,6 @@
+{
+    "include": ["gtapilot"],
+    "extraPaths": ["./bin"],
+    "venvPath": ".",
+    "venv": ".venv"
+}

@@ -5,7 +5,7 @@ import time
 
 import cv2
 
-from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
+from gtapilot.ipc.vision_ipc import VisionIpcCpuSubscriber
 
 SESSION_TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR = "blackbox-recordings"
@@ -15,7 +15,7 @@ METADATA_FILEPATH = f"{OUTPUT_DIR}/{OUTPUT_PREFIX}_metadata.json"
 
 
 def main():
-    visionIPCSubscriber = VisionIPCSubscriber()
+    visionIPCSubscriber = VisionIpcCpuSubscriber()
 
     all_frame_metadata = []  # List to store metadata for all captured frames
     captured_frame_counter = 0

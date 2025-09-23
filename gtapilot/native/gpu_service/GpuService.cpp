@@ -26,6 +26,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <pybind11/pybind11.h>
 
@@ -85,6 +86,8 @@ struct FrameToken {
     cudaArray_t array{};
     cudaTextureObject_t tex{};
     bool active{false};
+    int inW{0};
+    int inH{0};
 };
 
 // Kernel: BGRA8 -> RGB FP16 (NCHW) with letterbox + normalization
@@ -145,8 +148,10 @@ static int open_shared(uint64_t handle, int w, int h) {
                                  (void **)&s.tex),
         "OpenSharedResource");
     HRX(s.tex.As(&s.mtx), "QI IDXGIKeyedMutex");
+    // We only read from the D3D11 texture on the CUDA side; register as
+    // read-only
     CUX(cudaGraphicsD3D11RegisterResource(&s.cudaRes, s.tex.Get(),
-                                          cudaGraphicsRegisterFlagsNone));
+                                          cudaGraphicsRegisterFlagsReadOnly));
     s.w = w;
     s.h = h;
     s.inited = true;
@@ -163,7 +168,8 @@ static int begin_frame(int slot_id, uint64_t frame_id) {
     Slot &s = it->second;
 
     // Acquire keyed mutex for this frame and map CUDA resource
-    HRX(s.mtx->AcquireSync(frame_id, INFINITE), "AcquireSync(reader)");
+    // Writer uses key 0; reader must also use key 0.
+    HRX(s.mtx->AcquireSync(0, INFINITE), "AcquireSync(reader)");
     CUX(cudaGraphicsMapResources(1, &s.cudaRes, 0));
     cudaArray_t arr{};
     CUX(cudaGraphicsSubResourceGetMappedArray(&arr, s.cudaRes, 0, 0));
@@ -174,6 +180,8 @@ static int begin_frame(int slot_id, uint64_t frame_id) {
     ft.array = arr;
     ft.tex = make_bgra_tex(arr);
     ft.active = true;
+    ft.inW = s.w;
+    ft.inH = s.h;
 
     int tok = gNextTok++;
     gTokens.emplace(tok, ft);
@@ -191,17 +199,18 @@ static void preprocess_into(int token, uint64_t out_ptr, int outW, int outH,
             throw std::runtime_error("invalid token");
         ft = it->second; // local copy of handles
     }
+    if (out_ptr == 0) {
+        throw std::runtime_error("preprocess_into: out_ptr is null");
+    }
+    if (outW <= 0 || outH <= 0) {
+        throw std::runtime_error("preprocess_into: invalid output dimensions");
+    }
     half *out = reinterpret_cast<half *>(out_ptr);
-    auto st = reinterpret_cast<cudaStream_t>(stream_ptr);
+    auto st = reinterpret_cast<cudaStream_t>(stream_ptr); // stream 0 allowed
 
     // Compute letterbox parameters
-    int inW, inH;
-    {
-        std::lock_guard<std::mutex> lk(gMu);
-        auto sit = gSlots.find(ft.slot_id);
-        inW = sit->second.w;
-        inH = sit->second.h;
-    }
+    int inW = ft.inW;
+    int inH = ft.inH;
     float scale = std::min((float)outW / (float)inW, (float)outH / (float)inH);
     float newW = inW * scale;
     float newH = inH * scale;
@@ -231,7 +240,8 @@ static void end_frame(int token) {
 
     CUX(cudaDestroyTextureObject(ft.tex));
     CUX(cudaGraphicsUnmapResources(1, &s.cudaRes, 0));
-    HRX(s.mtx->ReleaseSync(ft.frame_id), "ReleaseSync(reader)");
+    // Writer uses key 0; reader must also use key 0.
+    HRX(s.mtx->ReleaseSync(0), "ReleaseSync(reader)");
 
     tit->second.active = false;
     gTokens.erase(tit);

@@ -2,7 +2,7 @@ import time
 
 import cv2
 
-from gtapilot.ipc.vision_ipc import VisionIPCPublisher
+from gtapilot.ipc.vision_ipc import VisionIpcPublisher
 
 """Display Override process
 Reads frames from a provided video file and publishes them through Vision IPC
@@ -11,7 +11,7 @@ at approximately the video's native FPS.
 
 
 def main(video_path: str):
-    publisher = VisionIPCPublisher()
+    publisher = VisionIpcPublisher()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

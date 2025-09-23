@@ -2,11 +2,11 @@ import time
 
 import cv2
 
-from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
+from gtapilot.ipc.vision_ipc import VisionIpcCpuSubscriber
 
 
 def main():
-    visionIPCSubscriber = VisionIPCSubscriber()
+    visionIPCSubscriber = VisionIpcCpuSubscriber()
 
     fps = 0
     frame_count = 0
@@ -52,7 +52,7 @@ def main():
                 break
             if key == 27:  # ESC pressed inside window
                 break
-            
+
     finally:
         visionIPCSubscriber.close()
         cv2.destroyAllWindows()

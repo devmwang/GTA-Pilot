@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -23,8 +24,9 @@
 #include <zmq.hpp>
 
 #pragma comment(lib, "winmm.lib")
-static constexpr const char *FRAMES_GPU_TOPIC = "frames_gpu";
-static constexpr const char *FRAMES_RAW_TOPIC = "frames";
+static constexpr const char *PUBLISH_ADDRESS = "tcp://127.0.0.1:55550";
+static constexpr const char *FRAMES_CPU_TOPIC = "frames";
+// static constexpr const char *FRAMES_GPU_TOPIC = "frames_gpu";
 
 using Microsoft::WRL::ComPtr;
 using json = nlohmann::json;
@@ -82,6 +84,10 @@ struct DupCtx {
         HRESULT hr = dup->AcquireNextFrame(16, &finfo, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT)
             return nullptr;
+        if (hr == DXGI_ERROR_ACCESS_LOST)
+            throw std::runtime_error("DXGI_ERROR_ACCESS_LOST");
+        if (hr == DXGI_ERROR_DEVICE_REMOVED)
+            throw std::runtime_error("DXGI_ERROR_DEVICE_REMOVED");
         hrx(hr, "AcquireNextFrame");
         ComPtr<ID3D11Texture2D> tex;
         hrx(res.As(&tex), "As Texture2D");
@@ -164,6 +170,32 @@ struct ScopedTimerResolution {
     bool _active;
 };
 
+struct ScopedReleaseFrame {
+    IDXGIOutputDuplication *dup;
+    bool armed;
+    ScopedReleaseFrame(IDXGIOutputDuplication *d, bool a) : dup(d), armed(a) {}
+    ~ScopedReleaseFrame() {
+        if (armed && dup) {
+            dup->ReleaseFrame();
+        }
+    }
+};
+
+// static inline uint64_t qpc_now() {
+//     LARGE_INTEGER li{};
+//     QueryPerformanceCounter(&li);
+//     return static_cast<uint64_t>(li.QuadPart);
+// }
+
+// static inline uint64_t qpc_hz() {
+//     static uint64_t hz = []() {
+//         LARGE_INTEGER li{};
+//         QueryPerformanceFrequency(&li);
+//         return static_cast<uint64_t>(li.QuadPart);
+//     }();
+//     return hz;
+// }
+
 static ComPtr<IDXGIOutput> select_output_by_index(int index, int &out_count) {
     out_count = 0;
     ComPtr<IDXGIFactory1> factory;
@@ -237,142 +269,237 @@ int main(int argc, char **argv) {
                    << (requestedDisplay < 0 ? 0 : requestedDisplay) << L" ("
                    << devName << L")" << std::endl;
 
-        DupCtx cap;
-        cap.init_with_output(chosenOutput);
-        auto dev = cap.dev;
-        auto ctx = cap.ctx;
-        UINT W = cap.W, H = cap.H;
-
-        // Shared ring for GPU path
-        std::vector<Slot> ring(RING_SIZE);
-        for (int i = 0; i < RING_SIZE; ++i) {
-            ring[i].tex = makeSharedTex(dev.Get(), W, H);
-            ring[i].tex.As(&ring[i].mtx);
-            ring[i].shared = createShared(ring[i].tex.Get());
-            ring[i].W = W;
-            ring[i].H = H;
-        }
-
-        // Staging for CPU RAW (one GPU->CPU copy per frame)
-        D3D11_TEXTURE2D_DESC sd{};
-        sd.Width = W;
-        sd.Height = H;
-        sd.MipLevels = 1;
-        sd.ArraySize = 1;
-        sd.Format = CAP_FMT;
-        sd.SampleDesc.Count = 1;
-        sd.Usage = D3D11_USAGE_STAGING;
-        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        ComPtr<ID3D11Texture2D> staging;
-        hrx(dev->CreateTexture2D(&sd, nullptr, &staging), "Create staging");
-
-        // ZMQ publishers
+        // ZMQ publishers (created once; sockets survive D3D re-inits)
         zmq::context_t zctx(1);
-        zmq::socket_t pubGPU(zctx, zmq::socket_type::pub);
+
         zmq::socket_t pubRAW(zctx, zmq::socket_type::pub);
-        pubGPU.set(zmq::sockopt::sndhwm, 1);
         pubRAW.set(zmq::sockopt::sndhwm, 1);
-        pubGPU.bind("tcp://127.0.0.1:55551"); // frames_gpu
-        pubRAW.bind("tcp://127.0.0.1:55550"); // frames_raw
+        pubRAW.set(zmq::sockopt::linger, 0);
+        pubRAW.bind(PUBLISH_ADDRESS); // frames_raw
+
+        // Disable GPU-only path since we're not using it currently
+        // zmq::socket_t pubGPU(zctx, zmq::socket_type::pub);
+        // pubGPU.set(zmq::sockopt::sndhwm, 1);
+        // pubGPU.set(zmq::sockopt::linger, 0);
+        // pubGPU.bind("tcp://127.0.0.1:55551"); // frames_gpu
 
         // Use nanoseconds to avoid integer rounding; target period = 50 ms @ 20
+
         // FPS
         const auto period = std::chrono::nanoseconds(1'000'000'000 / CAP_FPS);
         uint64_t fid = 1;
 
-        std::vector<uint8_t> rgb; // reused buffer for RAW
+        std::vector<uint8_t> rgb;
 
-        // Fixed‑deadline scheduler: compute the next publish deadline and sleep
-        // until it, independent of variable processing time, to avoid drift.
-        auto next_deadline = std::chrono::steady_clock::now() + period;
+        // Track last published so we can republish when no new frame arrives
+        // (DXGI_ERROR_WAIT_TIMEOUT)
+        bool haveLastCPU = false;
 
-        while (true) {
-            // Start work for this frame
-            auto frame_begin = std::chrono::steady_clock::now();
+        // Disable GPU-only path since we're not using it currently
+        // bool haveLastGPU = false;
+        // int lastGPUSlot = -1;
 
-            ComPtr<ID3D11Texture2D> src = cap.acquire();
-            if (!src) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
+        // Re-init loop: rebuild D3D resources upon duplication/device loss
+        for (;;) {
+            try {
+                DupCtx cap;
+                cap.init_with_output(chosenOutput);
+                auto dev = cap.dev;
+                auto ctx = cap.ctx;
+                UINT W = cap.W, H = cap.H;
 
-            // Write to GPU ring (non-blocking). If keyed mutex isn't
-            // immediately available (e.g., no consumer participating yet), skip
-            // GPU ring update to avoid stalling RAW publish path.
-            int slot = int(fid % RING_SIZE);
-            Slot &s = ring[slot];
-            HRESULT kmhr = s.mtx->AcquireSync(/*Key*/ 0, /*msTimeout*/ 0);
-            if (kmhr == WAIT_TIMEOUT) {
-                // Skip GPU ring update this frame.
-            } else {
-                hrx(kmhr, "Acquire writer mutex");
-                ctx->CopyResource(s.tex.Get(), src.Get());
-                hrx(s.mtx->ReleaseSync(/*Key*/ 0), "Release writer mutex");
+                // Shared ring for GPU path
+                std::vector<Slot> ring(RING_SIZE);
+                for (int i = 0; i < RING_SIZE; ++i) {
+                    ring[i].tex = makeSharedTex(dev.Get(), W, H);
+                    ring[i].tex.As(&ring[i].mtx);
+                    ring[i].shared = createShared(ring[i].tex.Get());
+                    ring[i].W = W;
+                    ring[i].H = H;
+                }
 
-                // Publish GPU handle (only if we actually wrote the slot)
-                json meta = {
-                    {"slot", slot},
-                    {"handle", (uint64_t)s.shared},
-                    {"w", s.W},
-                    {"h", s.H},
-                    {"format", "BGRA8"},
-                    {"frame_id", fid},
-                    {"qpc", (uint64_t)std::chrono::high_resolution_clock::now()
-                                .time_since_epoch()
-                                .count()}};
-                std::string m = meta.dump();
-                zmq::message_t t(FRAMES_GPU_TOPIC, strlen(FRAMES_GPU_TOPIC)),
-                    j(m.data(), m.size());
-                pubGPU.send(t, zmq::send_flags::sndmore);
-                pubGPU.send(j, zmq::send_flags::none);
-            }
+                // Double-buffered staging textures to reduce Map stalls
+                D3D11_TEXTURE2D_DESC sd{};
+                sd.Width = W;
+                sd.Height = H;
+                sd.MipLevels = 1;
+                sd.ArraySize = 1;
+                sd.Format = CAP_FMT;
+                sd.SampleDesc.Count = 1;
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                std::array<ComPtr<ID3D11Texture2D>, 2> stagingRing;
+                hrx(dev->CreateTexture2D(&sd, nullptr, &stagingRing[0]),
+                    "Create staging[0]");
+                hrx(dev->CreateTexture2D(&sd, nullptr, &stagingRing[1]),
+                    "Create staging[1]");
+                int copyIndex = 0;
+                int readIndex = 1;
+                bool stagingPrimed = false;
 
-            // RAW CPU path (single GPU->CPU copy)
-            {
-                ctx->CopyResource(staging.Get(), src.Get());
-                D3D11_MAPPED_SUBRESOURCE map{};
-                hrx(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map),
-                    "Map staging");
+                // Reset last-frame state on reinit (avoid stale publishes)
+                haveLastCPU = false;
+                // haveLastGPU = false;
+                // lastGPUSlot = -1;
 
-                convertBGRA_to_RGB_resized(
-                    reinterpret_cast<const uint8_t *>(map.pData),
-                    static_cast<int>(W), static_cast<int>(H),
-                    static_cast<int>(map.RowPitch), rawW, rawH, rgb);
+                // Fixed‑deadline scheduler
+                auto next_deadline = std::chrono::steady_clock::now() + period;
 
-                ctx->Unmap(staging.Get(), 0);
+                while (true) {
+                    ComPtr<ID3D11Texture2D> src = cap.acquire();
+                    bool acquired = (src != nullptr);
+                    ScopedReleaseFrame _rel(cap.dup.Get(), acquired);
+                    bool published_any = false;
 
-                json metadata = {{"encoding", "raw"}, {"w", rawW},
-                                 {"h", rawH},         {"channels", 3},
-                                 {"dtype", "uint8"},  {"frame_id", fid}};
-                std::string metadata_bytes = metadata.dump();
-                zmq::message_t topic_payload(FRAMES_RAW_TOPIC,
-                                             strlen(FRAMES_RAW_TOPIC));
-                zmq::message_t metadata_payload(metadata_bytes.data(),
-                                                metadata_bytes.size());
-                zmq::message_t frame_payload(rgb.data(), rgb.size());
+                    if (acquired) {
+                        // Disable GPU-only path since we're not using it
+                        // currently
 
-                pubRAW.send(topic_payload, zmq::send_flags::sndmore);
-                pubRAW.send(metadata_payload, zmq::send_flags::sndmore);
-                pubRAW.send(frame_payload, zmq::send_flags::none);
-            }
+                        // // Write to GPU ring (non-blocking)
+                        // int slot = int(fid % RING_SIZE);
+                        // Slot &s = ring[slot];
+                        // HRESULT kmhr =
+                        //     s.mtx->AcquireSync(/*Key*/ 0, /*msTimeout*/ 0);
 
-            cap.dup->ReleaseFrame();
-            ++fid;
+                        // if (kmhr == WAIT_TIMEOUT) {
+                        //     // Skip GPU ring update this frame.
+                        // } else {
+                        //     hrx(kmhr, "Acquire writer mutex");
+                        //     ctx->CopyResource(s.tex.Get(), src.Get());
+                        //     hrx(s.mtx->ReleaseSync(/*Key*/ 0),
+                        //         "Release writer mutex");
 
-            // Sleep until the fixed next deadline to maintain consistent
-            // cadence.
-            auto now = std::chrono::steady_clock::now();
-            if (now < next_deadline) {
-                std::this_thread::sleep_until(next_deadline);
-            }
+                        //     haveLastGPU = true;
+                        //     lastGPUSlot = slot;
 
-            // Schedule the next deadline, catching up if we fell behind
-            // by more than one period (drops sleep rather than compounding
-            // drift).
-            next_deadline += period;
-            auto lag = std::chrono::steady_clock::now() - next_deadline;
-            if (lag > period) {
-                next_deadline = std::chrono::steady_clock::now() + period;
+                        //     json meta = {{"slot", slot},
+                        //                  {"handle", (uint64_t)s.shared},
+                        //                  {"w", s.W},
+                        //                  {"h", s.H},
+                        //                  {"format", "BGRA8"},
+                        //                  {"frame_id", fid},
+                        //                  {"qpc", qpc_now()},
+                        //                  {"qpc_hz", qpc_hz()}};
+                        //     std::string m = meta.dump();
+                        //     zmq::message_t t(FRAMES_GPU_TOPIC,
+                        //                      strlen(FRAMES_GPU_TOPIC)),
+                        //         j(m.data(), m.size());
+                        //     pubGPU.send(t, zmq::send_flags::sndmore);
+                        //     pubGPU.send(j, zmq::send_flags::none);
+                        //     published_any = true; // GPU published
+                        // }
+
+                        // RAW CPU path using staging ring
+                        ctx->CopyResource(stagingRing[copyIndex].Get(),
+                                          src.Get());
+                        if (stagingPrimed) {
+                            D3D11_MAPPED_SUBRESOURCE map{};
+                            hrx(ctx->Map(stagingRing[readIndex].Get(), 0,
+                                         D3D11_MAP_READ, 0, &map),
+                                "Map staging");
+                            convertBGRA_to_RGB_resized(
+                                reinterpret_cast<const uint8_t *>(map.pData),
+                                static_cast<int>(W), static_cast<int>(H),
+                                static_cast<int>(map.RowPitch), rawW, rawH,
+                                rgb);
+                            ctx->Unmap(stagingRing[readIndex].Get(), 0);
+                            haveLastCPU = true;
+
+                            json metadata = {
+                                {"encoding", "raw"}, {"w", rawW},
+                                {"h", rawH},         {"channels", 3},
+                                {"dtype", "uint8"},  {"frame_id", fid}};
+                            std::string metadata_bytes = metadata.dump();
+                            zmq::message_t topic_payload(
+                                FRAMES_CPU_TOPIC, strlen(FRAMES_CPU_TOPIC));
+                            zmq::message_t metadata_payload(
+                                metadata_bytes.data(), metadata_bytes.size());
+                            zmq::message_t frame_payload(rgb.data(),
+                                                         rgb.size());
+                            pubRAW.send(topic_payload,
+                                        zmq::send_flags::sndmore);
+                            pubRAW.send(metadata_payload,
+                                        zmq::send_flags::sndmore);
+                            pubRAW.send(frame_payload, zmq::send_flags::none);
+                            published_any = true; // RAW published
+                        }
+                        // Rotate staging indices
+                        std::swap(copyIndex, readIndex);
+                        stagingPrimed = true;
+                    } else {
+                        // Republish last known GPU/CPU frames when no new frame
+                        // arrived
+
+                        // Disable GPU-only path since we're not using it
+                        // currently if (haveLastGPU && lastGPUSlot >= 0) {
+                        //     const Slot &s = ring[lastGPUSlot];
+                        //     json meta = {{"slot", lastGPUSlot},
+                        //                  {"handle", (uint64_t)s.shared},
+                        //                  {"w", s.W},
+                        //                  {"h", s.H},
+                        //                  {"format", "BGRA8"},
+                        //                  {"frame_id", fid},
+                        //                  {"qpc", qpc_now()},
+                        //                  {"qpc_hz", qpc_hz()}};
+                        //     std::string m = meta.dump();
+                        //     zmq::message_t t(FRAMES_GPU_TOPIC,
+                        //                      strlen(FRAMES_GPU_TOPIC)),
+                        //         j(m.data(), m.size());
+                        //     pubGPU.send(t, zmq::send_flags::sndmore);
+                        //     pubGPU.send(j, zmq::send_flags::none);
+                        //     published_any = true;
+                        // }
+
+                        if (haveLastCPU) {
+                            json metadata = {
+                                {"encoding", "raw"}, {"w", rawW},
+                                {"h", rawH},         {"channels", 3},
+                                {"dtype", "uint8"},  {"frame_id", fid}};
+                            std::string metadata_bytes = metadata.dump();
+                            zmq::message_t topic_payload(
+                                FRAMES_CPU_TOPIC, strlen(FRAMES_CPU_TOPIC));
+                            zmq::message_t metadata_payload(
+                                metadata_bytes.data(), metadata_bytes.size());
+                            zmq::message_t frame_payload(rgb.data(),
+                                                         rgb.size());
+                            pubRAW.send(topic_payload,
+                                        zmq::send_flags::sndmore);
+                            pubRAW.send(metadata_payload,
+                                        zmq::send_flags::sndmore);
+                            pubRAW.send(frame_payload, zmq::send_flags::none);
+                            published_any = true;
+                        }
+                    }
+
+                    if (published_any) {
+                        ++fid;
+                    }
+
+                    // Sleep until the fixed next deadline to maintain
+                    // consistent cadence
+                    auto now = std::chrono::steady_clock::now();
+                    if (now < next_deadline) {
+                        std::this_thread::sleep_until(next_deadline);
+                    }
+                    next_deadline += period;
+                    auto lag = std::chrono::steady_clock::now() - next_deadline;
+                    if (lag > period) {
+                        next_deadline =
+                            std::chrono::steady_clock::now() + period;
+                    }
+                }
+            } catch (const std::runtime_error &e) {
+                // Duplication or device loss: try to reinitialize once more
+                if (std::string(e.what()) ==
+                        std::string("DXGI_ERROR_ACCESS_LOST") ||
+                    std::string(e.what()) ==
+                        std::string("DXGI_ERROR_DEVICE_REMOVED")) {
+                    std::cerr << "[DisplayCaptureDX11] Duplication/device "
+                                 "lost, reinitializing...\n";
+                    continue;
+                }
+
+                throw;
             }
         }
     } catch (const std::exception &e) {

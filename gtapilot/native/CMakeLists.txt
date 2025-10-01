@@ -1,2 +1,1 @@
 add_subdirectory(display_capture)
-add_subdirectory(gpu_service)

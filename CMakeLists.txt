@@ -3,20 +3,15 @@ cmake_minimum_required(VERSION 3.26)
 set(CMAKE_POLICY_VERSION 3.25)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-project(gtapilot_native LANGUAGES CXX CUDA)
+project(gtapilot_native LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 75;86;89;90)
-endif()
 
 set(GTAPILOT_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(GTAPILOT_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
@@ -27,25 +22,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 set(JSON_INCLUDE_DIR "${GTAPILOT_SOURCE_DIR}/gtapilot/external/json/include" CACHE PATH "Location of nlohmann json headers" FORCE)
 
-set(Python3_FIND_VIRTUALENV FIRST)
-set(Python3_FIND_STRATEGY LOCATION)
-set(Python_FIND_VIRTUALENV FIRST)
-set(Python_FIND_STRATEGY LOCATION)
-if(EXISTS "${GTAPILOT_SOURCE_DIR}/.venv/Scripts/python.exe")
-    set(_gtapilot_python "${GTAPILOT_SOURCE_DIR}/.venv/Scripts/python.exe")
-elseif(EXISTS "${GTAPILOT_SOURCE_DIR}/.venv/bin/python")
-    set(_gtapilot_python "${GTAPILOT_SOURCE_DIR}/.venv/bin/python")
-endif()
-if(DEFINED _gtapilot_python)
-    set(Python3_EXECUTABLE "${_gtapilot_python}" CACHE FILEPATH "Python interpreter" FORCE)
-    set(Python_EXECUTABLE "${_gtapilot_python}" CACHE FILEPATH "Python interpreter" FORCE)
-    set(Python3_ROOT_DIR "${GTAPILOT_SOURCE_DIR}/.venv" CACHE PATH "Python root" FORCE)
-    set(Python_ROOT_DIR "${GTAPILOT_SOURCE_DIR}/.venv" CACHE PATH "Python root" FORCE)
-endif()
 
-set(PYBIND11_TEST OFF CACHE BOOL "Disable pybind11 tests" FORCE)
-set(PYBIND11_INSTALL OFF CACHE BOOL "Disable pybind11 install" FORCE)
-add_subdirectory("${GTAPILOT_SOURCE_DIR}/gtapilot/external/pybind11" "${CMAKE_BINARY_DIR}/pybind11")
 
 include(FetchContent)
 

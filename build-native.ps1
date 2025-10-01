@@ -78,13 +78,7 @@ function Publish-Binaries {
         Copy-Item -Path $exeSource -Destination $exeTarget -Force
         Write-Host "Copied $exeSource -> $exeTarget" -ForegroundColor Green
     }
-
-    $pydSource = Get-ChildItem -Path $sourceDir -Filter 'GpuService*.pyd' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($pydSource) {
-        $pydTarget = Join-Path $Destination $pydSource.Name
-        Copy-Item -Path $pydSource.FullName -Destination $pydTarget -Force
-        Write-Host "Copied $($pydSource.FullName) -> $pydTarget" -ForegroundColor Green
-    }
+    
 }
 
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {

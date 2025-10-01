@@ -1,69 +1,63 @@
 ﻿{
-  "version": 5,
-  "cmakeMinimumRequired": {
-    "major": 3,
-    "minor": 26,
-    "patch": 0
-  },
-  "configurePresets": [
-    {
-      "name": "base",
-      "hidden": true,
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "cacheVariables": {
-        "CMAKE_CUDA_ARCHITECTURES": "75;86;89;90"
-      }
+    "version": 5,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 26,
+        "patch": 0
     },
-    {
-      "name": "ninja-multi",
-      "displayName": "Ninja Multi-Config",
-      "description": "Use Ninja (multi-config) with MSVC toolchain",
-      "generator": "Ninja Multi-Config",
-      "inherits": [
-        "base"
-      ],
-      "cacheVariables": {
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_C_COMPILER": "cl.exe",
-        "CMAKE_CXX_COMPILER": "cl.exe"
-      }
-    },
-    {
-      "name": "vs2022",
-      "displayName": "Visual Studio 17 2022",
-      "description": "Generate a Visual Studio solution",
-      "generator": "Visual Studio 17 2022",
-      "architecture": {
-        "value": "x64"
-      },
-      "toolset": {
-        "value": "host=x64"
-      },
-      "inherits": [
-        "base"
-      ]
-    }
-  ],
-  "buildPresets": [
-    {
-      "name": "ninja-Debug",
-      "configurePreset": "ninja-multi",
-      "configuration": "Debug"
-    },
-    {
-      "name": "ninja-Release",
-      "configurePreset": "ninja-multi",
-      "configuration": "Release"
-    },
-    {
-      "name": "vs2022-Debug",
-      "configurePreset": "vs2022",
-      "configuration": "Debug"
-    },
-    {
-      "name": "vs2022-Release",
-      "configurePreset": "vs2022",
-      "configuration": "Release"
-    }
-  ]
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {}
+        },
+        {
+            "name": "ninja-multi",
+            "displayName": "Ninja Multi-Config",
+            "description": "Use Ninja (multi-config) with MSVC toolchain",
+            "generator": "Ninja Multi-Config",
+            "inherits": ["base"],
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_C_COMPILER": "cl.exe",
+                "CMAKE_CXX_COMPILER": "cl.exe"
+            }
+        },
+        {
+            "name": "vs2022",
+            "displayName": "Visual Studio 17 2022",
+            "description": "Generate a Visual Studio solution",
+            "generator": "Visual Studio 17 2022",
+            "architecture": {
+                "value": "x64"
+            },
+            "toolset": {
+                "value": "host=x64"
+            },
+            "inherits": ["base"]
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ninja-Debug",
+            "configurePreset": "ninja-multi",
+            "configuration": "Debug"
+        },
+        {
+            "name": "ninja-Release",
+            "configurePreset": "ninja-multi",
+            "configuration": "Release"
+        },
+        {
+            "name": "vs2022-Debug",
+            "configurePreset": "vs2022",
+            "configuration": "Debug"
+        },
+        {
+            "name": "vs2022-Release",
+            "configurePreset": "vs2022",
+            "configuration": "Release"
+        }
+    ]
 }

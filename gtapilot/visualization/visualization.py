@@ -1,6 +1,7 @@
 import time
 
 import cv2
+import numpy as np
 
 from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
 from gtapilot.ipc.messaging import SubMaster
@@ -64,15 +65,21 @@ def main():
                     ):
                         ll_mask = msg_ll.data["mask"]
                         if ll_mask is not None:
-                            if ll_mask.shape[:2] != (frame.shape[0], frame.shape[1]):
-                                ll_mask = cv2.resize(
-                                    ll_mask,
-                                    (frame.shape[1], frame.shape[0]),
-                                    interpolation=cv2.INTER_NEAREST,
-                                )
-                            ll_col = frame.copy()
-                            ll_col[:, :, 2] = cv2.max(ll_col[:, :, 2], ll_mask)
-                            frame = cv2.addWeighted(frame, 0.7, ll_col, 0.3, 0)
+                            lane_bin = (ll_mask > 0).astype(np.uint8)
+                            lane_thick = cv2.dilate(
+                                lane_bin,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                                iterations=1,
+                            )
+
+                            lane_alpha = 0.5
+                            lane_color = np.array([0, 0, 255], dtype=np.float32)
+                            m = lane_thick > 0
+                            if np.any(m):
+                                orig = frame[m].astype(np.float32)
+                                frame[m] = (
+                                    orig * (1.0 - lane_alpha) + lane_color * lane_alpha
+                                ).astype(np.uint8)
 
                     msg_boxes = sub.topics.get("vehicle_bounding_boxes")
                     if (

@@ -47,6 +47,20 @@ def build_processes(
         #     )
         # )
 
+    # Models
+    procs.append(
+        PythonProcess(
+            "YOLOPv2",
+            "gtapilot.models.yolopv2",
+            {
+                "device": "cuda",
+                "conf_thres": 0.25,
+                "iou_thres": 0.50,
+                "show": False,
+            },
+        )
+    )
+
     # Visualization always included for now
     procs.append(PythonProcess("Visualization", "gtapilot.visualization.visualization"))
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from typing import Any, List, Optional, Tuple, Sequence, cast
 from pathlib import Path
+from contextlib import nullcontext
 
 import cv2
 import numpy as np
@@ -13,6 +14,12 @@ import torch
 
 from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
 from gtapilot.ipc.messaging import PubMaster, Message
+
+# GPU NMS
+try:
+    from torchvision.ops import nms as tv_nms
+except Exception:
+    tv_nms = None
 
 
 if torch.cuda.is_available():
@@ -53,10 +60,12 @@ def _letterbox(
     bgr: np.ndarray,
     input_hw: Tuple[int, int],
     color: Tuple[int, int, int] = (114, 114, 114),
-) -> Tuple[np.ndarray, float, Tuple[float, float], Tuple[int, int]]:
+) -> Tuple[
+    np.ndarray, float, Tuple[float, float], Tuple[int, int], Tuple[int, int, int, int]
+]:
     """
     Resize and pad to input_hw (H_in, W_in) keeping aspect ratio. Returns:
-      (padded_bgr, gain, (padw, padh), (W0, H0))
+      (padded_img, gain, (padw, padh), (W0, H0), (top, bottom, left, right))
     where padw/padh are symmetric padding applied on both sides along width/height.
     """
     H_in, W_in = int(input_hw[0]), int(input_hw[1])
@@ -78,15 +87,14 @@ def _letterbox(
         resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
     )
 
-    return padded, scale, (padw, padh), (W0, H0)
+    return padded, scale, (padw, padh), (W0, H0), (top, bottom, left, right)
 
 
 def _mask_from_logits(
     logits: Any,
     input_hw: Tuple[int, int],
     orig_wh: Tuple[int, int],
-    pad: Tuple[float, float],
-    gain: float,
+    pad_tblr: Tuple[int, int, int, int],
     positive_class: int = 1,
     thresh: float = 0.5,
     close_k: int = 3,
@@ -112,8 +120,7 @@ def _mask_from_logits(
             logits[0],
             input_hw,
             orig_wh,
-            pad,
-            gain,
+            pad_tblr,
             positive_class,
             thresh,
             close_k,
@@ -146,12 +153,12 @@ def _mask_from_logits(
     H_in, W_in = int(input_hw[0]), int(input_hw[1])
     mask_canvas = cv2.resize(mask_small, (W_in, H_in), interpolation=cv2.INTER_NEAREST)
 
-    # remove padding (crop to unpadded region)
-    padw, padh = pad
-    x1 = int(round(padw))
-    y1 = int(round(padh))
-    x2 = int(round(W_in - padw))
-    y2 = int(round(H_in - padh))
+    # remove padding (crop to unpadded region) using exact integer paddings
+    top, bottom, left, right = pad_tblr
+    x1 = int(left)
+    y1 = int(top)
+    x2 = int(W_in - right)
+    y2 = int(H_in - bottom)
     x1 = max(0, min(x1, W_in))
     x2 = max(0, min(x2, W_in))
     y1 = max(0, min(y1, H_in))
@@ -288,78 +295,52 @@ class YOLOPv2:
         import numpy as _np
         import torch as _t
 
-        def _to_tensor(x: Any) -> Optional[_t.Tensor]:
-            if x is None:
-                return None
+        def _to_tensor(x: Any) -> _t.Tensor:
             if isinstance(x, _t.Tensor):
                 return x
             if isinstance(x, _np.ndarray):
                 return _t.from_numpy(x)
-            if isinstance(x, (int, float, str, bool)):
-                return None
-            return None
+            raise RuntimeError(f"Unsupported detection element type: {type(x)}")
 
         def _to_BNC(t: _t.Tensor) -> _t.Tensor:
             if t.dim() == 3:
-                B, a, b = t.shape
-                if a <= 512 and a < b:
-                    t = t.permute(0, 2, 1).contiguous()
+                # [B, N, 5+nc]
                 return t
-            if t.dim() == 4:
-                if t.shape[1] <= 512 and (
-                    t.shape[1] != t.shape[2] or t.shape[1] != t.shape[3]
-                ):
-                    t = t.permute(0, 2, 3, 1).contiguous()
-                return t.view(t.shape[0], -1, t.shape[-1])
             if t.dim() == 5:
-                if t.shape[-1] <= 512:
-                    return t.view(t.shape[0], -1, t.shape[-1])
-                if t.shape[1] <= 512:
-                    t = t.permute(0, 2, 3, 4, 1).contiguous()
-                    return t.view(t.shape[0], -1, t.shape[-1])
-                t = t.permute(0, 2, 3, 4, 1).contiguous()
-                return t.view(t.shape[0], -1, t.shape[-1])
-            raise RuntimeError(f"Unexpected det tensor shape {tuple(t.shape)}")
+                # [B, A, Sy, Sx, 5+nc] → [B, N, 5+nc]
+                B, A, Sy, Sx, no = t.shape
+                return t.view(B, A * Sy * Sx, no)
+            raise RuntimeError(
+                f"Unsupported detection tensor shape {tuple(t.shape)}; expected [B,N,5+nc] or [B,A,Sy,Sx,5+nc]."
+            )
 
         if isinstance(pred, dict):
-            for k in (
-                "det",
-                "pred",
-                "boxes",
-                "outputs",
-                "head",
-                "yolo_head",
-                "pyramids",
-            ):
+            for k in ("det", "pred", "outputs", "boxes", "head", "yolo_head"):
                 if k in pred:
-                    pred = pred[k]
-                    break
+                    return YOLOPv2._flatten_det(pred[k])
+            raise RuntimeError(
+                f"Unsupported detection dict keys: {list(pred.keys())}; expected one of det/pred/outputs/boxes/head/yolo_head."
+            )
 
         if isinstance(pred, (_t.Tensor, _np.ndarray)):
-            t = _to_tensor(pred)
-            assert t is not None
-            return _to_BNC(t)
+            return _to_BNC(_to_tensor(pred))
 
         if isinstance(pred, (list, tuple)):
+            # Concatenate well-formed tensors
             parts: List[_t.Tensor] = []
             for p in pred:
-                if isinstance(p, (list, tuple, dict)):
-                    try:
-                        t = YOLOPv2._flatten_det(p)
-                    except Exception:
-                        continue
+                if isinstance(p, (_t.Tensor, _np.ndarray)):
+                    parts.append(_to_BNC(_to_tensor(p)))
                 else:
-                    t = _to_tensor(p)
-                    if t is None:
-                        continue
-                    t = _to_BNC(t)
-                parts.append(t)
+                    raise RuntimeError(
+                        "Unsupported nested container in detection outputs; expected list/tuple of tensors."
+                    )
             if not parts:
-                raise RuntimeError("No usable detection tensors found in head output.")
+                raise RuntimeError("Empty detection outputs list.")
             cset = {t.shape[-1] for t in parts}
             if len(cset) != 1:
                 raise RuntimeError(
-                    f"Detection head parts disagree on channel size: {sorted(cset)}"
+                    f"Detection parts disagree on channel size: {sorted(cset)}"
                 )
             return _t.cat(parts, dim=1)
 
@@ -406,13 +387,28 @@ class YOLOPv2:
             # YOLOv5 export decode
             ps = p.sigmoid()
 
-            # build grid in cell coords
-            yv, xv = torch.meshgrid(
-                torch.arange(Ny, device=device),
-                torch.arange(Nx, device=device),
-                indexing="ij",
+            # build grid in cell coords (cache per (Ny,Nx,device))
+            cache_key = (
+                Ny,
+                Nx,
+                device.type,
+                device.index if hasattr(device, "index") else None,
             )
-            grid = torch.stack((xv, yv), dim=-1).view(1, 1, Ny, Nx, 2).float()
+            grid = (
+                getattr(self, "_grid_cache", {}).get(cache_key)
+                if hasattr(self, "_grid_cache")
+                else None
+            )
+            if grid is None or grid.device != device:
+                yv, xv = torch.meshgrid(
+                    torch.arange(Ny, device=device),
+                    torch.arange(Nx, device=device),
+                    indexing="ij",
+                )
+                grid = torch.stack((xv, yv), dim=-1).view(1, 1, Ny, Nx, 2).float()
+                if not hasattr(self, "_grid_cache"):
+                    self._grid_cache = {}
+                self._grid_cache[cache_key] = grid
 
             # anisotropic strides from letterbox size
             sx = W_in / float(Nx)
@@ -468,7 +464,7 @@ class YOLOPv2:
         if self.input_hw is None:
             self.input_hw = _choose_net_hw(W0, H0)  # ≈1280x736 for 16:9
 
-        img, gain, (padw, padh), (W0, H0) = _letterbox(rgb, self.input_hw)
+        img, gain, (padw, padh), (W0, H0), pad_tblr = _letterbox(rgb, self.input_hw)
         x = img
         x_t = (
             torch.from_numpy(x).permute(2, 0, 1).contiguous().float().unsqueeze(0)
@@ -482,12 +478,14 @@ class YOLOPv2:
         else:
             x_t = x_t.to(self.device)
 
-        # Forward
-        try:
-            self.model.to(self.device)
-        except Exception:
-            pass
-        out = self.model(x_t)
+        # Forward (optional mixed precision on CUDA)
+        use_autocast = self.device.type == "cuda"
+        with (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if use_autocast
+            else nullcontext()
+        ):
+            out = self.model(x_t)
 
         # ---- normalize to (det_out, da_logits, ll_logits) WITHOUT unwrapping the tuple
         if isinstance(out, (list, tuple)) and len(out) >= 3:
@@ -511,8 +509,7 @@ class YOLOPv2:
             da_logits,
             self.input_hw,
             (W0, H0),
-            (padw, padh),
-            gain,
+            pad_tblr,
             positive_class=1,
             thresh=self.driveable_area_thresh,
             close_k=3,
@@ -522,8 +519,7 @@ class YOLOPv2:
             ll_logits,
             self.input_hw,
             (W0, H0),
-            (padw, padh),
-            gain,
+            pad_tblr,
             positive_class=1,
             thresh=self.lane_thresh,
             close_k=5,
@@ -579,67 +575,95 @@ class YOLOPv2:
             # Case 2: raw-style [B, N, C]
             det_pred_bnc = self._flatten_det(det_out).to(self.device)
 
-        dp = det_pred_bnc[0].detach().cpu().numpy()
-        C = dp.shape[1]
+        dp_t = det_pred_bnc[0].detach()
+        C = dp_t.shape[1]
         # accept 5 (single-class) or 5+nc
         if C < 5:
             return boxes, da_mask, ll_mask
 
-        cxcy = dp[:, 0:2]
-        wh = dp[:, 2:4]
-        obj = dp[:, 4:5]
-        cls_logits = dp[:, 5:]  # may be empty
+        cxcy = dp_t[:, 0:2]
+        wh = dp_t[:, 2:4]
+        obj = dp_t[:, 4:5]
+        cls_logits = dp_t[:, 5:]  # may be empty
 
-        # normalize obj/cls if logits
-        def _needs_sigmoid(x: np.ndarray) -> bool:
-            return (x.min() < 0.0) or (x.max() > 1.0)
+        # normalize obj/cls if logits without host syncs
+        obj_min, obj_max = obj.min(), obj.max()
+        obj = torch.where((obj_min < 0) | (obj_max > 1), obj.sigmoid(), obj)
 
-        if _needs_sigmoid(obj):
-            obj = 1.0 / (1.0 + np.exp(-obj))
-
-        if cls_logits.size:
-            cls_prob = cls_logits
-            if _needs_sigmoid(cls_logits):
-                cls_prob = 1.0 / (1.0 + np.exp(-cls_logits))
-            scores = (obj * cls_prob).max(axis=1)
-            cls_ids = (obj * cls_prob).argmax(axis=1)
+        if cls_logits.numel() > 0:
+            cls_min, cls_max = cls_logits.min(), cls_logits.max()
+            cls_prob = torch.where(
+                (cls_min < 0) | (cls_max > 1), cls_logits.sigmoid(), cls_logits
+            )
+            mult = obj * cls_prob
+            scores = mult.max(dim=1).values
+            cls_ids = mult.argmax(dim=1)
         else:
             scores = obj.reshape(-1)
-            cls_ids = np.zeros_like(scores, dtype=np.int32)
+            cls_ids = torch.zeros_like(scores, dtype=torch.long)
 
-        # letterboxed canvas → xyxy
+        # letterboxed canvas → xyxy (torch)
         x1y1 = cxcy - wh / 2.0
         x2y2 = cxcy + wh / 2.0
-        xyxy = np.concatenate([x1y1, x2y2], axis=1)
+        xyxy = torch.cat([x1y1, x2y2], dim=1)
 
         keep = scores >= self.conf_thres
-        if not np.any(keep):
+        if not torch.any(keep):
             return boxes, da_mask, ll_mask
         xyxy = xyxy[keep]
         scores_k = scores[keep]
         cls_ids_k = cls_ids[keep]
 
         # un-letterbox to original frame
-        xyxy[:, [0, 2]] -= padw
-        xyxy[:, [1, 3]] -= padh
-        xyxy[:, :4] /= max(gain, 1e-9)
-        xyxy[:, 0] = np.clip(xyxy[:, 0], 0, W0 - 1)
-        xyxy[:, 1] = np.clip(xyxy[:, 1], 0, H0 - 1)
-        xyxy[:, 2] = np.clip(xyxy[:, 2], 0, W0 - 1)
-        xyxy[:, 3] = np.clip(xyxy[:, 3], 0, H0 - 1)
+        xyxy[:, [0, 2]] -= float(padw)
+        xyxy[:, [1, 3]] -= float(padh)
+        xyxy[:, :4] /= max(float(gain), 1e-9)
+        xyxy[:, 0].clamp_(0, W0 - 1)
+        xyxy[:, 1].clamp_(0, H0 - 1)
+        xyxy[:, 2].clamp_(0, W0 - 1)
+        xyxy[:, 3].clamp_(0, H0 - 1)
 
-        # per-class NMS
-        for c in np.unique(cls_ids_k):
-            idx = np.where(cls_ids_k == c)[0]
-            if idx.size == 0:
-                continue
-            keep_idx = _nms_xyxy(xyxy[idx], scores_k[idx], self.iou_thres)
-            for j in keep_idx:
-                x1, y1, x2, y2 = xyxy[idx][j].astype(int)
-                if x2 > x1 and y2 > y1:
-                    boxes.append(
-                        DetBox((x1, y1, x2, y2), float(scores_k[idx][j]), int(c))
-                    )
+        # per-class NMS (prefer torchvision on torch tensors)
+        kept: List[DetBox] = []
+        if tv_nms is not None:
+            for c in torch.unique(cls_ids_k).tolist():
+                idx = torch.where(cls_ids_k == int(c))[0]
+                if idx.numel() == 0:
+                    continue
+                keep_idx = tv_nms(xyxy[idx], scores_k[idx], float(self.iou_thres))
+                sel = idx[keep_idx]
+                for j in sel.tolist():
+                    x1, y1, x2, y2 = xyxy[j].round().to(torch.int64).tolist()
+                    if x2 > x1 and y2 > y1:
+                        kept.append(
+                            DetBox(
+                                (int(x1), int(y1), int(x2), int(y2)),
+                                float(scores_k[j].item()),
+                                int(c),
+                            )
+                        )
+        else:
+            # Fallback to NumPy CPU NMS
+            xyxy_np = xyxy.detach().cpu().numpy()
+            scores_np = scores_k.detach().cpu().numpy()
+            cls_np = cls_ids_k.detach().cpu().numpy()
+            for c in np.unique(cls_np):
+                idx = np.where(cls_np == c)[0]
+                if idx.size == 0:
+                    continue
+                keep_idx = _nms_xyxy(xyxy_np[idx], scores_np[idx], self.iou_thres)
+                for j in keep_idx:
+                    x1, y1, x2, y2 = xyxy_np[idx][j].astype(int)
+                    if x2 > x1 and y2 > y1:
+                        kept.append(
+                            DetBox(
+                                (int(x1), int(y1), int(x2), int(y2)),
+                                float(scores_np[idx][j]),
+                                int(c),
+                            )
+                        )
+
+        boxes.extend(kept)
 
         return boxes, da_mask, ll_mask
 
@@ -712,7 +736,7 @@ def _draw_overlay(
 def main(**kwargs):
     """
     Subscribe to the Vision IPC, run YOLOPv2 per frame, and optionally visualize overlays.
-    Vision IPC delivers RGB HxWx3 frames; convert to BGR for OpenCV and this adapter.
+    Model expects RGB HxWx3 frames.
     """
     # Always load weights from repo root: weights/YOLOPv2.pt
     root_dir = Path(__file__).resolve().parents[2]

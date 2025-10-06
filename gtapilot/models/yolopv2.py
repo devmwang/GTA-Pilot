@@ -11,6 +11,7 @@ from contextlib import nullcontext
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from gtapilot.ipc.vision_ipc import VisionIPCSubscriber
 from gtapilot.ipc.messaging import PubMaster, Message
@@ -56,42 +57,31 @@ def _choose_net_hw(
     return int(target_h), int(target_w)
 
 
-def _letterbox(
-    bgr: np.ndarray,
-    input_hw: Tuple[int, int],
-    color: Tuple[int, int, int] = (114, 114, 114),
-) -> Tuple[
-    np.ndarray, float, Tuple[float, float], Tuple[int, int], Tuple[int, int, int, int]
-]:
+def _compute_letterbox_params(
+    width: int, height: int, input_hw: Tuple[int, int]
+) -> Tuple[float, int, int, int, int, int, int, int, int]:
     """
-    Resize and pad to input_hw (H_in, W_in) keeping aspect ratio. Returns:
-      (padded_img, gain, (padw, padh), (W0, H0), (top, bottom, left, right))
-    where padw/padh are symmetric padding applied on both sides along width/height.
+    Compute letterbox scale and integer paddings.
+    Returns (scale, new_w, new_h, top, bottom, left, right, W0, H0)
     """
     H_in, W_in = int(input_hw[0]), int(input_hw[1])
-    H0, W0 = int(bgr.shape[0]), int(bgr.shape[1])
-
-    scale = min(W_in / max(W0, 1e-9), H_in / max(H0, 1e-9))
+    H0, W0 = int(height), int(width)
+    if H0 <= 0 or W0 <= 0:
+        return 1.0, W_in, H_in, 0, 0, 0, 0, W0, H0
+    scale = min(W_in / float(max(W0, 1)), H_in / float(max(H0, 1)))
     new_w = int(round(W0 * scale))
     new_h = int(round(H0 * scale))
-
-    resized = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     padw = (W_in - new_w) / 2.0
     padh = (H_in - new_h) / 2.0
-
     top = int(round(padh))
     bottom = int(round(H_in - new_h - top))
     left = int(round(padw))
     right = int(round(W_in - new_w - left))
-    padded = cv2.copyMakeBorder(
-        resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
-    )
-
-    return padded, scale, (padw, padh), (W0, H0), (top, bottom, left, right)
+    return scale, new_w, new_h, top, bottom, left, right, W0, H0
 
 
 def _mask_from_logits(
-    logits: Any,
+    logits: torch.Tensor,
     input_hw: Tuple[int, int],
     orig_wh: Tuple[int, int],
     pad_tblr: Tuple[int, int, int, int],
@@ -101,78 +91,55 @@ def _mask_from_logits(
     dilate_k: int = 1,
 ) -> np.ndarray:
     """
-    Convert raw segmentation logits to an original-resolution binary mask (uint8 in {0,255}).
-    Accepts torch.Tensor of shape [B,C,h,w] or [C,h,w], or numpy arrays with similar shapes.
+    Convert raw segmentation logits to original-resolution binary mask.
+    Performs upsample to input canvas, crop (remove padding), and final resize on GPU.
     """
-    # to numpy [C,h,w]
-    if isinstance(logits, torch.Tensor):
-        t = logits.detach()
-        if t.dim() == 4:
-            t = t[0]
-        t_np = t.float().cpu().numpy()
-    elif isinstance(logits, np.ndarray):
-        t_np = logits
-        if t_np.ndim == 4:
-            t_np = t_np[0]
-    elif isinstance(logits, (list, tuple)) and logits:
-        # try common container patterns
-        return _mask_from_logits(
-            logits[0],
-            input_hw,
-            orig_wh,
-            pad_tblr,
-            positive_class,
-            thresh,
-            close_k,
-            dilate_k,
-        )
-    else:
-        # Unknown; return empty mask
-        W0, H0 = orig_wh
-        return np.zeros((H0, W0), dtype=np.uint8)
-
-    # ensure [C,h,w]
-    if t_np.ndim == 2:
-        # already [h,w] single-channel
-        pos = t_np
-    elif t_np.ndim == 3:
-        C = t_np.shape[0]
+    t = logits.detach()
+    # Ensure [C,h,w]
+    if t.dim() == 4:
+        t = t[0]
+    if t.dim() == 2:
+        pos = t
+    elif t.dim() == 3:
+        C = t.shape[0]
         idx = min(positive_class, max(0, C - 1))
-        pos = t_np[idx]
+        pos = t[idx]
     else:
-        W0, H0 = orig_wh
+        W0, H0 = int(orig_wh[0]), int(orig_wh[1])
         return np.zeros((H0, W0), dtype=np.uint8)
 
-    # Convert to probability if values look like logits
-    if pos.min() < 0.0 or pos.max() > 1.0:
-        pos = 1.0 / (1.0 + np.exp(-pos))
+    # If logits, apply sigmoid; avoid host sync by using GPU scalar conditions
+    pos_min, pos_max = pos.min(), pos.max()
+    pos = torch.where((pos_min < 0) | (pos_max > 1), pos.sigmoid(), pos)
 
-    mask_small = (pos >= float(thresh)).astype(np.uint8) * 255
+    # Threshold → {0,1} float for interpolation
+    mask_small = (pos >= float(thresh)).to(dtype=torch.float32)
+    # [h,w] → [1,1,h,w]
+    mask_small = mask_small.unsqueeze(0).unsqueeze(0)
 
-    # upsample to input canvas (letterboxed) size
-    H_in, W_in = int(input_hw[0]), int(input_hw[1])
-    mask_canvas = cv2.resize(mask_small, (W_in, H_in), interpolation=cv2.INTER_NEAREST)
+    H_in_g, W_in_g = int(input_hw[0]), int(input_hw[1])
+    # Upsample to input canvas
+    mask_canvas = F.interpolate(mask_small, size=(H_in_g, W_in_g), mode="nearest")
 
-    # remove padding (crop to unpadded region) using exact integer paddings
+    # Crop padding
     top, bottom, left, right = pad_tblr
-    x1 = int(left)
-    y1 = int(top)
-    x2 = int(W_in - right)
-    y2 = int(H_in - bottom)
-    x1 = max(0, min(x1, W_in))
-    x2 = max(0, min(x2, W_in))
-    y1 = max(0, min(y1, H_in))
-    y2 = max(0, min(y2, H_in))
+    y1 = max(0, min(int(top), H_in_g))
+    y2 = max(0, min(int(H_in_g - bottom), H_in_g))
+    x1 = max(0, min(int(left), W_in_g))
+    x2 = max(0, min(int(W_in_g - right), W_in_g))
     if x2 <= x1 or y2 <= y1:
-        cropped = np.zeros((1, 1), dtype=np.uint8)
+        cropped = mask_canvas.new_zeros((1, 1, 1, 1))
     else:
-        cropped = mask_canvas[y1:y2, x1:x2]
+        cropped = mask_canvas[:, :, y1:y2, x1:x2]
 
-    # scale back to original resolution
+    # Resize to original resolution
     W0, H0 = int(orig_wh[0]), int(orig_wh[1])
-    mask = cv2.resize(cropped, (W0, H0), interpolation=cv2.INTER_NEAREST)
+    resized = F.interpolate(cropped, size=(H0, W0), mode="nearest")
+    # To uint8 0/255 on CPU
+    out = (resized.squeeze().clamp(0, 1) * 255.0).to(dtype=torch.uint8)
+    mask = out.detach().cpu().numpy()
 
-    # morphology for cleanups
+    # morphology for cleanups (on CPU to match prior behavior)
     if close_k and close_k > 1:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
@@ -208,6 +175,8 @@ class YOLOPv2:
         px_import_name: str = "yolopv2",
         px_entry_attr: str = "load_model",
         px_weights: Optional[str] = None,
+        res_height=864,  # 32 * 3 * 9
+        res_width=1536,  # 32 * 3 * 16
     ):
         # Always prefer CUDA if available, regardless of requested device
         prefer_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -216,7 +185,7 @@ class YOLOPv2:
         self.iou_thres = float(iou_thres)
         self.lane_thresh = float(lane_thresh)
         self.driveable_area_thresh = float(driveable_area_thresh)
-        self.input_hw: Optional[Tuple[int, int]] = None
+        self.input_hw = (res_height, res_width)
 
         self.model: Any
         self._is_jit: bool = False
@@ -462,21 +431,31 @@ class YOLOPv2:
     def infer(self, rgb: np.ndarray) -> Tuple[List[DetBox], np.ndarray, np.ndarray]:
         H0, W0 = rgb.shape[:2]
         if self.input_hw is None:
-            self.input_hw = _choose_net_hw(W0, H0)  # ≈1280x736 for 16:9
+            self.input_hw = _choose_net_hw(W0, H0)
 
-        img, gain, (padw, padh), (W0, H0), pad_tblr = _letterbox(rgb, self.input_hw)
-        x = img
-        x_t = (
-            torch.from_numpy(x).permute(2, 0, 1).contiguous().float().unsqueeze(0)
-            / 255.0
+        scale, new_w, new_h, top, bottom, left, right, W0, H0 = (
+            _compute_letterbox_params(W0, H0, self.input_hw)
         )
-        if self.device.type == "cuda":
-            try:
-                x_t = x_t.pin_memory().to(self.device, non_blocking=True)
-            except Exception:
-                x_t = x_t.to(self.device)
-        else:
-            x_t = x_t.to(self.device)
+
+        x_t = torch.tensor(rgb, device=self.device)
+        x_t = (
+            x_t.permute(2, 0, 1)
+            .contiguous()
+            .unsqueeze(0)
+            .to(dtype=torch.float32)
+            .div(255.0)
+        )
+        # Resize to (new_h, new_w)
+        if new_h != H0 or new_w != W0:
+            x_t = F.interpolate(
+                x_t, size=(new_h, new_w), mode="bilinear", align_corners=False
+            )
+        # Pad to (H_in, W_in)
+        if top or bottom or left or right:
+            x_t = F.pad(x_t, (left, right, top, bottom), value=114.0 / 255.0)
+        padw, padh = (left + right) / 2.0, (top + bottom) / 2.0
+        pad_tblr = (top, bottom, left, right)
+        gain = float(scale)
 
         # Forward (optional mixed precision on CUDA)
         use_autocast = self.device.type == "cuda"
@@ -504,7 +483,7 @@ class YOLOPv2:
         # one-time shapes
         self._debug_dump_shapes(det_out, da_logits, ll_logits)
 
-        # --- SEGMENTATION
+        # --- SEGMENTATION (GPU upsample/crop path)
         da_mask = _mask_from_logits(
             da_logits,
             self.input_hw,

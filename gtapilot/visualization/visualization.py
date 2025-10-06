@@ -8,7 +8,7 @@ from gtapilot.ipc.messaging import SubMaster
 
 
 def main():
-    visionIPCSubscriber = VisionIPCSubscriber()
+    visionIPCSubscriber = VisionIPCSubscriber(latestOnly=True)
     sub = SubMaster()
     # Subscribe to topics produced by YOLOPv2 model process
     sub.add_topic("lane_lines")
@@ -25,7 +25,10 @@ def main():
 
             if frame is not None:
                 # Process the frame (e.g., display it, save it, etc.)
-                frame = cv2.resize(frame, (1920, 1080), interpolation=cv2.INTER_LINEAR)
+                if frame.shape[0] != 1080 or frame.shape[1] != 1920:
+                    frame = cv2.resize(
+                        frame, (1920, 1080), interpolation=cv2.INTER_LINEAR
+                    )
                 frame = cv2.cvtColor(
                     frame, cv2.COLOR_RGB2BGR
                 )  # Convert RGB to BGR for OpenCV

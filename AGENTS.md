@@ -27,7 +27,8 @@ present them as already implemented.
 - PyTorch and torchvision are now project dependencies.
 - Runtime stack is still multi-process and ZeroMQ-based.
 - Live capture is primarily the native Windows DX11 executable in `bin/`.
-- Python `bettercam` capture remains as a fallback implementation.
+- Python video override remains for offline testing, but live capture is the
+  native DX11 path.
 
 ## 2. Entry Points
 
@@ -232,8 +233,8 @@ reintroduce a global shutdown event.
 These old systems are no longer part of the runtime contract:
 
 - old perception worker stack based on YOLO / lane masks / drivable masks
-- older IPC modules such as `gtapilot.ipc.messaging`,
-  `gtapilot.ipc.vision_ipc`, and `gtapilot.ipc.action_ipc`
+- older IPC modules such as `gtapilot.ipc.messaging` and the deleted
+  stream-specific frame/action IPC layer
 - planner-facing visualization overlays driven by that stack
 
 When cleaning up similar code in the future:

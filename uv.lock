@@ -9,19 +9,6 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "bettercam"
-version = "1.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "comtypes" },
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/96/27/bf39ca1caaaac0aedfdc77929608b316cce2bab7fc6f5f2643e3c107793b/bettercam-1.0.0.tar.gz", hash = "sha256:122cc0e905cb40be8f2a26e46ee587bae40c10eb9c23201370a54e68b84a0940", size = 19269, upload-time = "2023-11-22T08:25:15.705Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3c/66/c16181c6e036e60f41161ea31f78d4ffe76babbdad1e82499226e55bfecf/bettercam-1.0.0-py3-none-any.whl", hash = "sha256:0690b2289683725d875eb877db13a8c628935816866ef8ec0751945e988f32ac", size = 21029, upload-time = "2023-11-22T08:25:13.676Z" },
-]
-
-[[package]]
 name = "cffi"
 version = "1.17.1"
 source = { registry = "https://pypi.org/simple" }
@@ -75,7 +62,6 @@ name = "gtapilot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "bettercam" },
     { name = "comtypes" },
     { name = "numpy" },
     { name = "opencv-python" },
@@ -90,7 +76,6 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bettercam", specifier = "==1.0.0" },
     { name = "comtypes", specifier = "==1.4.12" },
     { name = "numpy", specifier = "==2.3.2" },
     { name = "opencv-python", specifier = "==4.11.0.86" },
@@ -570,12 +555,12 @@ dependencies = [
     { name = "typing-extensions", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313-manylinux_2_28_aarch64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313-manylinux_2_28_x86_64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313-win_amd64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313t-manylinux_2_28_aarch64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313t-manylinux_2_28_x86_64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313t-win_amd64.whl" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:ad2d64316635e7ab06f6c973a252526d59a92a2045825c102f876914a72304d0" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:563740167be2189b71530b503f0c8a8d7a8267dd49d4de6f9c5f1d23fbe237df" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313-win_amd64.whl", hash = "sha256:2cef066f9759ff4d7868a8c3695aa60d9a878598acb3685bb1ef2fdac29dcd68" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:2982bf34249cbb38f1090e71ad7097a214a21023ccdc0413961986ab7d0396e6" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:6344260959ebcfa6dae458e1c4365195bcfdf00f4f1f1ad438cbaf50756829ed" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp313-cp313t-win_amd64.whl", hash = "sha256:9c0cd89e54ce44ce3208c5cf4163773b9cda0067e4b48cfcac56a4e04af52040" },
 ]
 
 [[package]]
@@ -591,8 +576,8 @@ dependencies = [
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu129/torchvision-0.23.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:20f7e25a24f91d93d09398b80929dec805c4ee2f5527fad8eecd6e43dc5fd5d0" },
-    { url = "https://download.pytorch.org/whl/cu129/torchvision-0.23.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:cb70cc000e6a398270044c3406a89ee8ab6157a4e81b5d40c5904e1d0e22e2f8" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.23.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:20f7e25a24f91d93d09398b80929dec805c4ee2f5527fad8eecd6e43dc5fd5d0" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.23.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:cb70cc000e6a398270044c3406a89ee8ab6157a4e81b5d40c5904e1d0e22e2f8" },
 ]
 
 [[package]]
@@ -626,10 +611,10 @@ dependencies = [
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:04316e24ddd1cee3b301208811a9d7c4cfca5f566ea367f33bda059d8f0e012e" },
-    { url = "https://download.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313-win_amd64.whl", hash = "sha256:a486a0cee466807a17749d0b916d52088343453dc911baa20f0f459b2fa43c9a" },
-    { url = "https://download.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:c718f6d2c0e61feed39763925eea3e1f42979f6b21e61276f487409168d9e352" },
-    { url = "https://download.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313t-win_amd64.whl", hash = "sha256:8218c1f614972abb4710afde96d0f70b174b235f390e165e6fd4cdd5cee6d93d" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:04316e24ddd1cee3b301208811a9d7c4cfca5f566ea367f33bda059d8f0e012e" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313-win_amd64.whl", hash = "sha256:a486a0cee466807a17749d0b916d52088343453dc911baa20f0f459b2fa43c9a" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:c718f6d2c0e61feed39763925eea3e1f42979f6b21e61276f487409168d9e352" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp313-cp313t-win_amd64.whl", hash = "sha256:8218c1f614972abb4710afde96d0f70b174b235f390e165e6fd4cdd5cee6d93d" },
 ]
 
 [[package]]

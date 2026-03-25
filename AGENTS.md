@@ -1,179 +1,286 @@
-# AGENTS.md — GTA Pilot Coding Agent Playbook (Current Codebase Aware)
+# AGENTS.md - GTA Pilot Coding Agent Playbook
 
-Audience: autonomous / semi-autonomous coding agent operating on this repository.
-Goal (today): Maintain and extend a multi-process frame pipeline (display capture OR video file → ZeroMQ vision IPC → visualization (+ optional blackbox recorder)) while preserving stability and correctness. Future ML (depth/detection) is a roadmap item, not yet implemented.
+Audience: coding agents working inside this repository.
 
-## 1. Repository Facts (Ground Truth Now)
+Goal (current codebase): maintain and extend the Atlas-oriented runtime and data
+collection stack:
 
--   Language: Python 3.14 (`pyproject.toml`).
--   Package: `gtapilot` (import path matches directory name; no underscore variant).
--   Existing external deps: `bettercam`, `opencv-python`, `pyzmq` (declared as `zmq` in pyproject), `setproctitle`, `numpy`.
--   No PyTorch / CUDA code yet. Any ML additions must add dependency explicitly & minimally.
--   Virtual env: use `uv`; location `.venv/`.
+display capture OR video override -> generic channel IPC -> visualization / blackbox
+manual keyboard input capture -> generic channel IPC -> visualization / blackbox
 
-## 2. Executables / Entry Points
+The current runtime only records and consumes inference-time sources:
 
-Main user entrypoint (argument parsing): `gtapilot/main.py`.
+- front RGB frames
+- executed actions
+- timestamps and source metadata
 
-Run commands:
+Privileged sensors and labels are a later ScriptHook-based project. Do not
+present them as already implemented.
+
+# When making changes: Always use hard-cutover changes, never have backwards compatibility.
+
+## 1. Ground Truth
+
+- Language: Python 3.13+ (`pyproject.toml` currently requires `~=3.13`).
+- Package: `gtapilot`.
+- Atlas scaffolding exists under `gtapilot/atlas`.
+- PyTorch and torchvision are now project dependencies.
+- Runtime stack is still multi-process and ZeroMQ-based.
+- Live capture is primarily the native Windows DX11 executable in `bin/`.
+- Python `bettercam` capture remains as a fallback implementation.
+
+## 2. Entry Points
+
+Main CLI entrypoint: `gtapilot/main.py`
+
+Typical runs:
 
 ```bash
 uv venv .venv
-uv pip install -e . || uv pip install -r requirements.txt
+uv pip install -e .
 
-# Live display capture (display index hard-coded as 1 in coordinator build)
+# Live capture
 uv run ./gtapilot/main.py
 
-# Video override (plays file frames instead of live capture)
+# Video override instead of live capture
 uv run ./gtapilot/main.py --video-override path/to/video.mp4
+
+# Select display index explicitly
+uv run ./gtapilot/main.py --display-id 0
 ```
 
-Shutdown triggers (supervisor model):
+Shutdown triggers:
 
--   ESC key in coordinator console (Windows via `msvcrt`)
--   Ctrl+C / SIGINT / SIGTERM to coordinator
--   Any child process exiting (normal return or crash) — e.g. visualization window ESC/'q' closes that process
+- ESC in the coordinator console on Windows
+- Ctrl+C / SIGINT / SIGTERM to the coordinator
+- any child process exiting
 
-After the first trigger the coordinator force-terminates remaining processes. There is no shared `shutdown_event` anymore.
+After the first trigger, the coordinator force-terminates the remaining child
+processes. There is no shared shutdown event.
 
-## 3. Processes & Responsibilities
+## 3. Active Processes
 
-Coordinator (`gtapilot.coordinator.coordinator.main`):
+Coordinator: `gtapilot.coordinator.coordinator.main`
 
--   Builds list of `PythonProcess` objects (see `gtapilot.coordinator.process`), starts them, monitors liveness, and on ANY child exit or external trigger performs a single shutdown cascade (terminate + join timeout) recording root cause.
+Current worker set:
 
-Workers launched (current set):
+1. `DisplayCaptureDX11`
+   Native executable `bin/DisplayCaptureDX11.exe`
+   Live desktop capture on Windows, publishes RGB frames to the `vision.frames`
+   channel.
 
-1. `DisplayCapture` (`gtapilot.display_capture.display_capture.main`) — live screen capture via `bettercam`; publishes frames.
-2. `DisplayOverride` (mutually exclusive) (`gtapilot.display_capture.display_override.main`) — reads frames from video file path provided by `--video-override`.
-3. `Visualization` (`gtapilot.visualization.visualization.main`) — subscribes to frames, overlays FPS, displays via OpenCV window.
-4. `Blackbox` (`gtapilot.blackbox.blackbox.main`) — optional; only spawned if `BLACKBOX_ENABLED = True` in `gtapilot.config`.
+2. `DisplayOverride`
+   `gtapilot.display_capture.display_override.main`
+   Uses a video file instead of live capture and publishes RGB frames to the
+   `vision.frames` channel.
 
-Future (NOT implemented; treat as roadmap): depth worker, detection worker, separate messaging IPC, protocol-structured control messages.
+3. `ActionCapture`
+   `gtapilot.input_capture.input_capture.main`
+   Polls keyboard state and publishes action packets to the `input.actions`
+   channel.
 
-## 4. Vision IPC (Only IPC Layer Present)
+4. `Visualization`
+   `gtapilot.visualization.visualization.main`
+   Displays the latest frame with FPS and action overlays.
 
-Module: `gtapilot.ipc.vision_ipc`.
-Pattern: ZeroMQ PUB/SUB; publisher binds; subscribers connect. Topic: `b"frames"`.
-Frame format: NumPy `uint8` RGB, shape `(H, W, 3)` (NHWC). Serialization: pickle metadata dict (`dtype`, `shape`) + raw contiguous bytes (`frame.tobytes()`). No compression. Not zero-copy yet; full copy per publish.
+5. `Blackbox`
+   `gtapilot.blackbox.blackbox.main`
+   Optional recorder enabled by `BLACKBOX_ENABLED` in `gtapilot/config.py`.
 
-Subscriber buffering: bounded deque (default `buffer_size=10`) + background receive thread. Consumer pops frames with `receive_frame(blocking=True)` or `get_latest_frames(count)`. Optional conflation (`conflate=True`) keeps only most recent frame.
+Deprecated runtime systems based on the old depth / YOLO / lane-mask pipeline
+have been removed from the live process graph.
 
-Agent rules for modifying Vision IPC:
+## 4. Generic Channel IPC
 
-1. Maintain current wire contract unless versioning metadata (add key `"v"` if expanded).
-2. If adding compression or alt transport, keep old path configurable and default stable.
-3. Ensure clean shutdown: stop receive thread, close socket, term context.
+Public modules:
 
-## 5. Blackbox Recorder
+- `gtapilot.ipc.types`
+- `gtapilot.ipc.codecs`
+- `gtapilot.ipc.channel`
+- `gtapilot.ipc.channels`
 
-Writes BMP frames into a TAR archive plus JSON metadata file inside `blackbox-recordings/` using a timestamped prefix `capture_<YYYYmmdd_HHMMSS>`. Activation: toggle `BLACKBOX_ENABLED` in `gtapilot/config.py`. Avoid changing output format silently—if format evolves, include a `schema_version` field in JSON.
+Pattern:
 
-## 6. Safe Extension Patterns
+- ZeroMQ PUB/SUB
+- publishers bind
+- subscribers connect
+- every stream uses the same multipart wire format:
+  `[topic, envelope_json, payload_bytes]`
 
-Adding a new worker (e.g., experimental analytics):
+Current active channel specs:
 
-1. Create `gtapilot/<new_module>.py` exposing `def main(**kwargs):` (no shutdown_event).
-2. Loop pattern:
+- `VISION_FRAMES_CHANNEL`
+  - name: `vision.frames`
+  - port: `55550`
+  - topic: `b"frames"`
+  - codec: `RawRGBFrameCodec`
+- `INPUT_ACTIONS_CHANNEL`
+  - name: `input.actions`
+  - port: `55552`
+  - topic: `b"actions"`
+  - codec: `JsonDataclassCodec(ActionPacket)`
 
-```python
-def main():
-  # init resources
-  try:
-    while True:
-      # work
-      pass
-  finally:
-    # release resources (may be skipped if force terminated)
-    pass
-```
+Shared envelope contract (version `1`):
 
-3. Register in `build_processes` (ordering: producers then consumers is fine).
-4. To end intentionally, break/return; coordinator will cascade shutdown.
-5. Avoid `os._exit` (coordinator handles exit codes).
-6. Heavy imports inside `main()` only.
+- `v`
+- `channel`
+- `encoding`
+- `sequence_id`
+- `message_timestamp_ns`
+- `publish_timestamp_ns`
+- `source`
+- `metadata`
 
-Introducing ML (future): add `torch` only when first ML worker lands; load models lazily inside the worker.
+Vision payload contract:
 
-## 7. Testing Strategy (To Be Implemented)
+- raw RGB `uint8`
+- shape `(H, W, 3)`
+- encoding `raw_rgb_v1`
+- metadata fields:
+  - `w`
+  - `h`
+  - `channels`
+  - `dtype`
+  - `frame_id`
+  - `capture_timestamp_ns`
+  - `is_repeat`
 
-Create `tests/` directory. Suggested initial tests:
+Action payload contract:
 
-1. Vision IPC round-trip: publish synthetic `(8, 8, 3)` frame; subscriber receives correct shape & dtype within timeout.
-2. Blackbox recording: simulate N frames, force shutdown, assert TAR + JSON exist; verify metadata length matches stored entries.
-3. Graceful shutdown: start a minimal publisher & subscriber in processes with a short runtime and ensure processes exit on event set.
+- `ActionPacket`
+- action vector order:
+  `[steer, throttle, brake, handbrake, reverse, pilot_active]`
+- payload fields:
+  - `steer`
+  - `throttle`
+  - `brake`
+  - `handbrake`
+  - `reverse`
+  - `pilot_active`
+  - `raw_inputs`
 
-Fixtures: Provide helper to spin up a `VisionIPCPublisher` bound to ephemeral port (parameterize port), and an isolated subscriber. Use `pytest` markers to skip tests if Windows-specific constraints arise (e.g., screen capture unavailable in CI).
+Current action source is keyboard-only. `reverse` is not inferred reliably yet
+and is currently published as `0.0` until vehicle-state integration lands.
 
-## 8. Performance Considerations (Current State)
+Rules:
 
--   Target capture FPS: 20 (`TARGET_FPS = 20`).
--   Avoid unnecessary `time.sleep()` in visualization; currently acceptable. If latency spikes, enable subscriber conflation.
--   Resize always to 1920x1080 in visualization; add a conditional skip when source already matches to save cycles.
--   If backlog / dropped frames appear: increase `buffer_size` or enable `conflate=True`.
+1. Preserve the generic envelope contract unless you intentionally version it.
+2. New streams should be added by defining a `ChannelSpec` and payload codec or
+   payload schema, not by adding one-off IPC modules.
+3. Keep subscribers able to shut down cleanly: stop background thread, close
+   socket, terminate context.
+4. Do not silently switch to compression or a different transport without
+   documentation and an intentional encoding change.
 
-Future ML guidance (when added): single NHWC→NCHW conversion, `.contiguous()`, reuse device tensors, potential pinned host buffers for faster H2D copies.
+## 6. Blackbox Recorder
 
-## 9. Refactor & Change Control Guidelines
+The blackbox currently records inference-time data only.
 
-1. Do not rename existing `main` functions without adjusting coordinator references.
-2. Preserve argument names used in `build_processes` (e.g., `video_path`, `display`).
-3. There is no shared shutdown event; loops run until they exit voluntarily or crash.
-4. On IPC modifications, document change in both this file and `copilot-instructions.md`.
-5. Add minimal inline type hints for new public functions.
-6. If a worker needs grace to flush state, implement periodic incremental flush (do NOT reintroduce a global Event).
+Outputs under `blackbox-recordings/`:
 
-## 10. Logging & Diagnostics Roadmap
+- `capture_<timestamp>_frames.tar`
+- `capture_<timestamp>_metadata.json`
 
-Current state: plain `print()`; coordinator prefixes with `[Coordinator]`. Roadmap: introduce `logging` configured once before spawning with process name in format. Avoid logger setup in worker import scope.
+Current manifest schema version: `3`
 
-## 11. Commit Message Template
+The manifest records:
 
-```
-area: concise change summary
+- session metadata
+- per-frame metadata and archive filename
+- per-frame envelope data
+- frame-aligned action payload
+- frame-aligned action envelope data
+- frame-aligned action vector
+- raw action stream entries
 
-Why: short rationale
-How: key implementation notes
-Tests: new/updated tests & coverage focus
-Impact: perf, memory, compatibility (mention if any IPC contract changes)
-```
+Behavior notes:
 
-## 12. PR Expectations
+- frames are stored as BMP inside the tar
+- metadata is flushed incrementally during capture
+- abrupt termination can still lose a small tail of in-memory state
 
--   If adding tests: `uv run pytest -q` (once tests directory exists) passes locally.
--   If adding deps: update `pyproject.toml` and justify necessity (prefer optional extras if large).
--   Provide a short manual run snippet demonstrating feature (esp. new worker).
--   Confirm blackbox still functions (or explain intentional changes).
+Do not silently change the manifest format. If it must evolve, bump
+`schema_version`.
 
-## 13. Common Pitfalls (Current Tech Stack)
+## 7. Atlas Data Collection Scope
 
--   Forgetting to close / term ZMQ sockets -> hanging process on Windows.
--   Letting subscriber buffer starve the consumer (always pop frames promptly if real-time display is desired).
--   Hard-coding display index incorrectly (currently `1`); if user has single monitor, may need `0`—make configurable in future PR.
--   Assuming Torch exists (it does not yet). Do not import `torch` until added as dependency.
+For now, only collect inference-time sources needed by Atlas:
 
-## 14. Shutdown Semantics (Current Model)
+- front RGB frames
+- action vectors
+- timestamps
+- source identity / repeat flags
 
--   Triggers: ESC key (Windows console), SIGINT/SIGTERM, any child process exit (exitcode 0 or non-zero), coordinator internal error.
--   First trigger recorded; subsequent triggers ignored (idempotent).
--   Termination: forceful `terminate()`; child `finally` blocks may not run.
--   Blackbox metadata could lose last <1s of entries on abrupt terminate (future incremental flush improvement).
--   Soft-stop control channel is a roadmap item; do not add ad-hoc global events.
+Do not add fake placeholders for privileged labels. Those belong in a later
+ScriptHook-based data engine.
 
-## 15. Roadmap (Explicit – Not Yet Implemented)
+## 8. Safe Extension Patterns
 
-| Feature            | Outline                                                           | Notes                                                                 |
-| ------------------ | ----------------------------------------------------------------- | --------------------------------------------------------------------- |
-| Depth worker       | Torch model consuming frames, producing per-pixel depth           | Add messaging or reuse vision IPC with variant topic (`frames_depth`) |
-| Detection worker   | YOLO/segmentation inference; overlay engine                       | Keep result data lightweight (boxes, scores)                          |
-| Messaging IPC      | Lightweight control channel (heartbeats, shutdown reasons, stats) | Could be separate ZMQ PUB/SUB or `multiprocessing.Queue`              |
-| Structured logging | Logging config + optional JSON                                    | Enables easier telemetry collection                                   |
-| Config system      | Dataclass or `pydantic` central config                            | Reduces hard-coded values                                             |
+When adding a new worker:
 
-Do not reference roadmap features as if they already exist in user-facing docs or code.
+1. Create `gtapilot/<module>/<file>.py` with `def main(...):`
+2. Initialize heavy resources inside `main()`, not at import time
+3. Use a simple `while True` loop and rely on process termination semantics
+4. Register the worker in `build_processes`
+5. Prefer additive, reversible changes over broad rewrites
 
-## 16. When Unsure
+If a worker needs graceful flushing, make it periodic and incremental. Do not
+reintroduce a global shutdown event.
 
-1. Re-read `copilot-instructions.md` (kept in sync with this file).
-2. Inspect modules in order of data flow: `display_capture/` → `ipc/vision_ipc.py` → `visualization/` → `blackbox/`.
-3. Prefer additive, reversible changes with tests over speculative rewrites.
+## 9. Deprecated Systems
+
+These old systems are no longer part of the runtime contract:
+
+- old perception worker stack based on YOLO / lane masks / drivable masks
+- older IPC modules such as `gtapilot.ipc.messaging`,
+  `gtapilot.ipc.vision_ipc`, and `gtapilot.ipc.action_ipc`
+- planner-facing visualization overlays driven by that stack
+
+When cleaning up similar code in the future:
+
+- remove the worker from the coordinator
+- remove the IPC surface
+- remove dead imports and docs in the same change
+
+## 10. Testing Guidance
+
+Preferred tests for runtime code:
+
+1. Generic channel round-trip on synthetic RGB frames
+2. Generic channel round-trip on synthetic action packets
+3. Blackbox recording smoke test with synthetic frame/action streams
+4. Coordinator process-list smoke test
+
+Atlas model tests live separately under `tests/`.
+
+## 11. Performance Notes
+
+- target capture FPS is currently 20
+- visualization should avoid unnecessary resizes
+- heavy work should not run in the display capture loop
+- if latency rises, prefer conflation or bounded buffering over unbounded queues
+
+For Atlas itself, keep the current runtime focused on data movement and
+recording. Do not move training or inference into the capture workers.
+
+## 12. Documentation Rules
+
+`AGENTS.md` is the source-of-truth runtime playbook for this repository.
+
+If you change the generic channel framework, blackbox schema, or the active
+runtime graph, update `AGENTS.md` in the same change.
+
+## 13. When Unsure
+
+Inspect the runtime in data-flow order:
+
+1. `gtapilot/display_capture/` or `gtapilot/native/display_capture/`
+2. `gtapilot/ipc/channel.py`
+3. `gtapilot/ipc/channels.py`
+4. `gtapilot/input_capture/input_capture.py`
+5. `gtapilot/visualization/visualization.py`
+6. `gtapilot/blackbox/blackbox.py`
+7. `gtapilot/atlas/`
+
+Prefer small, testable changes that keep the frame/action capture contract
+stable.

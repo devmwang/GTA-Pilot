@@ -1,7 +1,6 @@
-// RAW-only capture: DXGI Desktop Duplication -> D3D11 shared texture ring
-// (keyed mutex) + ZeroMQ pubs. Publishes:
-//   - RAW RGB (resized) on tcp://127.0.0.1:55550 topic "frames"
-//   - GPU handles on tcp://127.0.0.1:55551 topic "frames_gpu"
+// Atlas capture source: DXGI Desktop Duplication -> D3D11 staging ring ->
+// ZeroMQ PUB. Publishes raw RGB frames on tcp://127.0.0.1:55550 topic
+// "frames" using the shared generic channel envelope contract.
 
 #include <d3d11.h>
 #include <dxgi1_6.h>
@@ -26,7 +25,9 @@
 #pragma comment(lib, "winmm.lib")
 static constexpr const char *PUBLISH_ADDRESS = "tcp://127.0.0.1:55550";
 static constexpr const char *FRAMES_CPU_TOPIC = "frames";
-// static constexpr const char *FRAMES_GPU_TOPIC = "frames_gpu";
+static constexpr const char *VISION_CHANNEL = "vision.frames";
+static constexpr const char *FRAME_SOURCE = "display_capture_dx11";
+static constexpr int CHANNEL_ENVELOPE_VERSION = 1;
 
 using Microsoft::WRL::ComPtr;
 using json = nlohmann::json;
@@ -95,42 +96,6 @@ struct DupCtx {
     }
 };
 
-struct Slot {
-    ComPtr<ID3D11Texture2D> tex;
-    ComPtr<IDXGIKeyedMutex> mtx;
-    HANDLE shared = nullptr;
-    UINT W = 0, H = 0;
-};
-
-static HANDLE createShared(ID3D11Texture2D *t) {
-    ComPtr<IDXGIResource1> r1;
-    hrx(t->QueryInterface(IID_PPV_ARGS(&r1)), "QI IDXGIResource1");
-    HANDLE h{};
-    hrx(r1->CreateSharedHandle(
-            nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-            nullptr, &h),
-        "CreateSharedHandle");
-    return h;
-}
-
-static ComPtr<ID3D11Texture2D> makeSharedTex(ID3D11Device *dev, UINT W,
-                                             UINT H) {
-    D3D11_TEXTURE2D_DESC d{};
-    d.Width = W;
-    d.Height = H;
-    d.MipLevels = 1;
-    d.ArraySize = 1;
-    d.Format = CAP_FMT;
-    d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_DEFAULT;
-    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
-                  D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-    ComPtr<ID3D11Texture2D> t;
-    hrx(dev->CreateTexture2D(&d, nullptr, &t), "CreateTexture2D");
-    return t;
-}
-
 // CPU: convert BGRA8 to RGB8 with nearest resize to (outW,outH).
 static void convertBGRA_to_RGB_resized(const uint8_t *bgra, int srcW, int srcH,
                                        int srcPitch, int outW, int outH,
@@ -195,6 +160,13 @@ struct ScopedReleaseFrame {
 //     }();
 //     return hz;
 // }
+
+static inline uint64_t unix_time_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
 
 static ComPtr<IDXGIOutput> select_output_by_index(int index, int &out_count) {
     out_count = 0;
@@ -283,21 +255,17 @@ int main(int argc, char **argv) {
         // pubGPU.set(zmq::sockopt::linger, 0);
         // pubGPU.bind("tcp://127.0.0.1:55551"); // frames_gpu
 
-        // Use nanoseconds to avoid integer rounding; target period = 50 ms @ 20
-
         // FPS
         const auto period = std::chrono::nanoseconds(1'000'000'000 / CAP_FPS);
         uint64_t fid = 1;
 
         std::vector<uint8_t> rgb;
+        std::array<uint64_t, 2> stagingCaptureTimestampNs{};
 
         // Track last published so we can republish when no new frame arrives
         // (DXGI_ERROR_WAIT_TIMEOUT)
         bool haveLastCPU = false;
-
-        // Disable GPU-only path since we're not using it currently
-        // bool haveLastGPU = false;
-        // int lastGPUSlot = -1;
+        uint64_t lastPublishedCaptureTimestampNs = 0;
 
         // Re-init loop: rebuild D3D resources upon duplication/device loss
         for (;;) {
@@ -307,16 +275,6 @@ int main(int argc, char **argv) {
                 auto dev = cap.dev;
                 auto ctx = cap.ctx;
                 UINT W = cap.W, H = cap.H;
-
-                // Shared ring for GPU path
-                std::vector<Slot> ring(RING_SIZE);
-                for (int i = 0; i < RING_SIZE; ++i) {
-                    ring[i].tex = makeSharedTex(dev.Get(), W, H);
-                    ring[i].tex.As(&ring[i].mtx);
-                    ring[i].shared = createShared(ring[i].tex.Get());
-                    ring[i].W = W;
-                    ring[i].H = H;
-                }
 
                 // Double-buffered staging textures to reduce Map stalls
                 D3D11_TEXTURE2D_DESC sd{};
@@ -339,8 +297,6 @@ int main(int argc, char **argv) {
 
                 // Reset last-frame state on reinit (avoid stale publishes)
                 haveLastCPU = false;
-                // haveLastGPU = false;
-                // lastGPUSlot = -1;
 
                 // Fixed‑deadline scheduler
                 auto next_deadline = std::chrono::steady_clock::now() + period;
@@ -352,46 +308,12 @@ int main(int argc, char **argv) {
                     bool published_any = false;
 
                     if (acquired) {
-                        // Disable GPU-only path since we're not using it
-                        // currently
-
-                        // // Write to GPU ring (non-blocking)
-                        // int slot = int(fid % RING_SIZE);
-                        // Slot &s = ring[slot];
-                        // HRESULT kmhr =
-                        //     s.mtx->AcquireSync(/*Key*/ 0, /*msTimeout*/ 0);
-
-                        // if (kmhr == WAIT_TIMEOUT) {
-                        //     // Skip GPU ring update this frame.
-                        // } else {
-                        //     hrx(kmhr, "Acquire writer mutex");
-                        //     ctx->CopyResource(s.tex.Get(), src.Get());
-                        //     hrx(s.mtx->ReleaseSync(/*Key*/ 0),
-                        //         "Release writer mutex");
-
-                        //     haveLastGPU = true;
-                        //     lastGPUSlot = slot;
-
-                        //     json meta = {{"slot", slot},
-                        //                  {"handle", (uint64_t)s.shared},
-                        //                  {"w", s.W},
-                        //                  {"h", s.H},
-                        //                  {"format", "BGRA8"},
-                        //                  {"frame_id", fid},
-                        //                  {"qpc", qpc_now()},
-                        //                  {"qpc_hz", qpc_hz()}};
-                        //     std::string m = meta.dump();
-                        //     zmq::message_t t(FRAMES_GPU_TOPIC,
-                        //                      strlen(FRAMES_GPU_TOPIC)),
-                        //         j(m.data(), m.size());
-                        //     pubGPU.send(t, zmq::send_flags::sndmore);
-                        //     pubGPU.send(j, zmq::send_flags::none);
-                        //     published_any = true; // GPU published
-                        // }
-
+                        const uint64_t acquiredTimestampNs = unix_time_ns();
                         // RAW CPU path using staging ring
                         ctx->CopyResource(stagingRing[copyIndex].Get(),
                                           src.Get());
+                        stagingCaptureTimestampNs[copyIndex] =
+                            acquiredTimestampNs;
                         if (stagingPrimed) {
                             D3D11_MAPPED_SUBRESOURCE map{};
                             hrx(ctx->Map(stagingRing[readIndex].Get(), 0,
@@ -404,21 +326,38 @@ int main(int argc, char **argv) {
                                 rgb);
                             ctx->Unmap(stagingRing[readIndex].Get(), 0);
                             haveLastCPU = true;
+                            lastPublishedCaptureTimestampNs =
+                                stagingCaptureTimestampNs[readIndex];
 
-                            json metadata = {
-                                {"encoding", "raw"}, {"w", rawW},
-                                {"h", rawH},         {"channels", 3},
-                                {"dtype", "uint8"},  {"frame_id", fid}};
-                            std::string metadata_bytes = metadata.dump();
+                            const uint64_t publishTimestampNs = unix_time_ns();
+                            json envelope = {
+                                {"v", CHANNEL_ENVELOPE_VERSION},
+                                {"channel", VISION_CHANNEL},
+                                {"encoding", "raw_rgb_v1"},
+                                {"sequence_id", fid},
+                                {"message_timestamp_ns",
+                                 lastPublishedCaptureTimestampNs},
+                                {"publish_timestamp_ns", publishTimestampNs},
+                                {"source", FRAME_SOURCE},
+                                {"metadata",
+                                 {{"w", rawW},
+                                  {"h", rawH},
+                                  {"channels", 3},
+                                  {"dtype", "uint8"},
+                                  {"frame_id", fid},
+                                  {"capture_timestamp_ns",
+                                   lastPublishedCaptureTimestampNs},
+                                  {"is_repeat", false}}}};
+                            std::string envelope_bytes = envelope.dump();
                             zmq::message_t topic_payload(
                                 FRAMES_CPU_TOPIC, strlen(FRAMES_CPU_TOPIC));
-                            zmq::message_t metadata_payload(
-                                metadata_bytes.data(), metadata_bytes.size());
+                            zmq::message_t envelope_payload(
+                                envelope_bytes.data(), envelope_bytes.size());
                             zmq::message_t frame_payload(rgb.data(),
                                                          rgb.size());
                             pubRAW.send(topic_payload,
                                         zmq::send_flags::sndmore);
-                            pubRAW.send(metadata_payload,
+                            pubRAW.send(envelope_payload,
                                         zmq::send_flags::sndmore);
                             pubRAW.send(frame_payload, zmq::send_flags::none);
                             published_any = true; // RAW published
@@ -427,44 +366,38 @@ int main(int argc, char **argv) {
                         std::swap(copyIndex, readIndex);
                         stagingPrimed = true;
                     } else {
-                        // Republish last known GPU/CPU frames when no new frame
-                        // arrived
-
-                        // Disable GPU-only path since we're not using it
-                        // currently if (haveLastGPU && lastGPUSlot >= 0) {
-                        //     const Slot &s = ring[lastGPUSlot];
-                        //     json meta = {{"slot", lastGPUSlot},
-                        //                  {"handle", (uint64_t)s.shared},
-                        //                  {"w", s.W},
-                        //                  {"h", s.H},
-                        //                  {"format", "BGRA8"},
-                        //                  {"frame_id", fid},
-                        //                  {"qpc", qpc_now()},
-                        //                  {"qpc_hz", qpc_hz()}};
-                        //     std::string m = meta.dump();
-                        //     zmq::message_t t(FRAMES_GPU_TOPIC,
-                        //                      strlen(FRAMES_GPU_TOPIC)),
-                        //         j(m.data(), m.size());
-                        //     pubGPU.send(t, zmq::send_flags::sndmore);
-                        //     pubGPU.send(j, zmq::send_flags::none);
-                        //     published_any = true;
-                        // }
-
+                        // Republish the last known CPU frame when no new frame
+                        // arrived.
                         if (haveLastCPU) {
-                            json metadata = {
-                                {"encoding", "raw"}, {"w", rawW},
-                                {"h", rawH},         {"channels", 3},
-                                {"dtype", "uint8"},  {"frame_id", fid}};
-                            std::string metadata_bytes = metadata.dump();
+                            const uint64_t publishTimestampNs = unix_time_ns();
+                            json envelope = {
+                                {"v", CHANNEL_ENVELOPE_VERSION},
+                                {"channel", VISION_CHANNEL},
+                                {"encoding", "raw_rgb_v1"},
+                                {"sequence_id", fid},
+                                {"message_timestamp_ns",
+                                 lastPublishedCaptureTimestampNs},
+                                {"publish_timestamp_ns", publishTimestampNs},
+                                {"source", FRAME_SOURCE},
+                                {"metadata",
+                                 {{"w", rawW},
+                                  {"h", rawH},
+                                  {"channels", 3},
+                                  {"dtype", "uint8"},
+                                  {"frame_id", fid},
+                                  {"capture_timestamp_ns",
+                                   lastPublishedCaptureTimestampNs},
+                                  {"is_repeat", true}}}};
+                            std::string envelope_bytes = envelope.dump();
                             zmq::message_t topic_payload(
                                 FRAMES_CPU_TOPIC, strlen(FRAMES_CPU_TOPIC));
-                            zmq::message_t metadata_payload(
-                                metadata_bytes.data(), metadata_bytes.size());
+                            zmq::message_t envelope_payload(
+                                envelope_bytes.data(), envelope_bytes.size());
                             zmq::message_t frame_payload(rgb.data(),
                                                          rgb.size());
                             pubRAW.send(topic_payload,
                                         zmq::send_flags::sndmore);
-                            pubRAW.send(metadata_payload,
+                            pubRAW.send(envelope_payload,
                                         zmq::send_flags::sndmore);
                             pubRAW.send(frame_payload, zmq::send_flags::none);
                             published_any = true;

@@ -1,0 +1,228 @@
+{
+  "variant": "PLWT-S1080",
+  "hidden_dim": 448,
+  "image": {
+    "raw_height": 1080,
+    "raw_width": 1920,
+    "padded_height": 1088,
+    "padded_width": 1920,
+    "channels": 3,
+    "hfov_deg": 90.0,
+    "depth_min_m": 0.5,
+    "depth_max_m": 80.0,
+    "depth_bins": 64
+  },
+  "visual": {
+    "token_dim": 448,
+    "detail_dim": 64,
+    "ctx_dims": [
+      128,
+      256,
+      384,
+      512
+    ],
+    "ctx_blocks": [
+      2,
+      4,
+      8,
+      4
+    ],
+    "cam_tokens_per_frame": 192,
+    "query_pool_heads": 8,
+    "dropout": 0.1,
+    "freeze_stages": 2,
+    "use_bifpn": true
+  },
+  "temporal": {
+    "num_frames": 8,
+    "mixer_blocks": 4,
+    "num_heads": 8,
+    "mlp_ratio": 4.0,
+    "dropout": 0.1
+  },
+  "action": {
+    "action_dim": 6,
+    "history_len": 20,
+    "act_tokens": 4,
+    "hidden_dim": 192,
+    "num_heads": 8,
+    "dropout": 0.1
+  },
+  "ego": {
+    "hidden_size": 192,
+    "num_layers": 2,
+    "ego_tokens": 6
+  },
+  "geometry": {
+    "frustum_tokens": 384,
+    "depth_bins": 64,
+    "track_history": 7,
+    "grid_h_8x": 136,
+    "grid_w_8x": 240,
+    "min_depth_m": 0.5,
+    "max_depth_m": 80.0
+  },
+  "obs_pool": {
+    "obs_tokens": 96,
+    "num_heads": 8
+  },
+  "world": {
+    "static_grid_h": 20,
+    "static_grid_w": 14,
+    "dynamic_slots": 64,
+    "lane_slots": 32,
+    "map_elem_slots": 16,
+    "ego_tokens": 6,
+    "route_tokens": 8,
+    "reasoner_tokens": 8,
+    "world_blocks": 8,
+    "num_heads": 8,
+    "x_range_m": [
+      -16.0,
+      64.0
+    ],
+    "y_range_m": [
+      -21.0,
+      21.0
+    ],
+    "static_write_dropout": 0.1
+  },
+  "planner": {
+    "proposals": 10,
+    "decoder_blocks": 4,
+    "evaluator_rollout_steps": 5,
+    "control_steps": 20,
+    "control_dt": 0.2,
+    "waypoint_dt": 0.1,
+    "reward_terms": [
+      "collision",
+      "offroad",
+      "rule",
+      "progress",
+      "comfort",
+      "uncertainty",
+      "route"
+    ],
+    "num_heads": 8
+  },
+  "lane": {
+    "lane_queries": 32,
+    "lane_pts": 20,
+    "lane_semantic_classes": [
+      "driving",
+      "merge",
+      "split",
+      "turn_left",
+      "turn_right",
+      "shoulder_parking",
+      "intersection_imputed",
+      "other"
+    ],
+    "lane_direction_classes": [
+      "same",
+      "opposite",
+      "bidirectional",
+      "unknown"
+    ],
+    "boundary_kind_classes": [
+      "paint",
+      "curb",
+      "barrier",
+      "inferred",
+      "unknown"
+    ],
+    "boundary_color_classes": [
+      "white",
+      "yellow",
+      "red",
+      "other",
+      "unknown"
+    ],
+    "boundary_pattern_classes": [
+      "solid",
+      "dashed",
+      "double",
+      "botts",
+      "unknown"
+    ],
+    "boundary_continuity_classes": [
+      "continuous",
+      "broken",
+      "mixed",
+      "unknown"
+    ]
+  },
+  "map_elem": {
+    "queries": 16,
+    "pts": 20,
+    "classes": [
+      "crosswalk_boundary",
+      "road_boundary",
+      "stop_line",
+      "keepout_other"
+    ]
+  },
+  "occupancy": {
+    "x_m": 64.0,
+    "y_m": 36.0,
+    "z_m": 6.0,
+    "voxel_m": 0.5,
+    "state_classes": 3,
+    "semantic_classes": 16,
+    "decoder_bev_channels": 128,
+    "out_z": 12,
+    "out_y": 72,
+    "out_x": 128
+  },
+  "bev_lite": {
+    "channels": 8,
+    "provenance_classes": 3,
+    "out_h": 96,
+    "out_w": 160
+  },
+  "actor": {
+    "queries": 40,
+    "classes": [
+      "car",
+      "large_vehicle",
+      "two_wheeler",
+      "pedestrian",
+      "dynamic_static",
+      "other"
+    ],
+    "future_steps": 10
+  },
+  "scheduler": {
+    "drive_mode_cadence": {
+      "planner": 1,
+      "ego": 1,
+      "lane": 1,
+      "map": 1,
+      "bev": 1,
+      "actors": 2,
+      "occupancy": 3
+    },
+    "inspect_mode_cadence": {
+      "planner": 1,
+      "ego": 1,
+      "lane": 1,
+      "map": 1,
+      "bev": 1,
+      "actors": 1,
+      "occupancy": 1
+    }
+  },
+  "route_adapter": {
+    "route_points": 32,
+    "route_tokens": 8,
+    "nav_cmd_dim": 6
+  },
+  "reasoner_adapter": {
+    "input_dim": 448,
+    "output_tokens": 8,
+    "ttl_steps": 20
+  },
+  "enable_route_tokens": true,
+  "enable_reasoner_tokens": true,
+  "enable_privileged_teacher_adapters": false
+}

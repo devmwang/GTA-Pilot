@@ -2,16 +2,22 @@ import time
 
 import cv2
 
-from gtapilot.ipc.vision_ipc import VisionIPCPublisher
+from gtapilot.ipc.channel import ChannelPublisher
+from gtapilot.ipc.channels import VISION_FRAMES_CHANNEL
 
 """Display Override process
-Reads frames from a provided video file and publishes them through Vision IPC
+Reads frames from a provided video file and publishes them through the
+generic `vision.frames` channel
 at approximately the video's native FPS.
 """
 
 
 def main(video_path: str):
-    publisher = VisionIPCPublisher()
+    publisher = ChannelPublisher(
+        VISION_FRAMES_CHANNEL,
+        source_name="display_override",
+    )
+    frame_id = 1
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -42,7 +48,23 @@ def main(video_path: str):
 
             # Convert BGR (OpenCV) to RGB to match live capture output_color="RGB"
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            publisher.publish_frame(frame_rgb)
+            if frame_rgb.shape[1] != 1920 or frame_rgb.shape[0] != 1080:
+                frame_rgb = cv2.resize(
+                    frame_rgb,
+                    (1920, 1080),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            capture_timestamp_ns = time.time_ns()
+            publisher.publish(
+                frame_rgb,
+                timestamp_ns=capture_timestamp_ns,
+                metadata={
+                    "frame_id": frame_id,
+                    "capture_timestamp_ns": capture_timestamp_ns,
+                    "is_repeat": False,
+                },
+            )
+            frame_id += 1
 
             # Schedule next deadline; if we fell behind by >1 frame, reset to avoid drift
             next_frame_time += frame_interval

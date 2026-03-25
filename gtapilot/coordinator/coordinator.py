@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from gtapilot.config import BLACKBOX_ENABLED
+from gtapilot.config import ACTION_CAPTURE_ENABLED, BLACKBOX_ENABLED
 from gtapilot.coordinator.process import BaseProcess, PythonProcess, ExecutableProcess
 
 
@@ -39,29 +39,15 @@ def build_processes(
                 args=exe_args,
             )
         )
-        # procs.append(
-        #     PythonProcess(
-        #         "DisplayCapture",
-        #         "gtapilot.display_capture.display_capture",
-        #         {"display": 1},
-        #     )
-        # )
 
-    # Models
-    procs.append(
-        PythonProcess(
-            "YOLOPv2",
-            "gtapilot.models.yolopv2",
-            {
-                "device": "cuda",
-                "conf_thres": 0.25,
-                "iou_thres": 0.50,
-                "show": False,
-            },
+    if ACTION_CAPTURE_ENABLED:
+        procs.append(
+            PythonProcess(
+                "ActionCapture",
+                "gtapilot.input_capture.input_capture",
+            )
         )
-    )
 
-    # Visualization always included for now
     procs.append(PythonProcess("Visualization", "gtapilot.visualization.visualization"))
 
     if BLACKBOX_ENABLED:

@@ -6,7 +6,7 @@ Goal (current codebase): maintain and extend the Atlas-oriented runtime and data
 collection stack:
 
 display capture OR video override -> generic channel IPC -> visualization / blackbox
-manual keyboard input capture -> generic channel IPC -> visualization / blackbox
+generalized manual input capture -> generic channel IPC -> visualization / blackbox
 
 The current runtime only records and consumes inference-time sources:
 
@@ -65,26 +65,32 @@ Coordinator: `gtapilot.coordinator.coordinator.main`
 
 Current worker set:
 
-1. `DisplayCaptureDX11`
+1. `SettingsRuntime`
+   `gtapilot.ipc.settings_runtime.main`
+   Owns the runtime settings snapshot and serves it over a dedicated settings
+   IPC plane.
+
+2. `DisplayCaptureDX11`
    Native executable `bin/DisplayCaptureDX11.exe`
    Live desktop capture on Windows, publishes RGB frames to the `vision.frames`
    channel.
 
-2. `DisplayOverride`
+3. `DisplayOverride`
    `gtapilot.display_capture.display_override.main`
    Uses a video file instead of live capture and publishes RGB frames to the
    `vision.frames` channel.
 
-3. `ActionCapture`
+4. `ActionCapture`
    `gtapilot.input_capture.input_capture.main`
-   Polls keyboard state and publishes action packets to the `input.actions`
-   channel.
+   Polls keyboard state plus one XInput controller, publishes generalized
+   driving action packets to `input.actions`, and updates mutable runtime
+   settings via the settings service.
 
-4. `Visualization`
+5. `Visualization`
    `gtapilot.visualization.visualization.main`
    Displays the latest frame with FPS and action overlays.
 
-5. `Blackbox`
+6. `Blackbox`
    `gtapilot.blackbox.blackbox.main`
    Optional recorder enabled by `BLACKBOX_ENABLED` in `gtapilot/config.py`.
 
@@ -158,10 +164,13 @@ Action payload contract:
   - `handbrake`
   - `reverse`
   - `pilot_active`
-  - `raw_inputs`
+  - `active_device`
+  - `device_actions`
+  - `device_inputs`
 
-Current action source is keyboard-only. `reverse` is not inferred reliably yet
-and is currently published as `0.0` until vehicle-state integration lands.
+Current action source is keyboard plus one XInput controller. `reverse` is not
+inferred reliably yet and is currently published as `0.0` until vehicle-state
+integration lands.
 
 Rules:
 
@@ -172,6 +181,50 @@ Rules:
    socket, terminate context.
 4. Do not silently switch to compression or a different transport without
    documentation and an intentional encoding change.
+
+## 5. Runtime Settings IPC
+
+Public modules:
+
+- `gtapilot.ipc.settings_types`
+- `gtapilot.ipc.settings_registry`
+- `gtapilot.ipc.settings_client`
+- `gtapilot.ipc.settings_runtime`
+
+This is separate from the stream channel IPC. Use it for mutable runtime state
+that late subscribers must be able to read immediately.
+
+Transport:
+
+- `settings.updates`
+  - ZeroMQ PUB/SUB
+  - port `55553`
+- `settings.rpc`
+  - ZeroMQ REQ/REP
+  - port `55554`
+
+Current runtime-visible settings:
+
+- `blackbox.enabled`
+  - seeded from `BLACKBOX_ENABLED`
+  - read-only
+- `blackbox.recording_enabled`
+  - seeded from `BLACKBOX_RECORD_ON_START`
+  - mutable
+  - current writer: `manual_input`
+- `blackbox.preroll_seconds`
+  - seeded from `BLACKBOX_PREROLL_SECONDS`
+  - mutable for trusted local tools only
+- `blackbox.record_hotkey`
+  - seeded from `BLACKBOX_RECORD_HOTKEY`
+  - read-only in v1
+
+Rules:
+
+1. Do not tunnel runtime settings through stream channels.
+2. `SettingsRuntime` is the only authority for accepted writes.
+3. Clients must load a startup snapshot via RPC and then listen for updates.
+4. Runtime settings are not persisted across fresh launches.
 
 ## 6. Blackbox Recorder
 
@@ -196,6 +249,12 @@ The manifest records:
 
 Behavior notes:
 
+- blackbox starts idle by default even when `BLACKBOX_ENABLED = True`
+- runtime recording is controlled by the `blackbox.recording_enabled` setting
+- keyboard hotkey `F8` currently flips that setting via the input-capture
+  process
+- while idle, blackbox keeps a bounded in-memory pre-roll buffer
+- each start/stop cycle produces a separate `capture_<timestamp>_*` pair
 - frames are stored as BMP inside the tar
 - metadata is flushed incrementally during capture
 - abrupt termination can still lose a small tail of in-memory state
@@ -245,14 +304,12 @@ When cleaning up similar code in the future:
 
 ## 10. Testing Guidance
 
-Preferred tests for runtime code:
+Do not automatically add tests, test files, or test scaffolding.
 
-1. Generic channel round-trip on synthetic RGB frames
-2. Generic channel round-trip on synthetic action packets
-3. Blackbox recording smoke test with synthetic frame/action streams
-4. Coordinator process-list smoke test
+Only create or update tests if the user explicitly asks for them.
 
-Atlas model tests live separately under `tests/`.
+For early runtime work in this repo, prioritize implementation speed and manual
+validation over adding unit or smoke tests by default.
 
 ## 11. Performance Notes
 
@@ -275,13 +332,15 @@ runtime graph, update `AGENTS.md` in the same change.
 
 Inspect the runtime in data-flow order:
 
-1. `gtapilot/display_capture/` or `gtapilot/native/display_capture/`
-2. `gtapilot/ipc/channel.py`
-3. `gtapilot/ipc/channels.py`
-4. `gtapilot/input_capture/input_capture.py`
-5. `gtapilot/visualization/visualization.py`
-6. `gtapilot/blackbox/blackbox.py`
-7. `gtapilot/atlas/`
+1. `gtapilot/ipc/settings_runtime.py`
+2. `gtapilot/ipc/settings_client.py`
+3. `gtapilot/display_capture/` or `gtapilot/native/display_capture/`
+4. `gtapilot/ipc/channel.py`
+5. `gtapilot/ipc/channels.py`
+6. `gtapilot/input_capture/input_capture.py`
+7. `gtapilot/visualization/visualization.py`
+8. `gtapilot/blackbox/blackbox.py`
+9. `gtapilot/atlas/`
 
-Prefer small, testable changes that keep the frame/action capture contract
+Prefer small, focused changes that keep the frame/action capture contract
 stable.

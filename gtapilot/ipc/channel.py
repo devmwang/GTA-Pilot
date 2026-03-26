@@ -152,10 +152,14 @@ class ChannelSubscriber:
                 return None
 
             if blocking:
-                deadline = None if timeout_sec is None else time.time() + timeout_sec
+                deadline = (
+                    None if timeout_sec is None else time.monotonic() + timeout_sec
+                )
                 while not self._buffer and self._running:
                     remaining = (
-                        None if deadline is None else max(0.0, deadline - time.time())
+                        None
+                        if deadline is None
+                        else max(0.0, deadline - time.monotonic())
                     )
                     if not self._available.wait(timeout=remaining):
                         return None

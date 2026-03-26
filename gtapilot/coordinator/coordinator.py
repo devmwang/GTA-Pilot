@@ -13,7 +13,12 @@ from gtapilot.coordinator.process import BaseProcess, PythonProcess, ExecutableP
 def build_processes(
     video_override: Optional[str] = None, display_id: Optional[int] = None
 ) -> List[BaseProcess]:
-    procs: List[BaseProcess] = []
+    procs: List[BaseProcess] = [
+        PythonProcess(
+            "SettingsRuntime",
+            "gtapilot.ipc.settings_runtime",
+        )
+    ]
     if video_override:
         procs.append(
             PythonProcess(
@@ -48,7 +53,13 @@ def build_processes(
             )
         )
 
-    procs.append(PythonProcess("Visualization", "gtapilot.visualization.visualization"))
+    procs.append(
+        PythonProcess(
+            "Visualization",
+            "gtapilot.visualization.visualization",
+            {"capture_display_id": display_id},
+        )
+    )
 
     if BLACKBOX_ENABLED:
         procs.append(PythonProcess("Blackbox", "gtapilot.blackbox.blackbox"))

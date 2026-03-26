@@ -29,8 +29,9 @@ sources only:
 
 Processes currently in the live graph:
 
+- settings runtime service
 - native DX11 display capture or Python video override
-- keyboard action capture
+- generalized manual input capture
 - visualization
 - optional blackbox recorder
 
@@ -52,7 +53,8 @@ or ScriptHook-based label extraction pipeline.
 What it does today:
 
 - capture front RGB frames
-- capture current manual keyboard inputs as Atlas-format action packets
+- capture current keyboard and Xbox controller inputs as Atlas-format action packets
+- expose mutable runtime settings through a central settings service
 - visualize the live stream with action overlays
 - optionally record frame/action sessions to disk for later training
 
@@ -80,6 +82,64 @@ uv pip install -e .
 If you only want to exercise the pipeline with a prerecorded clip instead of
 live desktop capture, `--video-override` is the easiest path.
 
+## Build The Native DX11 Capture Module
+
+The live capture path depends on the native DX11 desktop duplication binary:
+
+```text
+bin/DisplayCaptureDX11.exe
+```
+
+If you need to rebuild it, use the repo build script:
+
+```powershell
+.\build-native.ps1
+```
+
+That script is the supported path for native builds right now. It:
+
+- initializes the Visual Studio C++ build environment
+- configures the CMake builds
+- builds the native `DisplayCaptureDX11` target
+- updates `compile_commands.json`
+- copies the built executable into `bin/DisplayCaptureDX11.exe`
+
+Default behavior:
+
+- configuration: `Release`
+- builds both the `ninja-multi` and `vs2022` presets
+- publishes the final executable into the runtime `bin/` directory
+
+Useful options:
+
+```powershell
+# Debug build
+.\build-native.ps1 -Configuration Debug
+
+# Skip the Visual Studio preset and only build the Ninja preset
+.\build-native.ps1 -SkipVS
+```
+
+Requirements for the script:
+
+- Windows
+- CMake on `PATH`
+- Ninja on `PATH`
+- Visual Studio 2022 Build Tools or Visual Studio with C++ tooling
+
+The root CMake project will fetch `libzmq` and `cppzmq` automatically, and it
+uses the vendored `nlohmann/json` headers from `gtapilot/external/json`.
+
+If you need to inspect the raw build outputs, the script writes into:
+
+```text
+build/ninja-multi/
+build/vs2022/
+```
+
+If you only use the video override path, you do not need to build the native
+capture module.
+
 ## How To Use It
 
 ### 1. Live desktop capture
@@ -92,6 +152,7 @@ uv run ./gtapilot/main.py
 
 By default the coordinator starts:
 
+- `SettingsRuntime`
 - `DisplayCaptureDX11`
 - `ActionCapture`
 - `Visualization`
@@ -152,8 +213,8 @@ order:
 
 `[steer, throttle, brake, handbrake, reverse, pilot_active]`
 
-Current action capture is keyboard-based and intended as an inference-time data
-source only.
+Current action capture supports keyboard plus one XInput Xbox controller and is
+intended as an inference-time data source only.
 
 The current keyboard mapping is:
 
@@ -162,6 +223,20 @@ The current keyboard mapping is:
 - `W` / up arrow: throttle
 - `S` / down arrow: brake
 - `Space`: handbrake
+
+The current controller mapping is:
+
+- left stick X: steer
+- right trigger: throttle
+- left trigger: brake
+- `RB`: handbrake
+
+Each action packet contains:
+
+- the top-level normalized action vector used by Atlas/blackbox consumers
+- `active_device` indicating `none`, `keyboard`, or `xinput_controller`
+- per-device normalized actions
+- per-device raw input state, including controller analog values
 
 Current action semantics:
 
@@ -178,11 +253,36 @@ Blackbox is disabled by default. To enable it, edit
 BLACKBOX_ENABLED = True
 ```
 
+Useful related defaults:
+
+```python
+BLACKBOX_RECORD_ON_START = False
+BLACKBOX_PREROLL_SECONDS = 3.0
+BLACKBOX_RECORD_HOTKEY = "F8"
+```
+
 Then run the coordinator normally:
 
 ```bash
 uv run ./gtapilot/main.py
 ```
+
+Once the runtime is up:
+
+- get into the desired in-car camera/view
+- press `F8` to start recording
+- press `F8` again to stop and finalize that clip
+
+Blackbox no longer records full sessions by default. It starts idle and only
+creates output files when recording is toggled on.
+
+The hotkey does not go through a one-off control stream anymore. The input
+process flips the runtime setting `blackbox.recording_enabled`, and the blackbox
+and visualization processes read the latest value from the shared settings
+service.
+
+When multiple monitors are available, the visualization window is moved to a
+monitor other than the captured display by default.
 
 Recordings are written to:
 
@@ -194,6 +294,9 @@ Each session currently produces:
 
 - `capture_<timestamp>_frames.tar`
 - `capture_<timestamp>_metadata.json`
+
+Each start/stop cycle produces a separate recording pair. If you toggle
+recording on twice in one runtime, you will get two clips.
 
 The tar archive contains BMP frames. The JSON manifest contains:
 
@@ -208,13 +311,16 @@ inference-time training work.
 
 ## IPC
 
-The runtime now uses one generic ZeroMQ PUB/SUB channel framework with typed
-channel specs:
+The runtime uses two IPC layers:
+
+### Stream channels
+
+The generic ZeroMQ PUB/SUB channel framework carries the live data streams:
 
 - `vision.frames`: raw RGB frames plus metadata
 - `input.actions`: action packets in Atlas order
 
-Every stream uses the same multipart wire format:
+Every stream channel uses the same multipart wire format:
 
 - topic
 - envelope JSON
@@ -225,6 +331,22 @@ Current action vector order:
 `[steer, throttle, brake, handbrake, reverse, pilot_active]`
 
 `pilot_active=0` currently means manual control / human intervention.
+
+### Runtime settings
+
+Mutable runtime settings live on a separate stateful IPC plane:
+
+- `settings.updates` on port `55553` broadcasts accepted setting changes
+- `settings.rpc` on port `55554` serves snapshots and validated writes
+
+This is how late subscribers can always read the latest value immediately.
+
+Current settings exposed at runtime:
+
+- `blackbox.enabled`
+- `blackbox.recording_enabled`
+- `blackbox.preroll_seconds`
+- `blackbox.record_hotkey`
 
 ## Blackbox
 
@@ -250,5 +372,6 @@ project.
 
 - The runtime is currently a capture/recording system, not an end-to-end autonomy stack.
 - The DX11 desktop capture path is the main live capture path; Python video override is mainly for testing.
-- The action stream reflects keyboard intent, not authoritative in-game vehicle state.
+- The action stream reflects human input intent, not authoritative in-game vehicle state.
+- Blackbox pre-roll is in-memory only; if the process dies before recording is toggled on, that buffered data is lost.
 - Privileged labels and GTA-native state extraction will come later through a separate ScriptHook-based pipeline.

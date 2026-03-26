@@ -345,6 +345,7 @@ int main(int argc, char **argv) {
                                   {"channels", 3},
                                   {"dtype", "uint8"},
                                   {"frame_id", fid},
+                                  {"nominal_fps", CAP_FPS},
                                   {"capture_timestamp_ns",
                                    lastPublishedCaptureTimestampNs},
                                   {"is_repeat", false}}}};
@@ -385,6 +386,7 @@ int main(int argc, char **argv) {
                                   {"channels", 3},
                                   {"dtype", "uint8"},
                                   {"frame_id", fid},
+                                  {"nominal_fps", CAP_FPS},
                                   {"capture_timestamp_ns",
                                    lastPublishedCaptureTimestampNs},
                                   {"is_repeat", true}}}};

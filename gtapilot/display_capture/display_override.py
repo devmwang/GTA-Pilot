@@ -61,6 +61,7 @@ def main(video_path: str):
                 metadata={
                     "frame_id": frame_id,
                     "capture_timestamp_ns": capture_timestamp_ns,
+                    "nominal_fps": float(fps),
                     "is_repeat": False,
                 },
             )

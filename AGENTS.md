@@ -232,15 +232,16 @@ The blackbox currently records inference-time data only.
 
 Outputs under `blackbox-recordings/`:
 
-- `capture_<timestamp>_frames.tar`
+- `capture_<timestamp>_video.mkv`
 - `capture_<timestamp>_metadata.json`
 
-Current manifest schema version: `3`
+Current manifest schema version: `5`
 
 The manifest records:
 
 - session metadata
-- per-frame metadata and archive filename
+- session video settings
+- per-frame metadata and video frame index
 - per-frame envelope data
 - frame-aligned action payload
 - frame-aligned action envelope data
@@ -255,9 +256,13 @@ Behavior notes:
   process
 - while idle, blackbox keeps a bounded in-memory pre-roll buffer
 - each start/stop cycle produces a separate `capture_<timestamp>_*` pair
-- frames are stored as BMP inside the tar
+- frames are encoded into H.264 video in an MKV container via `ffmpeg`
 - metadata is flushed incrementally during capture
 - abrupt termination can still lose a small tail of in-memory state
+- the JSON manifest is the authoritative timestamp/alignment source, not the
+  container timestamps
+- frame producers must publish `nominal_fps` in frame metadata; blackbox does
+  not guess it
 
 Do not silently change the manifest format. If it must evolve, bump
 `schema_version`.

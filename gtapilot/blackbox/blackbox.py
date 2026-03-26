@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import collections
-import io
 import json
 import os
-import tarfile
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,11 +30,18 @@ from gtapilot.ipc.settings_types import SettingValue
 from gtapilot.ipc.types import ChannelEnvelope, ChannelMessage, ChannelSpec
 
 DEFAULT_OUTPUT_DIR = Path("blackbox-recordings")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 FLUSH_EVERY_FRAMES = 25
 FLUSH_EVERY_SECONDS = 2.0
 PREROLL_JPEG_QUALITY = 85
 SETTINGS_REFRESH_INTERVAL_SECONDS = 0.5
+VIDEO_CODEC = "libx264"
+VIDEO_CONTAINER = "matroska"
+VIDEO_FILE_SUFFIX = ".mkv"
+VIDEO_PIXEL_FORMAT = "yuv420p"
+VIDEO_PRESET = "veryfast"
+VIDEO_CRF = 18
+FPS_COMPARE_EPSILON = 1e-3
 
 T = TypeVar("T")
 
@@ -42,10 +49,22 @@ T = TypeVar("T")
 @dataclass(slots=True)
 class BlackboxSessionPaths:
     output_dir: Path
-    tar_path: Path
+    video_path: Path
     metadata_path: Path
     metadata_tmp_path: Path
     session_timestamp: str
+
+
+@dataclass(slots=True, frozen=True)
+class VideoSessionConfig:
+    width: int
+    height: int
+    nominal_fps: float
+    codec: str = VIDEO_CODEC
+    container: str = VIDEO_CONTAINER
+    pixel_format: str = VIDEO_PIXEL_FORMAT
+    preset: str = VIDEO_PRESET
+    crf: int = VIDEO_CRF
 
 
 @dataclass(slots=True)
@@ -64,7 +83,7 @@ def _build_session_paths(output_dir: Path) -> BlackboxSessionPaths:
     output_prefix = f"capture_{session_timestamp}"
     return BlackboxSessionPaths(
         output_dir=output_dir,
-        tar_path=output_dir / f"{output_prefix}_frames.tar",
+        video_path=output_dir / f"{output_prefix}_video{VIDEO_FILE_SUFFIX}",
         metadata_path=output_dir / f"{output_prefix}_metadata.json",
         metadata_tmp_path=output_dir / f"{output_prefix}_metadata.tmp.json",
         session_timestamp=session_timestamp,
@@ -99,14 +118,66 @@ def _aligned_message_before(
     return aligned_message
 
 
+def _normalize_nominal_fps(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _format_nominal_fps(value: float) -> str:
+    return f"{_normalize_nominal_fps(value):.6f}".rstrip("0").rstrip(".")
+
+
+def _frame_config_from_parts(
+    *,
+    frame_metadata: dict[str, Any],
+    resolution_height: int,
+    resolution_width: int,
+) -> VideoSessionConfig:
+    raw_nominal_fps = frame_metadata.get("nominal_fps")
+    if raw_nominal_fps is None:
+        raise RuntimeError(
+            "Blackbox recording requires frame metadata field 'nominal_fps'."
+        )
+
+    nominal_fps = float(raw_nominal_fps)
+    if nominal_fps <= 0.0:
+        raise RuntimeError(
+            f"Blackbox recording requires positive 'nominal_fps', got {nominal_fps!r}."
+        )
+
+    return VideoSessionConfig(
+        width=int(frame_metadata.get("w", resolution_width)),
+        height=int(frame_metadata.get("h", resolution_height)),
+        nominal_fps=_normalize_nominal_fps(nominal_fps),
+    )
+
+
+def _frame_config_from_message(frame_message: ChannelMessage[np.ndarray]) -> VideoSessionConfig:
+    frame_metadata = dict(frame_message.envelope.metadata)
+    return _frame_config_from_parts(
+        frame_metadata=frame_metadata,
+        resolution_height=int(frame_message.payload.shape[0]),
+        resolution_width=int(frame_message.payload.shape[1]),
+    )
+
+
+def _configs_match(left: VideoSessionConfig, right: VideoSessionConfig) -> bool:
+    return (
+        left.width == right.width
+        and left.height == right.height
+        and abs(left.nominal_fps - right.nominal_fps) <= FPS_COMPARE_EPSILON
+    )
+
+
 def _frame_entry_from_parts(
     *,
     frame_envelope: ChannelEnvelope,
     frame_metadata: dict[str, Any],
     resolution_height: int,
     resolution_width: int,
-    frame_archive_name: str,
     action_message: ChannelMessage | None,
+    session_paths: BlackboxSessionPaths,
+    session_config: VideoSessionConfig,
+    video_frame_index: int,
 ) -> dict[str, Any]:
     action_payload = None
     action_vector = [0.0] * 6
@@ -117,7 +188,13 @@ def _frame_entry_from_parts(
         action_envelope = action_message.envelope.to_dict()
 
     return {
-        "frame_archive_name": frame_archive_name,
+        "video_file_name": session_paths.video_path.name,
+        "video_frame_index": int(video_frame_index),
+        "video_nominal_fps": float(session_config.nominal_fps),
+        "video_codec": session_config.codec,
+        "video_container": session_config.container,
+        "encoded_width": int(session_config.width),
+        "encoded_height": int(session_config.height),
         "frame_id": int(frame_metadata.get("frame_id", -1)),
         "capture_timestamp_ns": int(
             frame_metadata.get(
@@ -138,21 +215,6 @@ def _frame_entry_from_parts(
     }
 
 
-def _frame_entry(
-    frame_message: ChannelMessage,
-    frame_archive_name: str,
-    action_message: ChannelMessage | None,
-) -> dict[str, Any]:
-    return _frame_entry_from_parts(
-        frame_envelope=frame_message.envelope,
-        frame_metadata=dict(frame_message.envelope.metadata),
-        resolution_height=int(frame_message.payload.shape[0]),
-        resolution_width=int(frame_message.payload.shape[1]),
-        frame_archive_name=frame_archive_name,
-        action_message=action_message,
-    )
-
-
 def _action_stream_entry(action_message: ChannelMessage) -> dict[str, Any]:
     return {
         "envelope": action_message.envelope.to_dict(),
@@ -161,16 +223,12 @@ def _action_stream_entry(action_message: ChannelMessage) -> dict[str, Any]:
     }
 
 
-def _encode_bmp_from_rgb(frame_rgb: np.ndarray) -> bytes | None:
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    success, buffer = cv2.imencode(".bmp", frame_bgr)
-    if not success:
-        return None
-    return buffer.tobytes()
+def _frame_bgr_from_rgb(frame_rgb: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
 
 def _encode_preroll_jpeg(frame_rgb: np.ndarray) -> bytes | None:
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    frame_bgr = _frame_bgr_from_rgb(frame_rgb)
     success, buffer = cv2.imencode(
         ".jpg",
         frame_bgr,
@@ -181,18 +239,116 @@ def _encode_preroll_jpeg(frame_rgb: np.ndarray) -> bytes | None:
     return buffer.tobytes()
 
 
-def _decode_preroll_jpeg_to_bmp(jpeg_bytes: bytes) -> tuple[bytes | None, int, int]:
+def _decode_preroll_jpeg_to_bgr(jpeg_bytes: bytes) -> np.ndarray | None:
     frame_buffer = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-    frame_bgr = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
-    if frame_bgr is None:
-        return (None, 0, 0)
+    return cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
 
-    success, buffer = cv2.imencode(".bmp", frame_bgr)
-    if not success:
-        return (None, 0, 0)
 
-    height, width = frame_bgr.shape[:2]
-    return (buffer.tobytes(), int(height), int(width))
+class FFmpegVideoWriter:
+    def __init__(self, *, output_path: Path, config: VideoSessionConfig):
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            raise RuntimeError(
+                "ffmpeg was not found on PATH. Blackbox video recording requires ffmpeg."
+            )
+
+        self.output_path = output_path
+        self.config = config
+        self.command = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "bgr24",
+            "-video_size",
+            f"{config.width}x{config.height}",
+            "-framerate",
+            _format_nominal_fps(config.nominal_fps),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            config.codec,
+            "-preset",
+            config.preset,
+            "-crf",
+            str(config.crf),
+            "-pix_fmt",
+            config.pixel_format,
+            "-f",
+            config.container,
+            str(output_path),
+        ]
+        self._process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self._closed = False
+
+    def _read_stderr_text(self) -> str:
+        if self._process.stderr is None:
+            return ""
+        try:
+            return self._process.stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    def _raise_process_failure(self, context: str) -> None:
+        stderr_text = self._read_stderr_text()
+        detail = f" {stderr_text}" if stderr_text else ""
+        raise RuntimeError(f"{context}.{detail}".strip())
+
+    def write_frame(self, frame_bgr: np.ndarray) -> None:
+        if self._closed:
+            raise RuntimeError("ffmpeg video writer is already closed.")
+
+        if (
+            frame_bgr.ndim != 3
+            or frame_bgr.shape[0] != self.config.height
+            or frame_bgr.shape[1] != self.config.width
+            or frame_bgr.shape[2] != 3
+        ):
+            raise RuntimeError(
+                "Frame shape does not match active blackbox video session format."
+            )
+
+        if self._process.stdin is None:
+            self._raise_process_failure("ffmpeg stdin is not available")
+
+        frame_bgr = np.ascontiguousarray(frame_bgr)
+        try:
+            self._process.stdin.write(memoryview(frame_bgr))
+        except BrokenPipeError:
+            self._raise_process_failure("ffmpeg exited while writing blackbox video")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        self._closed = True
+        if self._process.stdin is not None:
+            try:
+                self._process.stdin.close()
+            except Exception:
+                pass
+
+        try:
+            return_code = self._process.wait(timeout=15.0)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            return_code = self._process.wait(timeout=5.0)
+
+        if return_code != 0:
+            self._raise_process_failure(
+                f"ffmpeg exited with status {return_code} for {self.output_path.name}"
+            )
 
 
 class BlackboxRecorder:
@@ -237,10 +393,11 @@ class BlackboxRecorder:
 
         self.paths: BlackboxSessionPaths | None = None
         self.manifest: dict[str, Any] | None = None
+        self.session_config: VideoSessionConfig | None = None
         self.frame_count = 0
         self.action_count = 0
         self.last_flush = time.time()
-        self._tar_out_file: tarfile.TarFile | None = None
+        self._video_writer: FFmpegVideoWriter | None = None
         self._written_action_keys: set[tuple[str, int]] = set()
         initial_recording_setting = self._refresh_runtime_settings()
         if initial_recording_setting is not None:
@@ -251,7 +408,12 @@ class BlackboxRecorder:
             )
 
     def _session_active(self) -> bool:
-        return self._tar_out_file is not None and self.manifest is not None
+        return (
+            self._video_writer is not None
+            and self.manifest is not None
+            and self.paths is not None
+            and self.session_config is not None
+        )
 
     def _refresh_runtime_settings(self) -> SettingValue | None:
         now = time.monotonic()
@@ -322,34 +484,37 @@ class BlackboxRecorder:
         self.action_count += 1
         self.manifest["action_count"] = self.action_count
 
-    def _write_frame_bytes(
+    def _write_frame_bgr(
         self,
         *,
-        frame_bmp_bytes: bytes,
+        frame_bgr: np.ndarray,
         frame_envelope: ChannelEnvelope,
         frame_metadata: dict[str, Any],
         resolution_height: int,
         resolution_width: int,
         action_message: ChannelMessage | None,
     ) -> bool:
-        if not self._session_active() or self.manifest is None or self._tar_out_file is None:
+        if (
+            not self._session_active()
+            or self.manifest is None
+            or self._video_writer is None
+            or self.paths is None
+            or self.session_config is None
+        ):
             return False
 
+        self._video_writer.write_frame(frame_bgr)
         self.frame_count += 1
-        frame_filename_in_tar = f"frame_{self.frame_count:06d}.bmp"
-        tar_info = tarfile.TarInfo(name=frame_filename_in_tar)
-        tar_info.size = len(frame_bmp_bytes)
-        tar_info.mtime = int(time.time())
-        self._tar_out_file.addfile(tar_info, io.BytesIO(frame_bmp_bytes))
-
         self.manifest["frames"].append(
             _frame_entry_from_parts(
                 frame_envelope=frame_envelope,
                 frame_metadata=frame_metadata,
                 resolution_height=resolution_height,
                 resolution_width=resolution_width,
-                frame_archive_name=frame_filename_in_tar,
                 action_message=action_message,
+                session_paths=self.paths,
+                session_config=self.session_config,
+                video_frame_index=self.frame_count,
             )
         )
         self.manifest["frame_count"] = self.frame_count
@@ -365,14 +530,12 @@ class BlackboxRecorder:
 
     def _append_live_frame(
         self,
-        frame_message: ChannelMessage,
+        frame_message: ChannelMessage[np.ndarray],
         action_message: ChannelMessage | None,
     ) -> bool:
-        frame_bmp_bytes = _encode_bmp_from_rgb(frame_message.payload)
-        if frame_bmp_bytes is None:
-            return False
-        return self._write_frame_bytes(
-            frame_bmp_bytes=frame_bmp_bytes,
+        frame_bgr = _frame_bgr_from_rgb(frame_message.payload)
+        return self._write_frame_bgr(
+            frame_bgr=frame_bgr,
             frame_envelope=frame_message.envelope,
             frame_metadata=dict(frame_message.envelope.metadata),
             resolution_height=int(frame_message.payload.shape[0]),
@@ -381,18 +544,16 @@ class BlackboxRecorder:
         )
 
     def _append_buffered_frame(self, buffered_frame: BufferedFrame) -> bool:
-        frame_bmp_bytes, resolution_height, resolution_width = _decode_preroll_jpeg_to_bmp(
-            buffered_frame.jpeg_bytes
-        )
-        if frame_bmp_bytes is None:
+        frame_bgr = _decode_preroll_jpeg_to_bgr(buffered_frame.jpeg_bytes)
+        if frame_bgr is None:
             return False
 
-        return self._write_frame_bytes(
-            frame_bmp_bytes=frame_bmp_bytes,
+        return self._write_frame_bgr(
+            frame_bgr=frame_bgr,
             frame_envelope=buffered_frame.frame_envelope,
             frame_metadata=buffered_frame.frame_metadata,
-            resolution_height=resolution_height,
-            resolution_width=resolution_width,
+            resolution_height=int(frame_bgr.shape[0]),
+            resolution_width=int(frame_bgr.shape[1]),
             action_message=buffered_frame.action_message,
         )
 
@@ -420,11 +581,31 @@ class BlackboxRecorder:
             )
         )
 
-    def start_session(self) -> None:
+    def _append_matching_preroll_frames(self) -> None:
+        if self.session_config is None:
+            return
+
+        for buffered_frame in self.preroll_frames:
+            buffered_config = _frame_config_from_parts(
+                frame_metadata=buffered_frame.frame_metadata,
+                resolution_height=buffered_frame.resolution_height,
+                resolution_width=buffered_frame.resolution_width,
+            )
+            if _configs_match(buffered_config, self.session_config):
+                self._append_buffered_frame(buffered_frame)
+
+        self.preroll_frames.clear()
+
+    def start_session(self, session_config: VideoSessionConfig) -> None:
         if self._session_active():
             return
 
         self.paths = _build_session_paths(self.output_dir)
+        self.session_config = session_config
+        self._video_writer = FFmpegVideoWriter(
+            output_path=self.paths.video_path,
+            config=session_config,
+        )
         self.manifest = {
             "schema_version": SCHEMA_VERSION,
             "session_timestamp": self.paths.session_timestamp,
@@ -433,6 +614,12 @@ class BlackboxRecorder:
             "frame_topic": self.vision_subscriber.spec.topic.decode("utf-8"),
             "action_channel": self.action_subscriber.spec.name,
             "action_topic": self.action_subscriber.spec.topic.decode("utf-8"),
+            "video_file_name": self.paths.video_path.name,
+            "video_codec": session_config.codec,
+            "video_container": session_config.container,
+            "video_nominal_fps": float(session_config.nominal_fps),
+            "encoded_width": int(session_config.width),
+            "encoded_height": int(session_config.height),
             "frames": [],
             "actions": [],
         }
@@ -440,36 +627,41 @@ class BlackboxRecorder:
         self.action_count = 0
         self.last_flush = time.time()
         self._written_action_keys.clear()
-        self._tar_out_file = tarfile.open(self.paths.tar_path, "w")
 
         for action_message in self.preroll_actions:
             self._append_action(action_message)
-        for buffered_frame in self.preroll_frames:
-            self._append_buffered_frame(buffered_frame)
-
+        self._append_matching_preroll_frames()
         self.preroll_actions.clear()
-        self.preroll_frames.clear()
 
     def stop_session(self) -> None:
         if not self._session_active():
             return
 
+        video_writer = self._video_writer
+        manifest_error: Exception | None = None
+        writer_error: Exception | None = None
         try:
             self.flush_manifest()
-        except Exception:
-            pass
+        except Exception as exc:
+            manifest_error = exc
         try:
-            if self._tar_out_file is not None:
-                self._tar_out_file.close()
-        except Exception:
-            pass
+            if video_writer is not None:
+                video_writer.close()
+        except Exception as exc:
+            writer_error = exc
 
         self.paths = None
         self.manifest = None
-        self._tar_out_file = None
+        self.session_config = None
+        self._video_writer = None
         self.frame_count = 0
         self.action_count = 0
         self._written_action_keys.clear()
+
+        if writer_error is not None:
+            raise writer_error
+        if manifest_error is not None:
+            raise manifest_error
 
     def flush_manifest(self) -> None:
         if self.manifest is None or self.paths is None:
@@ -479,6 +671,18 @@ class BlackboxRecorder:
             self.paths.metadata_tmp_path,
             self.paths.metadata_path,
         )
+
+    def _roll_session_if_needed(self, frame_message: ChannelMessage[np.ndarray]) -> None:
+        frame_config = _frame_config_from_message(frame_message)
+        if not self._session_active():
+            self.start_session(frame_config)
+            return
+
+        if self.session_config is None or _configs_match(self.session_config, frame_config):
+            return
+
+        self.stop_session()
+        self.start_session(frame_config)
 
     def record_next_frame(self, timeout_sec: float | None = None) -> bool:
         frame_message = self.vision_subscriber.receive(
@@ -519,8 +723,8 @@ class BlackboxRecorder:
             previous_revision=previous_recording_revision,
         )
 
-        if recording_enabled_for_frame and not self._session_active():
-            self.start_session()
+        if recording_enabled_for_frame:
+            self._roll_session_if_needed(frame_message)
 
         for action_message in drained_action_messages:
             recording_enabled_for_action = self._recording_enabled_at(
@@ -554,11 +758,17 @@ class BlackboxRecorder:
         return True
 
     def close(self) -> None:
-        self.stop_session()
+        stop_error: Exception | None = None
+        try:
+            self.stop_session()
+        except Exception as exc:
+            stop_error = exc
         if self._owns_settings_client:
             self.settings_client.close()
         self.action_subscriber.close()
         self.vision_subscriber.close()
+        if stop_error is not None:
+            raise stop_error
 
     def run_forever(self) -> None:
         try:

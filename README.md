@@ -71,6 +71,7 @@ Current practical assumptions:
 - Windows for the native DX11 desktop capture path
 - Python `3.13`
 - `uv` for environment management
+- `ffmpeg` on `PATH` if `BLACKBOX_ENABLED = True`
 
 Install the project:
 
@@ -198,6 +199,7 @@ metadata includes:
 
 - `frame_id`
 - `capture_timestamp_ns`
+- `nominal_fps`
 - `publish_timestamp_ns`
 - `source`
 - `is_repeat`
@@ -257,7 +259,7 @@ Useful related defaults:
 
 ```python
 BLACKBOX_RECORD_ON_START = False
-BLACKBOX_PREROLL_SECONDS = 3.0
+BLACKBOX_PREROLL_SECONDS = 0.0
 BLACKBOX_RECORD_HOTKEY = "F8"
 ```
 
@@ -292,16 +294,21 @@ blackbox-recordings/
 
 Each session currently produces:
 
-- `capture_<timestamp>_frames.tar`
+- `capture_<timestamp>_video.mkv`
 - `capture_<timestamp>_metadata.json`
 
 Each start/stop cycle produces a separate recording pair. If you toggle
 recording on twice in one runtime, you will get two clips.
 
-The tar archive contains BMP frames. The JSON manifest contains:
+Blackbox now requires `ffmpeg` on `PATH` when recording is enabled. Frames are
+streamed into ffmpeg as raw `bgr24` and encoded as H.264 in an MKV container.
+The JSON manifest is still the authoritative source for frame timing and action
+alignment. The current manifest schema version is `5`. The manifest contains:
 
 - session-level metadata
+- session video settings
 - frame envelope and frame metadata
+- per-frame video file name and video frame index
 - frame-aligned action payloads
 - frame-aligned action vectors
 - the raw action stream seen during capture
@@ -356,10 +363,12 @@ for Atlas. It is enabled by setting `BLACKBOX_ENABLED = True` in
 
 Current blackbox outputs:
 
-- a tar archive of BMP frames
+- an MKV video clip encoded via ffmpeg
 - a JSON manifest containing:
+  - session video settings
   - frame envelope metadata
   - per-frame metadata
+  - per-frame video file name and frame index
   - frame-aligned action payloads and action envelope data
   - frame-aligned action vectors
   - the raw action stream seen during capture

@@ -217,6 +217,3 @@ class AuxHeads(nn.Module):
         if "ego" in active:
             out.update(self.ego(world))
         return out
-
-
-AtlasAuxHeads = AuxHeads

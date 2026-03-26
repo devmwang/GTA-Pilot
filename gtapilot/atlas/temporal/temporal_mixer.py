@@ -52,6 +52,3 @@ class TemporalMixer(nn.Module):
         frame_sum = x.mean(dim=2)
         cam_now = x[:, -1]
         return cam_now, frame_sum
-
-
-AtlasTemporalMixer = TemporalMixer

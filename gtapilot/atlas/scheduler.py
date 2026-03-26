@@ -22,6 +22,3 @@ class AtlasHeadScheduler:
             if step_index % every == 0:
                 active.add(name)
         return active
-
-
-HeadScheduler = AtlasHeadScheduler

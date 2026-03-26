@@ -154,5 +154,3 @@ class AtlasState:
             reasoner_tokens=self.reasoner_tokens,
             persistent_tokens=persistent,
         )
-
-WorldMemoryView = AtlasWorldMemoryView

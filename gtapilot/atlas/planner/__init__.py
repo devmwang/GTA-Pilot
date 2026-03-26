@@ -1,3 +1,3 @@
-from .planner import AtlasPlannerHead, PlannerHead
+from .planner import PlannerHead
 
-__all__ = ["AtlasPlannerHead", "PlannerHead"]
+__all__ = ["PlannerHead"]

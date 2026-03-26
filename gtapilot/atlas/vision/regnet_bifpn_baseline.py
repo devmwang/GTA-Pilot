@@ -133,6 +133,3 @@ class RegNetBiFPNBaseline(nn.Module):
             **fused,
         }
         return _restore_features(features, cam_tokens, batch_shape)
-
-
-AtlasRegNetBiFPNBaseline = RegNetBiFPNBaseline

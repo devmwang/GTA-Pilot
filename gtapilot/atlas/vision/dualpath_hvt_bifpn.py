@@ -81,7 +81,3 @@ class DualPathHVTBiFPN(nn.Module):
             **fused,
         }
         return _restore_features(features, cam_tokens, batch_shape)
-
-
-AtlasVisionEncoder = DualPathHVTBiFPN
-AtlasDualPathHVTBiFPN = DualPathHVTBiFPN

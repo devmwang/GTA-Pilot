@@ -54,6 +54,3 @@ class EgoFilter(nn.Module):
             "logvar_pose": logvar_pose,
             "hidden_next": hidden_next,
         }
-
-
-AtlasEgoFilter = EgoFilter

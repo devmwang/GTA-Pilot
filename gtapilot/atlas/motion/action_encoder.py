@@ -38,6 +38,3 @@ class ActionEncoder(nn.Module):
         x = torch.cat([actions_hist, dt_hist], dim=-1)
         seq = self.in_proj(x)
         return self.query_pool(seq)
-
-
-AtlasActionEncoder = ActionEncoder

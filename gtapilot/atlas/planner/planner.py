@@ -104,6 +104,3 @@ class PlannerHead(nn.Module):
             "best_idx": best_idx,
             "best_traj": best_traj,
         }
-
-
-AtlasPlannerHead = PlannerHead

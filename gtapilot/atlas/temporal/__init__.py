@@ -1,3 +1,3 @@
-from .temporal_mixer import AtlasTemporalMixer, TemporalMixer
+from .temporal_mixer import TemporalMixer
 
-__all__ = ["AtlasTemporalMixer", "TemporalMixer"]
+__all__ = ["TemporalMixer"]

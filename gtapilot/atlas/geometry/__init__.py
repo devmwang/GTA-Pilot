@@ -1,3 +1,3 @@
-from .geometry_lifter import AtlasGeometryLifter, GeometryLifter
+from .geometry_lifter import GeometryLifter
 
-__all__ = ["AtlasGeometryLifter", "GeometryLifter"]
+__all__ = ["GeometryLifter"]

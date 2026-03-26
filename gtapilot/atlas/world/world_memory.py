@@ -123,6 +123,3 @@ class WorldMemory(nn.Module):
                 dim=1,
             ),
         )
-
-
-AtlasWorldMemory = WorldMemory

@@ -75,6 +75,3 @@ class GeometryLifter(nn.Module):
             "frustum_tokens": frustum_tokens,
             "frustum_xyz": xyz,
         }
-
-
-AtlasGeometryLifter = GeometryLifter

@@ -28,6 +28,3 @@ class ObservationPool(nn.Module):
         assert_rank(frustum_tokens, 3, "frustum_tokens")
         src = torch.cat([cam_now, frustum_tokens, ego_tokens, act_tokens], dim=1)
         return self.pool(src)
-
-
-AtlasObservationPool = ObservationPool

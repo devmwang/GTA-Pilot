@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import replace
 from typing import Any, Dict, Optional
 
@@ -110,6 +111,12 @@ class Atlas(nn.Module):
         elif not torch.is_floating_point(rgb):
             rgb = rgb.float()
         return rgb
+
+    @staticmethod
+    def _grad_context(enabled: bool):
+        if enabled:
+            return contextlib.nullcontext()
+        return torch.no_grad()
 
     def _vision_encode_cam_tokens(self, rgb_step: torch.Tensor) -> torch.Tensor:
         _, cam_tokens = self.vision(rgb_step[:, None], pad_to_native=True)
@@ -258,6 +265,8 @@ class Atlas(nn.Module):
         dt_hist: torch.Tensor | None = None,
         init_state: AtlasState | None = None,
         seed_action_history: bool = False,
+        seed_older_with_grad: bool = False,
+        seed_mid_with_grad: bool = False,
     ) -> AtlasState:
         batch_size = rgb_recent.shape[0]
         state_device, state_dtype = self._state_device_dtype(rgb_recent)
@@ -268,7 +277,7 @@ class Atlas(nn.Module):
         )
 
         if rgb_older.shape[1] > 0:
-            with torch.no_grad():
+            with self._grad_context(seed_older_with_grad):
                 older_tokens = self._encode_camera_token_sequence(rgb_older)
                 older_tokens = older_tokens[:, -self.cfg.temporal.older_compressed_frames :]
                 compressed_older = self.temporal.compress_history_frames(older_tokens)
@@ -295,7 +304,7 @@ class Atlas(nn.Module):
             )
 
         if rgb_mid.shape[1] > 0:
-            with torch.no_grad():
+            with self._grad_context(seed_mid_with_grad):
                 mid_summary_tokens = self._emit_sparse_summary_seed_tokens(
                     rgb_mid,
                     dt_mid,
@@ -538,6 +547,55 @@ class Atlas(nn.Module):
             outputs["ctx_8x"] = ctx_8x
         return outputs, next_state
 
+    def _apply_stage1c_temporal_corruption(
+        self,
+        *,
+        temporal_out: dict[str, torch.Tensor],
+        corruption: dict[str, float] | None,
+    ) -> dict[str, torch.Tensor]:
+        if corruption is None or not self.training:
+            return temporal_out
+
+        cam_drop_prob = float(corruption.get("cam_drop_prob", 0.0))
+        context_family_drop_prob = float(corruption.get("context_family_drop_prob", 0.0))
+
+        if cam_drop_prob > 0.0:
+            temporal_out = {
+                **temporal_out,
+                "cam_now": self._apply_token_dropout(temporal_out["cam_now"], cam_drop_prob),
+            }
+
+        if context_family_drop_prob > 0.0:
+            family_keys = ("short_ctx", "older_ctx", "long_ctx")
+            batch_size = temporal_out["cam_now"].shape[0]
+            apply_dropout = torch.rand(batch_size, device=temporal_out["cam_now"].device) < context_family_drop_prob
+            family_index = torch.randint(
+                0,
+                len(family_keys),
+                (batch_size,),
+                device=temporal_out["cam_now"].device,
+            )
+            for current_family_index, family_key in enumerate(family_keys):
+                family_tokens = temporal_out[family_key]
+                drop_mask = (
+                    apply_dropout & (family_index == current_family_index)
+                ).to(family_tokens.dtype)[:, None, None]
+                temporal_out[family_key] = family_tokens * (1.0 - drop_mask)
+
+        return temporal_out
+
+    def _apply_stage1c_frustum_dropout(
+        self,
+        frustum_tokens: torch.Tensor,
+        corruption: dict[str, float] | None,
+    ) -> torch.Tensor:
+        if corruption is None or not self.training:
+            return frustum_tokens
+        frustum_drop_prob = float(corruption.get("frustum_drop_prob", 0.0))
+        if frustum_drop_prob <= 0.0:
+            return frustum_tokens
+        return self._apply_token_dropout(frustum_tokens, frustum_drop_prob)
+
     def forward_stage1a(
         self,
         rgb_recent: torch.Tensor,
@@ -549,6 +607,8 @@ class Atlas(nn.Module):
         *,
         init_state: AtlasState | None = None,
         student_masking: dict[str, float] | None = None,
+        seed_older_with_grad: bool = False,
+        seed_mid_with_grad: bool = False,
     ) -> Dict[str, Any]:
         assert_rank(rgb_recent, 5, "rgb_recent")
         assert_rank(dt_recent, 3, "dt_recent")
@@ -571,6 +631,8 @@ class Atlas(nn.Module):
             dt_mid=dt_mid,
             init_state=init_state,
             seed_action_history=False,
+            seed_older_with_grad=seed_older_with_grad,
+            seed_mid_with_grad=seed_mid_with_grad,
         )
         per_step: list[dict[str, torch.Tensor]] = []
         for step_idx in range(rgb_recent.shape[1]):
@@ -611,6 +673,8 @@ class Atlas(nn.Module):
         dt_hist: torch.Tensor,
         *,
         init_state: AtlasState | None = None,
+        seed_older_with_grad: bool = False,
+        seed_mid_with_grad: bool = False,
     ) -> Dict[str, Any]:
         assert_rank(rgb_recent, 5, "rgb_recent")
         assert_rank(dt_recent, 3, "dt_recent")
@@ -638,6 +702,8 @@ class Atlas(nn.Module):
             dt_hist=dt_hist,
             init_state=init_state,
             seed_action_history=True,
+            seed_older_with_grad=seed_older_with_grad,
+            seed_mid_with_grad=seed_mid_with_grad,
         )
         recent_steps = rgb_recent.shape[1]
         action_seq = actions_hist[:, -recent_steps:]
@@ -722,6 +788,9 @@ class Atlas(nn.Module):
         reasoner_tok: Optional[torch.Tensor] = None,
         *,
         init_state: AtlasState | None = None,
+        student_corruption: dict[str, float] | None = None,
+        seed_older_with_grad: bool = False,
+        seed_mid_with_grad: bool = False,
     ) -> Dict[str, Any]:
         assert_rank(rgb_recent, 5, "rgb_recent")
         assert_rank(dt_recent, 3, "dt_recent")
@@ -749,6 +818,8 @@ class Atlas(nn.Module):
             dt_hist=dt_hist,
             init_state=init_state,
             seed_action_history=True,
+            seed_older_with_grad=seed_older_with_grad,
+            seed_mid_with_grad=seed_mid_with_grad,
         )
         recent_steps = rgb_recent.shape[1]
         action_seq = actions_hist[:, -recent_steps:]
@@ -785,6 +856,10 @@ class Atlas(nn.Module):
                 ctx_8x=temporal_out["ctx_8x"],
                 cam_now=temporal_out["cam_now"],
                 ego_tokens=ego_out["ego_tokens"],
+            )
+            frustum_tokens = self._apply_stage1c_frustum_dropout(
+                frustum_tokens,
+                student_corruption,
             )
             batch_size = rgb_recent.shape[0]
             route_tokens = self.route_adapter(
@@ -999,10 +1074,13 @@ class Atlas(nn.Module):
         assert_rank(dt_t, 2, "dt_t")
         batch_size = rgb_t.shape[0]
 
+        rgb_model = self._move_rgb_to_model_device(rgb_t)
         rgb_pad = pad_image_to_size(
-            rgb_t, self.cfg.image.padded_height, self.cfg.image.padded_width
+            rgb_model,
+            self.cfg.image.padded_height,
+            self.cfg.image.padded_width,
         )
-        vision_features, cam_tokens_cur = self.vision(rgb_t[:, None], pad_to_native=True)
+        vision_features, cam_tokens_cur = self.vision(rgb_model[:, None], pad_to_native=True)
         cam_tokens_cur = cam_tokens_cur[:, 0]
         current_vision_features = {
             name: tensor[:, 0] for name, tensor in vision_features.items()
@@ -1053,8 +1131,8 @@ class Atlas(nn.Module):
                 route_polyline,
                 nav_cmd,
                 batch_size,
-                rgb_t.device,
-                rgb_t.dtype,
+                rgb_model.device,
+                rgb_model.dtype,
             )
         else:
             route_tokens = state.route_tokens

@@ -76,38 +76,87 @@ def downsample_depth_native_to_8x(depth_native_m: np.ndarray) -> np.ndarray:
 
 
 def build_rigid_track_targets(
+    *,
+    cfg: AtlasConfig,
     depth_8x_m: np.ndarray,
-    pose_delta_local: np.ndarray,
+    pose_xyyaw_world: np.ndarray,
     dynamic_mask_8x: np.ndarray,
     lag_indices: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     depth_8x_m = np.asarray(depth_8x_m, dtype=np.float32)
-    pose_delta_local = np.asarray(pose_delta_local, dtype=np.float32)
+    pose_xyyaw_world = np.asarray(pose_xyyaw_world, dtype=np.float32)
     dynamic_mask_8x = np.asarray(dynamic_mask_8x, dtype=bool)
     lag_indices = np.asarray(lag_indices, dtype=np.int64)
     t, h, w = depth_8x_m.shape
     track_target = np.zeros((t, lag_indices.shape[0], 2, h, w), dtype=np.float32)
     track_valid = np.zeros((t, lag_indices.shape[0], h, w), dtype=bool)
-    yy, xx = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float32),
+        np.arange(w, dtype=np.float32),
+        indexing="ij",
+    )
+    scale_x = float(cfg.image.padded_width) / float(w)
+    scale_y = float(cfg.image.padded_height) / float(h)
+    u = (xx + 0.5) * scale_x
+    v = (yy + 0.5) * scale_y
+    fx = float(cfg.image.fx)
+    fy = float(cfg.image.fy)
+    cx = float(cfg.image.padded_width) * 0.5
+    cy = float(cfg.image.padded_height) * 0.5
+
     for time_idx in range(t):
         current_depth = depth_8x_m[time_idx]
-        current_valid = np.isfinite(current_depth) & (current_depth > 0.0) & (~dynamic_mask_8x[time_idx])
+        current_valid = (
+            np.isfinite(current_depth)
+            & (current_depth >= cfg.image.depth_min_m)
+            & (current_depth <= cfg.image.depth_max_m)
+            & (~dynamic_mask_8x[time_idx])
+        )
+        if not np.any(current_valid):
+            continue
+        x_cam = ((u - cx) / fx) * current_depth
+        y_cam = ((v - cy) / fy) * current_depth
+        z_cam = current_depth
+        forward_cur = z_cam
+        left_cur = -x_cam
+        yaw_cur = float(pose_xyyaw_world[time_idx, 2])
+        cos_cur = math.cos(yaw_cur)
+        sin_cur = math.sin(yaw_cur)
+        world_x = float(pose_xyyaw_world[time_idx, 0]) + cos_cur * forward_cur - sin_cur * left_cur
+        world_y = float(pose_xyyaw_world[time_idx, 1]) + sin_cur * forward_cur + cos_cur * left_cur
+
         for lag_idx, lag in enumerate(lag_indices.tolist()):
             prev_idx = time_idx - lag
             if prev_idx < 0:
                 continue
-            motion = pose_delta_local[prev_idx + 1 : time_idx + 1].sum(axis=0)
-            flow_x = -motion[0] / np.maximum(current_depth, 1e-3)
-            flow_y = -motion[1] / np.maximum(current_depth, 1e-3)
-            target_x = xx + flow_x
-            target_y = yy + flow_y
+            yaw_prev = float(pose_xyyaw_world[prev_idx, 2])
+            cos_prev = math.cos(yaw_prev)
+            sin_prev = math.sin(yaw_prev)
+            dx_world = world_x - float(pose_xyyaw_world[prev_idx, 0])
+            dy_world = world_y - float(pose_xyyaw_world[prev_idx, 1])
+            forward_prev = cos_prev * dx_world + sin_prev * dy_world
+            left_prev = -sin_prev * dx_world + cos_prev * dy_world
+            x_prev = -left_prev
+            z_prev = forward_prev
+            sane_depth = z_prev > max(cfg.image.depth_min_m, 1e-3)
+            u_prev = fx * (x_prev / np.maximum(z_prev, 1e-3)) + cx
+            v_prev = fy * (y_cam / np.maximum(z_prev, 1e-3)) + cy
+            target_x = (u_prev / scale_x) - 0.5
+            target_y = (v_prev / scale_y) - 0.5
             in_bounds = (
                 (target_x >= 0.0)
                 & (target_x <= (w - 1))
                 & (target_y >= 0.0)
                 & (target_y <= (h - 1))
             )
-            valid = current_valid & in_bounds & (~dynamic_mask_8x[prev_idx])
+            finite_target = np.isfinite(target_x) & np.isfinite(target_y)
+            valid = (
+                current_valid
+                & sane_depth
+                & finite_target
+                & in_bounds
+                & (~dynamic_mask_8x[prev_idx])
+            )
             track_target[time_idx, lag_idx, 0] = target_x - xx
             track_target[time_idx, lag_idx, 1] = target_y - yy
             track_valid[time_idx, lag_idx] = valid
@@ -135,14 +184,20 @@ def build_stage1b_targets(
     if ego_valid is None:
         ego_valid = np.ones((depth_8x_m.shape[0],), dtype=bool)
     if track_lag_indices is None:
-        track_lag_indices = np.array([1, 2, 4, 8, 16, 31], dtype=np.int64)
+        track_lag_indices = np.asarray(cfg.geometry.track_lag_indices, dtype=np.int64)
 
     pose_delta_local = compute_pose_delta_local(pose_xyyaw_world)
     kinematics = compute_kinematics(pose_delta_local, dt_s)
-    depth_valid_8x = np.isfinite(depth_8x_m) & (depth_8x_m > cfg.image.depth_min_m)
+    depth_valid_8x = (
+        np.isfinite(depth_8x_m)
+        & (depth_8x_m >= cfg.image.depth_min_m)
+        & (depth_8x_m <= cfg.image.depth_max_m)
+    )
+    depth_8x_m = np.clip(depth_8x_m, cfg.image.depth_min_m, cfg.image.depth_max_m)
     track_target_sparse, track_valid_sparse = build_rigid_track_targets(
+        cfg=cfg,
         depth_8x_m=depth_8x_m,
-        pose_delta_local=pose_delta_local,
+        pose_xyyaw_world=pose_xyyaw_world,
         dynamic_mask_8x=dynamic_mask_8x,
         lag_indices=track_lag_indices,
     )

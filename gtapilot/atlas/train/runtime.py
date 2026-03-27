@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from ..data import (
     AtlasBlackboxClipDataset,
     AtlasPrivilegedClipDataset,
+    ClipGroupedBatchSampler,
     collate_temporal_clips,
 )
 from ..heads.pretrain_heads import Stage1APretrainHeads, Stage1CPretrainHeads
@@ -76,18 +77,24 @@ def _build_dataset(
         older_steps=data_cfg.older_steps,
         mid_steps=data_cfg.mid_steps,
         action_steps=data_cfg.action_steps,
+        anchor_stride_steps=data_cfg.anchor_stride_steps,
+        max_samples_per_clip_per_epoch=data_cfg.max_samples_per_clip_per_epoch,
     )
 
 
-def _build_loader(dataset, data_cfg: DataConfig, *, shuffle: bool) -> DataLoader:
+def _build_loader(
+    dataset,
+    data_cfg: DataConfig,
+    *,
+    shuffle: bool,
+    seed: int,
+) -> DataLoader:
     stage1_gpu_loader = (
         isinstance(dataset, (AtlasBlackboxClipDataset, AtlasPrivilegedClipDataset))
         and float(dataset.model_hz) in {24.0, 36.0}
     )
     loader_kwargs: dict[str, Any] = {
         "dataset": dataset,
-        "batch_size": data_cfg.batch_size,
-        "shuffle": shuffle,
         "num_workers": data_cfg.num_workers,
         # Stage 1 batches now keep the large RGB banks on CPU and stream frames to CUDA
         # one step at a time. Pinning the full three-tier clip tensors eagerly can exhaust
@@ -95,8 +102,19 @@ def _build_loader(dataset, data_cfg: DataConfig, *, shuffle: bool) -> DataLoader
         "pin_memory": data_cfg.pin_memory and not stage1_gpu_loader,
         "persistent_workers": data_cfg.persistent_workers and data_cfg.num_workers > 0,
         "collate_fn": collate_temporal_clips,
-        "drop_last": shuffle,
     }
+    if shuffle and data_cfg.clip_batch_grouping:
+        loader_kwargs["batch_sampler"] = ClipGroupedBatchSampler(
+            clip_ids=[sample.clip_id for sample in dataset.samples],
+            batch_size=data_cfg.batch_size,
+            drop_last=True,
+            shuffle=True,
+            seed=seed,
+        )
+    else:
+        loader_kwargs["batch_size"] = data_cfg.batch_size
+        loader_kwargs["shuffle"] = shuffle
+        loader_kwargs["drop_last"] = shuffle
     if data_cfg.num_workers > 0 and data_cfg.prefetch_factor is not None:
         loader_kwargs["prefetch_factor"] = data_cfg.prefetch_factor
     return DataLoader(**loader_kwargs)
@@ -179,6 +197,7 @@ def _summary_insert_sequence(
 
 def _build_train_module(stage: str, model_variant: str, trainer_cfg: TrainerConfig) -> StageTrainModule:
     atlas = build_model_from_variant(model_variant)
+    _prune_atlas_for_stage(atlas, stage)
     atlas_cfg = atlas.cfg
     stage1a_heads = None
     stage1c_heads = None
@@ -191,6 +210,56 @@ def _build_train_module(stage: str, model_variant: str, trainer_cfg: TrainerConf
         stage1a_heads=stage1a_heads,
         stage1c_heads=stage1c_heads,
     )
+
+
+def _prune_atlas_for_stage(atlas: nn.Module, stage: str) -> None:
+    teacher_only_modules = (
+        "lidar_adapter",
+        "pose_adapter",
+        "actor_adapter",
+        "map_adapter",
+        "hidden_actor_adapter",
+        "visibility_adapter",
+        "flow_adapter",
+        "risk_adapter",
+    )
+    prune_map = {
+        "stage1a": (
+            "action_encoder",
+            "ego_filter",
+            "geometry",
+            "obs_pool",
+            "route_adapter",
+            "reasoner_bridge",
+            "world",
+            "risk_decoder",
+            "planner",
+            "aux",
+            "scheduler",
+            *teacher_only_modules,
+        ),
+        "stage1b": (
+            "obs_pool",
+            "route_adapter",
+            "reasoner_bridge",
+            "world",
+            "risk_decoder",
+            "planner",
+            "aux",
+            "scheduler",
+            *teacher_only_modules,
+        ),
+        "stage1c": (
+            "risk_decoder",
+            "planner",
+            "aux",
+            "scheduler",
+            *teacher_only_modules,
+        ),
+    }
+    for name in prune_map.get(stage, ()):
+        if hasattr(atlas, name):
+            setattr(atlas, name, None)
 
 
 def _stage_init_checkpoint(stage: str, trainer_cfg: TrainerConfig) -> str | None:
@@ -217,31 +286,64 @@ def _load_partial_module_state(module: nn.Module, path: str | Path) -> int:
 def _build_optimizer(module: StageTrainModule, trainer_cfg: TrainerConfig) -> torch.optim.Optimizer:
     opt_cfg = trainer_cfg.optimizer
     vision_ids = {id(param) for param in module.atlas.vision.parameters() if param.requires_grad}
-    vision_params = []
-    base_params = []
-    for param in module.parameters():
-        if not param.requires_grad:
+    groups = {
+        "vision_decay": [],
+        "vision_no_decay": [],
+        "base_decay": [],
+        "base_no_decay": [],
+    }
+    seen_param_ids: set[int] = set()
+    for name, param in module.named_parameters():
+        if not param.requires_grad or id(param) in seen_param_ids:
             continue
-        if id(param) in vision_ids:
-            vision_params.append(param)
-        else:
-            base_params.append(param)
-    groups = []
-    if base_params:
-        groups.append({"params": base_params, "lr": opt_cfg.lr})
-    if vision_params:
-        groups.append(
-            {
-                "params": vision_params,
-                "lr": opt_cfg.lr * opt_cfg.vision_lr_scale,
-            }
+        seen_param_ids.add(id(param))
+        lower_name = name.lower()
+        no_decay = (
+            param.ndim == 1
+            or name.endswith(".bias")
+            or "norm" in lower_name
+            or "layernorm" in lower_name
+            or lower_name.endswith(".ln")
+            or ".ln" in lower_name
+            or "bn" in lower_name
+            or "query" in lower_name
+            or "embed" in lower_name
+            or "pos_embed" in lower_name
+            or "position" in lower_name
+            or "relative" in lower_name
         )
+        group_name = "vision_" if id(param) in vision_ids else "base_"
+        group_name += "no_decay" if no_decay else "decay"
+        groups[group_name].append(param)
     if opt_cfg.name.lower() != "adamw":
         raise ValueError(f"Unsupported optimizer: {opt_cfg.name}")
+    param_groups = []
+    if groups["base_decay"]:
+        param_groups.append(
+            {"params": groups["base_decay"], "lr": opt_cfg.lr, "weight_decay": opt_cfg.weight_decay}
+        )
+    if groups["base_no_decay"]:
+        param_groups.append({"params": groups["base_no_decay"], "lr": opt_cfg.lr, "weight_decay": 0.0})
+    if groups["vision_decay"]:
+        param_groups.append(
+            {
+                "params": groups["vision_decay"],
+                "lr": opt_cfg.lr * opt_cfg.vision_lr_scale,
+                "weight_decay": opt_cfg.weight_decay,
+            }
+        )
+    if groups["vision_no_decay"]:
+        param_groups.append(
+            {
+                "params": groups["vision_no_decay"],
+                "lr": opt_cfg.lr * opt_cfg.vision_lr_scale,
+                "weight_decay": 0.0,
+            }
+        )
     return AdamW(
-        groups,
+        param_groups,
         lr=opt_cfg.lr,
-        weight_decay=opt_cfg.weight_decay,
+        weight_decay=0.0,
         betas=opt_cfg.betas,
         eps=opt_cfg.eps,
     )
@@ -319,6 +421,7 @@ def _stage1a_forward_loss(
     module: StageTrainModule,
     batch: dict[str, Any],
     trainer_cfg: TrainerConfig,
+    data_cfg: DataConfig,
     ema_modules: dict[str, EMAModel],
     device: torch.device,
     *,
@@ -344,6 +447,8 @@ def _stage1a_forward_loss(
             batch["rgb_mid"],
             batch["dt_mid"],
             student_masking=masking,
+            seed_older_with_grad=data_cfg.seed_older_with_grad,
+            seed_mid_with_grad=data_cfg.seed_mid_with_grad,
         )
         summary_src, dt_summary = _summary_insert_sequence(
             student["seq"]["frame_summary"],
@@ -366,6 +471,8 @@ def _stage1a_forward_loss(
                 batch["dt_older"],
                 batch["rgb_mid"],
                 batch["dt_mid"],
+                seed_older_with_grad=data_cfg.seed_older_with_grad,
+                seed_mid_with_grad=data_cfg.seed_mid_with_grad,
             )
         teacher_summary_src, _ = _summary_insert_sequence(
             teacher["seq"]["frame_summary"],
@@ -389,6 +496,7 @@ def _stage1b_forward_loss(
     module: StageTrainModule,
     batch: dict[str, Any],
     trainer_cfg: TrainerConfig,
+    data_cfg: DataConfig,
     ema_modules: dict[str, EMAModel],
     device: torch.device,
     *,
@@ -404,6 +512,8 @@ def _stage1b_forward_loss(
             batch["dt_mid"],
             batch["actions_hist"],
             batch["dt_hist"],
+            seed_older_with_grad=data_cfg.seed_older_with_grad,
+            seed_mid_with_grad=data_cfg.seed_mid_with_grad,
         )
         canonical = _canonical_stage1b_outputs(outputs)
         losses = compute_stage1b_losses(canonical, batch)
@@ -436,6 +546,8 @@ def _stage1b_forward_loss(
                     batch["dt_older"],
                     batch["rgb_mid"],
                     batch["dt_mid"],
+                    seed_older_with_grad=data_cfg.seed_older_with_grad,
+                    seed_mid_with_grad=data_cfg.seed_mid_with_grad,
                 )
             teacher_summary_src, _ = _summary_insert_sequence(
                 teacher["seq"]["frame_summary"],
@@ -465,6 +577,7 @@ def _stage1c_forward_loss(
     module: StageTrainModule,
     batch: dict[str, Any],
     trainer_cfg: TrainerConfig,
+    data_cfg: DataConfig,
     ema_modules: dict[str, EMAModel],
     device: torch.device,
     *,
@@ -488,6 +601,13 @@ def _stage1c_forward_loss(
             route_polyline=batch.get("route_polyline"),
             nav_cmd=batch.get("nav_cmd"),
             reasoner_tok=batch.get("reasoner_tok"),
+            student_corruption={
+                "cam_drop_prob": trainer_cfg.stage1c.cam_drop_prob,
+                "frustum_drop_prob": trainer_cfg.stage1c.frustum_drop_prob,
+                "context_family_drop_prob": trainer_cfg.stage1c.context_family_drop_prob,
+            },
+            seed_older_with_grad=data_cfg.seed_older_with_grad,
+            seed_mid_with_grad=data_cfg.seed_mid_with_grad,
         )
         canonical = _canonical_stage1c_outputs(outputs)
         student_readout = module.stage1c_heads.readout_seq(
@@ -521,6 +641,8 @@ def _stage1c_forward_loss(
                 route_polyline=batch.get("route_polyline"),
                 nav_cmd=batch.get("nav_cmd"),
                 reasoner_tok=batch.get("reasoner_tok"),
+                seed_older_with_grad=data_cfg.seed_older_with_grad,
+                seed_mid_with_grad=data_cfg.seed_mid_with_grad,
             )
             teacher_readout = ema_modules["stage1c_heads"].module.readout_seq(
                 static_grid_seq=teacher["seq"]["static_grid"],
@@ -561,6 +683,7 @@ def _forward_loss_for_stage(
     module: StageTrainModule,
     batch: dict[str, Any],
     trainer_cfg: TrainerConfig,
+    data_cfg: DataConfig,
     ema_modules: dict[str, EMAModel],
     device: torch.device,
     *,
@@ -571,6 +694,7 @@ def _forward_loss_for_stage(
             module,
             batch,
             trainer_cfg,
+            data_cfg,
             ema_modules,
             device,
             amp_enabled=amp_enabled,
@@ -580,6 +704,7 @@ def _forward_loss_for_stage(
             module,
             batch,
             trainer_cfg,
+            data_cfg,
             ema_modules,
             device,
             amp_enabled=amp_enabled,
@@ -589,6 +714,7 @@ def _forward_loss_for_stage(
             module,
             batch,
             trainer_cfg,
+            data_cfg,
             ema_modules,
             device,
             amp_enabled=amp_enabled,
@@ -605,7 +731,7 @@ def _train_one_step(
     scaler: torch.amp.GradScaler,
     ema_modules: dict[str, EMAModel],
     device: torch.device,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], bool]:
     module.train()
     optimizer.zero_grad(set_to_none=True)
     microbatch_size = trainer_cfg.train.microbatch_size
@@ -617,6 +743,7 @@ def _train_one_step(
             module,
             microbatch,
             trainer_cfg,
+            trainer_cfg.train,
             ema_modules,
             device,
             amp_enabled=trainer_cfg.amp,
@@ -637,8 +764,10 @@ def _train_one_step(
             trainer_cfg.optimizer.grad_clip_norm,
         )
     grad = grad_norm(module.parameters())
+    prev_scale = scaler.get_scale()
     scaler.step(optimizer)
     scaler.update()
+    optimizer_step_applied = scaler.get_scale() >= prev_scale
     if "atlas" in ema_modules:
         ema_modules["atlas"].update(module.atlas)
     if "stage1c_heads" in ema_modules and module.stage1c_heads is not None:
@@ -648,7 +777,7 @@ def _train_one_step(
         aggregated[key] /= max(1.0, batch_total)
     aggregated["grad_norm"] = grad
     aggregated["batch_size"] = batch_total
-    return aggregated
+    return aggregated, optimizer_step_applied
 
 
 @torch.no_grad()
@@ -672,6 +801,7 @@ def _validate(
             module,
             batch,
             trainer_cfg,
+            trainer_cfg.val,
             ema_modules,
             device,
             amp_enabled=trainer_cfg.amp,
@@ -711,7 +841,12 @@ def run_training_stage(
     train_dataset = _build_dataset(stage, trainer_cfg.train, atlas_cfg)
     if len(train_dataset) == 0:
         raise RuntimeError("Training dataset is empty.")
-    train_loader = _build_loader(train_dataset, trainer_cfg.train, shuffle=True)
+    train_loader = _build_loader(
+        train_dataset,
+        trainer_cfg.train,
+        shuffle=True,
+        seed=trainer_cfg.seed,
+    )
 
     val_loader = None
     validation_requested = trainer_cfg.validate_first or trainer_cfg.logging.val_every_steps > 0
@@ -723,7 +858,12 @@ def run_training_stage(
         val_dataset = _build_dataset(stage, trainer_cfg.val, atlas_cfg)
         if len(val_dataset) == 0:
             raise RuntimeError("Validation was requested, but the validation dataset is empty.")
-        val_loader = _build_loader(val_dataset, trainer_cfg.val, shuffle=False)
+        val_loader = _build_loader(
+            val_dataset,
+            trainer_cfg.val,
+            shuffle=False,
+            seed=trainer_cfg.seed,
+        )
 
     optimizer = _build_optimizer(module, trainer_cfg)
     scheduler = _build_scheduler(optimizer, trainer_cfg)
@@ -792,7 +932,7 @@ def run_training_stage(
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             batch = _stage_batch_to_device(stage, raw_batch, device)
-            train_metrics = _train_one_step(
+            train_metrics, optimizer_step_applied = _train_one_step(
                 stage,
                 module,
                 batch,
@@ -802,11 +942,15 @@ def run_training_stage(
                 ema_modules,
                 device,
             )
-            scheduler.step()
+            if optimizer_step_applied:
+                scheduler.step()
             step += 1
             elapsed = timer.tick()
             train_metrics["lr"] = _current_lr(optimizer)
-            train_metrics["throughput_fps"] = train_metrics.pop("batch_size") / max(elapsed, 1e-6)
+            train_metrics["throughput_samples_per_s"] = train_metrics.pop("batch_size") / max(
+                elapsed,
+                1e-6,
+            )
             train_metrics["gpu_mem_mb"] = tensor_memory_mb(device)
             if step % max(1, trainer_cfg.logging.log_every_steps) == 0:
                 logger.log_scalars(step, train_metrics, prefix="train/")

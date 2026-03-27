@@ -6,11 +6,11 @@ from pathlib import Path
 import cv2
 import torch
 
-# Keep the worker-local clip cache modest: Stage 1 samples already materialize large
-# recent/older/mid unions, and overly large decoded-frame caches can consume several
-# additional gigabytes of host RAM per active clip. Bound both the per-clip frame cache
-# and the number of live clip decoders so host RAM cannot grow without limit.
-_MAX_CACHED_FRAMES = 32
+# Keep the worker-local clip cache bounded but large enough to cover the heavily
+# overlapping Stage 1 recent/older/mid unions for one clip. This preserves warm
+# reuse across neighboring anchors without recreating the old unbounded host-RAM
+# failure mode.
+_MAX_CACHED_FRAMES = 256
 _MAX_DECODER_SESSIONS = 2
 _DECODER_SESSIONS: OrderedDict[Path, "_ClipDecoder"] = OrderedDict()
 

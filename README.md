@@ -393,6 +393,21 @@ timestamp, and action history is built from the raw blackbox action stream when
 it exists. Older recordings without a raw `actions` stream fall back to the
 frame-aligned `action_vector` path while still preserving exact `dt`.
 
+Privileged Stage 1B / Stage 1C targets are a separate sibling package:
+
+- `capture_<timestamp>_privileged/`
+- built with `python -m gtapilot.atlas.data.build_stage1b_privileged_dataset ...`
+- indexed through `AtlasTemporalClipIndex.privileged_dir`
+
+The privileged manifest now carries source-metadata alignment fields
+(`source_metadata_file`, source hash, frame ids, and capture timestamps), and
+the privileged dataset loader fails fast if those arrays do not match the
+source blackbox metadata exactly.
+
+Stage 1B track supervision is now sparse-lag only. The geometry head predicts
+the configured `track_lag_indices` set instead of a dense lag volume, and the
+privileged dataset keeps those sparse lag targets sparse end to end.
+
 ## IPC
 
 The runtime uses two IPC layers:

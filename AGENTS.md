@@ -335,6 +335,13 @@ Current Stage 1 data contract:
 - privileged Stage 1B / 1C targets should live in the sibling
   `capture_<timestamp>_privileged/` directory and be indexed through
   `AtlasTemporalClipIndex.privileged_dir`
+- build aligned privileged packages with
+  `python -m gtapilot.atlas.data.build_stage1b_privileged_dataset ...`
+- privileged manifests must carry source alignment metadata and should be
+  validated against the source blackbox clip before training
+- Stage 1B track supervision is sparse-lag only; keep
+  `cfg.geometry.track_lag_indices`, sparse privileged targets, and geometry-head
+  output dimensionality in sync
 
 Atlas state must carry:
 

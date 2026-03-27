@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-INDEX_CACHE_SCHEMA_VERSION = 2
+INDEX_CACHE_SCHEMA_VERSION = 3
 
 
 def _stable_key(payload: dict[str, Any]) -> str:

@@ -23,6 +23,11 @@ class DataConfig:
     older_steps: int | None = None
     mid_steps: int | None = None
     action_steps: int | None = None
+    anchor_stride_steps: int = 1
+    max_samples_per_clip_per_epoch: int | None = None
+    clip_batch_grouping: bool = True
+    seed_older_with_grad: bool = False
+    seed_mid_with_grad: bool = False
 
 
 @dataclass
@@ -34,7 +39,6 @@ class OptimizerConfig:
     eps: float = 1e-8
     grad_clip_norm: float = 1.0
     vision_lr_scale: float = 0.5
-    pretrained_backbone_lr_scale: float = 0.5
 
 
 @dataclass

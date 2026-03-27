@@ -22,9 +22,10 @@ class GeometryLifter(nn.Module):
         in_ch = cfg.vision.ctx_dims[0]
         D = cfg.hidden_dim
         depth_bins = cfg.image.depth_bins
+        track_lags = len(cfg.geometry.track_lag_indices)
         self.depth_head = nn.Conv2d(in_ch, depth_bins, kernel_size=1)
         self.conf_head = nn.Conv2d(in_ch, 1, kernel_size=1)
-        self.track_head = nn.Conv2d(in_ch, cfg.geometry.track_history * 2, kernel_size=1)
+        self.track_head = nn.Conv2d(in_ch, track_lags * 2, kernel_size=1)
         self.feat_proj = nn.Linear(in_ch + 4 + D, D)
         self.norm = nn.LayerNorm(D)
 
@@ -38,7 +39,13 @@ class GeometryLifter(nn.Module):
         b, c, h, w = ctx_8x.shape
         depth_logits = self.depth_head(ctx_8x)
         ray_conf = self.conf_head(ctx_8x).sigmoid()
-        track_offsets = self.track_head(ctx_8x).reshape(b, self.cfg.geometry.track_history, 2, h, w)
+        track_offsets = self.track_head(ctx_8x).reshape(
+            b,
+            len(self.cfg.geometry.track_lag_indices),
+            2,
+            h,
+            w,
+        )
 
         bins = depth_bin_centers(
             self.cfg.image.depth_min_m,

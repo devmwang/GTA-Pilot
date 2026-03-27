@@ -187,6 +187,12 @@ class WorldMemory(nn.Module):
             obs_summary=static_obs_summary,
             pose_uncertainty=pose_uncertainty,
         )
+        if self.training and self.cfg.world.static_write_dropout > 0.0:
+            keep = (
+                torch.rand_like(gate)
+                >= float(self.cfg.world.static_write_dropout)
+            ).to(gate.dtype)
+            gate = gate * keep
         fused_static = (1.0 - gate) * static_tokens + gate * updated_static
         fused_static_grid = fused_static.transpose(1, 2).reshape(
             state.static_grid.shape[0],

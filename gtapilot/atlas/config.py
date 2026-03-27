@@ -117,11 +117,17 @@ class EgoFilterConfig:
 class GeometryLifterConfig:
     frustum_tokens: int = 384
     depth_bins: int = 64
-    track_history: int = 31
+    track_lag_indices: Tuple[int, ...] = (1, 2, 4, 8, 16, 31)
     grid_h_8x: int = 136
     grid_w_8x: int = 240
     min_depth_m: float = 0.5
     max_depth_m: float = 80.0
+
+    @property
+    def track_history(self) -> int:
+        if not self.track_lag_indices:
+            return 0
+        return int(max(self.track_lag_indices))
 
 
 @dataclass
@@ -388,7 +394,7 @@ def atlas_s1080_config() -> AtlasConfig:
     cfg.action.hidden_dim = 192
     cfg.ego.hidden_size = 192
     cfg.geometry.frustum_tokens = 384
-    cfg.geometry.track_history = cfg.temporal.recent_cache_frames
+    cfg.geometry.track_lag_indices = (1, 2, 4, 8, 16, 32, 47)
     cfg.obs_pool.obs_tokens = 96
     cfg.world.static_grid_h = 20
     cfg.world.static_grid_w = 14
@@ -452,7 +458,7 @@ def atlas_t1080_priv_config() -> AtlasConfig:
     cfg.ego.hidden_size = 256
     cfg.ego.ego_tokens = 8
     cfg.geometry.frustum_tokens = 512
-    cfg.geometry.track_history = cfg.temporal.recent_cache_frames
+    cfg.geometry.track_lag_indices = (1, 2, 4, 8, 16, 31)
     cfg.obs_pool.obs_tokens = 128
     cfg.obs_pool.num_heads = 10
     cfg.world.static_grid_h = 24
@@ -527,7 +533,7 @@ def atlas_smoke_config() -> AtlasConfig:
     cfg.geometry.frustum_tokens = 8
     cfg.geometry.grid_h_8x = cfg.image.padded_height // 8
     cfg.geometry.grid_w_8x = cfg.image.padded_width // 8
-    cfg.geometry.track_history = cfg.temporal.recent_cache_frames
+    cfg.geometry.track_lag_indices = (1, 2, 3)
     cfg.obs_pool.obs_tokens = 4
     cfg.obs_pool.num_heads = 2
     cfg.world.static_grid_h = 4

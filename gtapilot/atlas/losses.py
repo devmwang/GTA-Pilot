@@ -20,14 +20,18 @@ def _expand_mask(mask: torch.Tensor, target_rank: int) -> torch.Tensor:
     return mask
 
 
+def _broadcast_mask(mask: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return _expand_mask(mask, target.ndim).expand_as(target)
+
+
 def masked_l2_jepa(
     pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None
 ) -> torch.Tensor:
     if mask is None:
         return F.mse_loss(pred, target)
-    mask = _expand_mask(mask, pred.ndim).to(pred.dtype)
-    denom = mask.sum().clamp(min=1.0)
-    return ((pred - target).pow(2) * mask).sum() / denom
+    mask = _broadcast_mask(mask, pred).to(pred.dtype)
+    loss = (pred - target).pow(2) * mask
+    return loss.sum() / mask.sum().clamp(min=1.0)
 
 
 def sigreg(latents: torch.Tensor, family_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -81,8 +85,9 @@ def gaussian_nll(
     loss = 0.5 * ((pred_mean - target).pow(2) * torch.exp(-pred_logvar) + pred_logvar)
     if valid is None:
         return loss.mean()
-    valid = _expand_mask(valid, loss.ndim).to(loss.dtype)
-    return (loss * valid).sum() / valid.sum().clamp(min=1.0)
+    valid = _broadcast_mask(valid, loss).to(loss.dtype)
+    loss = loss * valid
+    return loss.sum() / valid.sum().clamp(min=1.0)
 
 
 def focal_ce_logits(
@@ -191,8 +196,9 @@ def future_dyn_l2(
 ) -> torch.Tensor:
     if valid is None:
         return F.mse_loss(pred, target)
-    valid = _expand_mask(valid, pred.ndim).to(pred.dtype)
-    return ((pred - target).pow(2) * valid).sum() / valid.sum().clamp(min=1.0)
+    valid = _broadcast_mask(valid, pred).to(pred.dtype)
+    loss = (pred - target).pow(2) * valid
+    return loss.sum() / valid.sum().clamp(min=1.0)
 
 
 @dataclass
@@ -493,8 +499,8 @@ def compute_stage1b_losses(
         ),
         "track": track_epe(
             outputs["track_offsets_seq"],
-            targets["track_target_recent"],
-            targets.get("track_valid_recent"),
+            targets["track_target_recent_sparse"],
+            targets.get("track_valid_recent_sparse"),
         ),
     }
     total = outputs["pose_delta_seq"].new_zeros(())

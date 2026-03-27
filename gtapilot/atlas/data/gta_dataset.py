@@ -144,6 +144,15 @@ def _stream_action_vectors(
     )
 
 
+def _effective_action_timestamps_ns(actions: list[BlackboxActionRecord]) -> list[int]:
+    return [
+        action.message_timestamp_ns
+        if action.message_timestamp_ns > 0
+        else action.publish_timestamp_ns
+        for action in actions
+    ]
+
+
 class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
     """
     Builds Atlas temporal training samples from blackbox MKV+metadata recordings.
@@ -164,6 +173,8 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
         older_steps: int | None = None,
         mid_steps: int | None = None,
         action_steps: int | None = None,
+        anchor_stride_steps: int = 1,
+        max_samples_per_clip_per_epoch: int | None = None,
         require_privileged: bool = False,
     ):
         self.recordings_root = Path(recordings_root)
@@ -172,6 +183,12 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
         self.older_steps = older_steps or cfg.temporal.older_compressed_frames
         self.mid_steps = mid_steps or cfg.temporal.mid_summary_frames
         self.action_steps = action_steps or cfg.action.history_len
+        self.anchor_stride_steps = max(1, int(anchor_stride_steps))
+        self.max_samples_per_clip_per_epoch = (
+            None
+            if max_samples_per_clip_per_epoch is None
+            else max(1, int(max_samples_per_clip_per_epoch))
+        )
         self.model_hz = int(cfg.temporal.fast_loop_hz)
         self.mid_hz = int(cfg.temporal.mid_summary_hz)
         self.index_cache_dir = (
@@ -198,6 +215,8 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             "older_steps": self.older_steps,
             "mid_steps": self.mid_steps,
             "action_steps": self.action_steps,
+            "anchor_stride_steps": self.anchor_stride_steps,
+            "max_samples_per_clip_per_epoch": self.max_samples_per_clip_per_epoch,
             "model_hz": self.model_hz,
             "mid_hz": self.mid_hz,
             "action_source_policy": {
@@ -232,11 +251,17 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
     def _load_actions(self, metadata_path: Path) -> list[BlackboxActionRecord]:
         if metadata_path not in self._action_cache:
             manifest = self._load_manifest(metadata_path)
-            self._action_cache[metadata_path] = [
-                BlackboxActionRecord.from_dict(action_payload)
-                for action_payload in manifest.get("actions", [])
-                if action_payload.get("envelope", {}).get("message_timestamp_ns") is not None
-            ]
+            records: list[BlackboxActionRecord] = []
+            for action_payload in manifest.get("actions", []):
+                record = BlackboxActionRecord.from_dict(action_payload)
+                if record.message_timestamp_ns > 0 or record.publish_timestamp_ns > 0:
+                    records.append(record)
+            records.sort(
+                key=lambda action: action.message_timestamp_ns
+                if action.message_timestamp_ns > 0
+                else action.publish_timestamp_ns
+            )
+            self._action_cache[metadata_path] = records
         return self._action_cache[metadata_path]
 
     def _action_source_for_manifest(self, metadata_path: Path) -> str:
@@ -266,7 +291,7 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             return []
         samples: list[AtlasTemporalClipIndex] = []
 
-        for anchor_step in range(int(last_anchor_step) + 1):
+        for anchor_step in range(0, int(last_anchor_step) + 1, self.anchor_stride_steps):
             anchor_timestamp_ns = grid_origin_ns + anchor_step * model_step_ns
             target_frame_index = bisect.bisect_right(frame_timestamps_ns, anchor_timestamp_ns) - 1
             if target_frame_index < 0:
@@ -309,12 +334,7 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
                 continue
 
             if actions:
-                action_timestamps_ns = [
-                    action.message_timestamp_ns
-                    if action.message_timestamp_ns > 0
-                    else action.publish_timestamp_ns
-                    for action in actions
-                ]
+                action_timestamps_ns = _effective_action_timestamps_ns(actions)
                 action_entry_indices = _select_latest_indices(
                     action_timestamps_ns,
                     action_grid_timestamps_ns,
@@ -329,6 +349,21 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
                 action_source = LEGACY_FRAME_ACTION_SOURCE
             if action_entry_indices is None:
                 continue
+            if action_source == RAW_ACTION_SOURCE:
+                selected_action_timestamps_ns = [
+                    action_timestamps_ns[action_index]
+                    for action_index in action_entry_indices
+                ]
+                stale_limit_ns = max(model_step_ns * 3, 100_000_000)
+                if any(
+                    desired_ts < selected_ts
+                    or (desired_ts - selected_ts) > stale_limit_ns
+                    for desired_ts, selected_ts in zip(
+                        action_grid_timestamps_ns,
+                        selected_action_timestamps_ns,
+                    )
+                ):
+                    continue
 
             samples.append(
                 AtlasTemporalClipIndex(
@@ -347,6 +382,17 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
                     privileged_dir=privileged_dir_str,
                 )
             )
+        if (
+            self.max_samples_per_clip_per_epoch is not None
+            and len(samples) > self.max_samples_per_clip_per_epoch
+        ):
+            select = np.linspace(
+                0,
+                len(samples) - 1,
+                num=self.max_samples_per_clip_per_epoch,
+                dtype=np.int64,
+            )
+            samples = [samples[int(sample_index)] for sample_index in select.tolist()]
         return samples
 
     def _build_indices(self) -> list[AtlasTemporalClipIndex]:
@@ -462,12 +508,7 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             "reasoner_tok": None,
         }
         if sample.action_source == RAW_ACTION_SOURCE:
-            action_timestamps_ns = [
-                action.message_timestamp_ns
-                if action.message_timestamp_ns > 0
-                else action.publish_timestamp_ns
-                for action in actions
-            ]
+            action_timestamps_ns = _effective_action_timestamps_ns(actions)
             batch["actions_hist"] = _stream_action_vectors(actions, sample.action_entry_indices)
             batch["dt_hist"] = _selected_dt_tensor(
                 action_timestamps_ns,

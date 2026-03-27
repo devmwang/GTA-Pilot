@@ -68,9 +68,11 @@ class BlackboxFrameRecord:
     frame_metadata: dict[str, Any]
     action: dict[str, Any] | None
     action_vector: np.ndarray
+    action_message_timestamp_ns: int | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BlackboxFrameRecord":
+        action_envelope = payload.get("action_envelope") or {}
         return cls(
             video_frame_index=int(payload["video_frame_index"]),
             capture_timestamp_ns=int(payload["capture_timestamp_ns"]),
@@ -80,7 +82,45 @@ class BlackboxFrameRecord:
             frame_metadata=dict(payload.get("frame_metadata", {})),
             action=None if payload.get("action") is None else dict(payload["action"]),
             action_vector=np.asarray(payload["action_vector"], dtype=np.float32),
+            action_message_timestamp_ns=None
+            if action_envelope.get("message_timestamp_ns") is None
+            else int(action_envelope["message_timestamp_ns"]),
         )
+
+
+@dataclass
+class BlackboxActionRecord:
+    message_timestamp_ns: int
+    publish_timestamp_ns: int
+    action_vector: np.ndarray
+    envelope: dict[str, Any]
+    payload: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "BlackboxActionRecord":
+        envelope = dict(payload.get("envelope", {}))
+        raw_payload = payload.get("payload")
+        vector_payload = payload.get("action_vector")
+        if vector_payload is None and isinstance(raw_payload, dict):
+            vector_payload = [
+                raw_payload.get("steer", 0.0),
+                raw_payload.get("throttle", 0.0),
+                raw_payload.get("brake", 0.0),
+                raw_payload.get("handbrake", 0.0),
+                raw_payload.get("reverse", 0.0),
+                raw_payload.get("pilot_active", 0.0),
+            ]
+        return cls(
+            message_timestamp_ns=int(envelope.get("message_timestamp_ns", 0)),
+            publish_timestamp_ns=int(envelope.get("publish_timestamp_ns", 0)),
+            action_vector=np.asarray(vector_payload or np.zeros(6, dtype=np.float32), dtype=np.float32),
+            envelope=envelope,
+            payload={} if raw_payload is None else dict(raw_payload),
+        )
+
+    @property
+    def timestamp_ns(self) -> int:
+        return self.message_timestamp_ns
 
 
 @dataclass
@@ -88,13 +128,16 @@ class AtlasTemporalClipIndex:
     clip_id: str
     metadata_path: str
     video_path: str
+    anchor_timestamp_ns: int
     target_frame_index: int
     recent_frame_indices: list[int]
     older_frame_indices: list[int]
     mid_frame_indices: list[int]
-    action_frame_indices: list[int]
+    action_entry_indices: list[int]
+    action_source: str
     nominal_fps: float
     frame_source: str
+    privileged_dir: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -106,3 +149,7 @@ class AtlasTemporalClipIndex:
     @property
     def video_file(self) -> Path:
         return Path(self.video_path)
+
+    @property
+    def privileged_path(self) -> Path | None:
+        return None if self.privileged_dir is None else Path(self.privileged_dir)

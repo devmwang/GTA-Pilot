@@ -20,9 +20,21 @@ class _PrivilegedTokenAdapter(nn.Module):
         )
         self.pool = LearnedQueryPool(output_tokens, d_model, heads=max(1, d_model // 64))
 
-    def forward(self, tensor: torch.Tensor | None, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def forward(
+        self,
+        tensor: torch.Tensor | None,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         if tensor is None:
-            return torch.zeros(batch_size, 0, self.proj[-1].out_features, device=device, dtype=dtype)
+            return torch.zeros(
+                batch_size,
+                0,
+                self.proj[-1].out_features,
+                device=device,
+                dtype=dtype,
+            )
         if tensor.ndim == 2:
             tensor = tensor[:, None, :]
         embedded = self.proj(tensor.to(dtype))
@@ -77,35 +89,157 @@ class PrivilegedTeacherModel(Atlas):
             ),
         }
 
-    def forward_train(self, *args: Any, privileged: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
-        outputs = super().forward_train(*args, privileged=privileged, **kwargs)
+    @staticmethod
+    def _teacher_supervision(
+        privileged: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        privileged = privileged or {}
+        return {
+            "hidden_actor_trajs": privileged.get("hidden_actor_trajs"),
+            "visibility_mask": privileged.get("visibility_mask"),
+            "occupancy_flow": privileged.get("occupancy_flow"),
+            "speculative_heatmap": privileged.get("speculative_heatmap"),
+            "actor_existence": privileged.get("actor_existence"),
+            "occluder_risk": privileged.get("occluder_risk"),
+        }
+
+    def _attach_teacher_context(
+        self,
+        outputs: dict[str, Any],
+        privileged: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         batch_size = outputs["final_state"].static_grid.shape[0]
         device = outputs["final_state"].static_grid.device
         dtype = outputs["final_state"].static_grid.dtype
-        last = outputs["last"]
         outputs["teacher_privileged_tokens"] = self.encode_privileged_tokens(
-            privileged, batch_size=batch_size, device=device, dtype=dtype
+            privileged,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
         )
-        outputs["teacher_privileged_supervision"] = {
-            "hidden_actor_trajs": None if privileged is None else privileged.get("hidden_actor_trajs"),
-            "visibility_mask": None if privileged is None else privileged.get("visibility_mask"),
-            "occupancy_flow": None if privileged is None else privileged.get("occupancy_flow"),
-            "speculative_heatmap": None if privileged is None else privileged.get("speculative_heatmap"),
-            "actor_existence": None if privileged is None else privileged.get("actor_existence"),
-            "occluder_risk": None if privileged is None else privileged.get("occluder_risk"),
-        }
+        outputs["teacher_privileged_supervision"] = self._teacher_supervision(privileged)
+        return outputs
+
+    def forward_stage1a_teacher(
+        self,
+        *args: Any,
+        privileged: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        outputs = super().forward_stage1a(*args, **kwargs)
+        outputs = self._attach_teacher_context(outputs, privileged)
         outputs["teacher_distill_bundle"] = {
-            "dynamic_slots_target": last["dynamic_slots"].detach().clone(),
-            "speculative_slots_target": last["speculative_slots"].detach().clone(),
-            "dyn_flow_target": last["dyn_flow_bev"].detach().clone(),
-            "occl_risk_target": last["occl_risk_bev"].detach().clone(),
-            "provenance_target": last["provenance"].detach().clone(),
-            "future_spec_target": last["future_spec"].detach().clone(),
-            "hidden_risk_penalty_target": last["hidden_risk_penalty"].detach().clone(),
-            "hidden_actor_trajs": None if privileged is None else privileged.get("hidden_actor_trajs"),
-            "visibility_mask": None if privileged is None else privileged.get("visibility_mask"),
-            "occupancy_flow": None if privileged is None else privileged.get("occupancy_flow"),
-            "speculative_heatmap": None if privileged is None else privileged.get("speculative_heatmap"),
-            "occluder_risk": None if privileged is None else privileged.get("occluder_risk"),
+            "cam_now_target": outputs["seq"]["cam_now"].detach().clone(),
+            "frame_summary_target": outputs["seq"]["frame_summary"].detach().clone(),
         }
         return outputs
+
+    def forward_stage1b_teacher(
+        self,
+        *args: Any,
+        privileged: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        outputs = super().forward_stage1b(*args, **kwargs)
+        outputs = self._attach_teacher_context(outputs, privileged)
+        outputs["teacher_distill_bundle"] = {
+            "cam_now_target": outputs["seq"]["cam_now"].detach().clone(),
+            "frame_summary_target": outputs["seq"]["frame_summary"].detach().clone(),
+            "pose_delta_target": outputs["seq"]["pose_delta"].detach().clone(),
+            "kinematics_target": outputs["seq"]["kinematics"].detach().clone(),
+            "depth_target": outputs["seq"]["depth_mean"].detach().clone(),
+            "track_target": outputs["seq"]["track_offsets"].detach().clone(),
+        }
+        return outputs
+
+    def forward_stage1c_teacher(
+        self,
+        *args: Any,
+        privileged: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        outputs = super().forward_stage1c(*args, **kwargs)
+        outputs = self._attach_teacher_context(outputs, privileged)
+        outputs["teacher_distill_bundle"] = {
+            "static_grid_target": outputs["seq"]["static_grid"].detach().clone(),
+            "dynamic_slots_target": outputs["seq"]["dynamic_slots"].detach().clone(),
+            "speculative_slots_target": outputs["seq"]["speculative_slots"].detach().clone(),
+            "dynamic_slot_alive_target": outputs["seq"]["dynamic_slot_alive"].detach().clone(),
+            "speculative_slot_alive_target": outputs["seq"]["speculative_slot_alive"].detach().clone(),
+            "lane_slots_target": outputs["seq"]["lane_slots"].detach().clone(),
+            "map_elem_slots_target": outputs["seq"]["map_elem_slots"].detach().clone(),
+            "route_tokens_target": outputs["seq"]["route_tokens"].detach().clone(),
+            "reasoner_tokens_target": outputs["seq"]["reasoner_tokens"].detach().clone(),
+            "ego_tokens_target": outputs["seq"]["ego_tokens"].detach().clone(),
+            **outputs["teacher_privileged_supervision"],
+        }
+        return outputs
+
+    def forward_stage2plus_teacher(
+        self,
+        rgb_recent: torch.Tensor,
+        dt_recent: torch.Tensor,
+        rgb_older: torch.Tensor,
+        dt_older: torch.Tensor,
+        rgb_mid: torch.Tensor,
+        dt_mid: torch.Tensor,
+        actions_hist: torch.Tensor,
+        dt_hist: torch.Tensor,
+        route_polyline: torch.Tensor | None = None,
+        nav_cmd: torch.Tensor | None = None,
+        reasoner_tok: torch.Tensor | None = None,
+        privileged: dict[str, Any] | None = None,
+        init_state=None,
+        stage: str = "stage2",
+        mode: str = "inspect",
+    ) -> dict[str, Any]:
+        if stage in {"stage1a", "stage1b", "stage1c"}:
+            raise RuntimeError(
+                "Stage 1 teacher hard cut: use forward_stage1a_teacher(), "
+                "forward_stage1b_teacher(), or forward_stage1c_teacher() directly."
+            )
+
+        outputs = super().forward_train(
+            rgb_recent,
+            dt_recent,
+            rgb_older,
+            dt_older,
+            rgb_mid,
+            dt_mid,
+            actions_hist,
+            dt_hist,
+            route_polyline=route_polyline,
+            nav_cmd=nav_cmd,
+            reasoner_tok=reasoner_tok,
+            privileged=privileged,
+            init_state=init_state,
+            stage=stage,
+            mode=mode,
+        )
+        outputs = self._attach_teacher_context(outputs, privileged)
+        last = outputs["last"]
+        outputs["teacher_distill_bundle"] = {}
+        for key in (
+            "dynamic_slots",
+            "speculative_slots",
+            "dyn_flow_bev",
+            "occl_risk_bev",
+            "provenance",
+            "future_spec",
+            "hidden_risk_penalty",
+        ):
+            if key in last:
+                outputs["teacher_distill_bundle"][f"{key}_target"] = last[key].detach().clone()
+        outputs["teacher_distill_bundle"].update(outputs["teacher_privileged_supervision"])
+        return outputs
+
+    def forward_train(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        raise RuntimeError(
+            "PrivilegedTeacherModel forward_train() is not part of the public teacher API. "
+            "Use forward_stage1a_teacher(), forward_stage1b_teacher(), forward_stage1c_teacher(), "
+            "or forward_stage2plus_teacher() explicitly."
+        )

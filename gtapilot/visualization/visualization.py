@@ -216,12 +216,16 @@ def main(
             record_hotkey = str(
                 settings_client.get("blackbox.record_hotkey", "F8")
             )
+            frame_nominal_fps = float(
+                packet.envelope.metadata.get("nominal_fps", 0.0) or 0.0
+            )
+            is_repeat = bool(packet.envelope.metadata.get("is_repeat", False))
 
-            _draw_text(frame, f"FPS: {fps:.2f}", 40)
+            _draw_text(frame, f"FPS: {fps:.2f} nominal={frame_nominal_fps:.2f}", 40)
             _draw_text(
                 frame,
                 f"Frame {packet.envelope.metadata.get('frame_id', '?')} "
-                f"source={packet.envelope.source}",
+                f"source={packet.envelope.source} repeat={1 if is_repeat else 0}",
                 80,
             )
 

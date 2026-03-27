@@ -12,8 +12,9 @@ from gtapilot.ipc.settings_registry import (
     SETTINGS_RPC_PORT,
     SETTINGS_UPDATES_PORT,
 )
+from gtapilot.timing import HighResolutionTimer, advance_fixed_deadline, sleep_until
 
-POLL_HZ = 50
+POLL_HZ = 60
 POLL_INTERVAL = 1.0 / POLL_HZ
 
 KEYBOARD_DEVICE = "keyboard"
@@ -476,72 +477,71 @@ def main(
     active_device = "none"
     keyboard_last_active_timestamp_ns = 0
     controller_last_active_timestamp_ns = 0
+    next_poll_time = time.perf_counter()
     try:
-        while True:
-            started_at = time.perf_counter()
-            sample_timestamp_ns = time.time_ns()
+        with HighResolutionTimer(1):
+            while True:
+                sleep_until(next_poll_time)
+                sample_timestamp_ns = time.time_ns()
 
-            keyboard_inputs = _keyboard_inputs_from_keys(_read_keyboard_driving_keys())
-            controller_inputs = _read_xinput_controller_inputs()
-            keyboard_action = _keyboard_action_from_inputs(keyboard_inputs)
-            controller_action = _controller_action_from_inputs(controller_inputs)
+                keyboard_inputs = _keyboard_inputs_from_keys(_read_keyboard_driving_keys())
+                controller_inputs = _read_xinput_controller_inputs()
+                keyboard_action = _keyboard_action_from_inputs(keyboard_inputs)
+                controller_action = _controller_action_from_inputs(controller_inputs)
 
-            if keyboard_inputs["driving_active"]:
-                keyboard_last_active_timestamp_ns = sample_timestamp_ns
-            if controller_inputs["driving_active"]:
-                controller_last_active_timestamp_ns = sample_timestamp_ns
+                if keyboard_inputs["driving_active"]:
+                    keyboard_last_active_timestamp_ns = sample_timestamp_ns
+                if controller_inputs["driving_active"]:
+                    controller_last_active_timestamp_ns = sample_timestamp_ns
 
-            active_device = _resolve_active_device(
-                keyboard_inputs=keyboard_inputs,
-                controller_inputs=controller_inputs,
-                keyboard_last_active_timestamp_ns=keyboard_last_active_timestamp_ns,
-                controller_last_active_timestamp_ns=controller_last_active_timestamp_ns,
-                previous_active_device=active_device,
-            )
-            effective_action = _effective_action_for_device(
-                active_device,
-                keyboard_action=keyboard_action,
-                controller_action=controller_action,
-            )
-
-            current_recording_enabled = bool(
-                settings_client.get(
-                    "blackbox.recording_enabled",
-                    BLACKBOX_RECORD_ON_START,
-                )
-            )
-            record_hotkey_pressed = _record_hotkey_pressed(BLACKBOX_RECORD_HOTKEY)
-            next_recording_enabled, record_hotkey_was_pressed, did_toggle = (
-                _update_recording_state(
-                    record_hotkey_pressed=record_hotkey_pressed,
-                    record_hotkey_was_pressed=record_hotkey_was_pressed,
-                    recording_enabled=current_recording_enabled,
-                )
-            )
-            if did_toggle:
-                next_recording_enabled = not _authoritative_recording_enabled(
-                    settings_client
-                )
-                settings_client.set(
-                    "blackbox.recording_enabled",
-                    next_recording_enabled,
-                )
-
-            action_publisher.publish(
-                _build_action_packet(
-                    active_device=active_device,
-                    effective_action=effective_action,
-                    keyboard_action=keyboard_action,
-                    controller_action=controller_action,
+                active_device = _resolve_active_device(
                     keyboard_inputs=keyboard_inputs,
                     controller_inputs=controller_inputs,
-                ),
-                timestamp_ns=sample_timestamp_ns,
-            )
+                    keyboard_last_active_timestamp_ns=keyboard_last_active_timestamp_ns,
+                    controller_last_active_timestamp_ns=controller_last_active_timestamp_ns,
+                    previous_active_device=active_device,
+                )
+                effective_action = _effective_action_for_device(
+                    active_device,
+                    keyboard_action=keyboard_action,
+                    controller_action=controller_action,
+                )
 
-            elapsed = time.perf_counter() - started_at
-            if elapsed < POLL_INTERVAL:
-                time.sleep(POLL_INTERVAL - elapsed)
+                current_recording_enabled = bool(
+                    settings_client.get(
+                        "blackbox.recording_enabled",
+                        BLACKBOX_RECORD_ON_START,
+                    )
+                )
+                record_hotkey_pressed = _record_hotkey_pressed(BLACKBOX_RECORD_HOTKEY)
+                next_recording_enabled, record_hotkey_was_pressed, did_toggle = (
+                    _update_recording_state(
+                        record_hotkey_pressed=record_hotkey_pressed,
+                        record_hotkey_was_pressed=record_hotkey_was_pressed,
+                        recording_enabled=current_recording_enabled,
+                    )
+                )
+                if did_toggle:
+                    next_recording_enabled = not _authoritative_recording_enabled(
+                        settings_client
+                    )
+                    settings_client.set(
+                        "blackbox.recording_enabled",
+                        next_recording_enabled,
+                    )
+
+                action_publisher.publish(
+                    _build_action_packet(
+                        active_device=active_device,
+                        effective_action=effective_action,
+                        keyboard_action=keyboard_action,
+                        controller_action=controller_action,
+                        keyboard_inputs=keyboard_inputs,
+                        controller_inputs=controller_inputs,
+                    ),
+                    timestamp_ns=sample_timestamp_ns,
+                )
+                next_poll_time = advance_fixed_deadline(next_poll_time, POLL_INTERVAL)
     finally:
         settings_client.close()
         action_publisher.close()

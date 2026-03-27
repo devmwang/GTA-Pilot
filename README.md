@@ -52,8 +52,8 @@ or ScriptHook-based label extraction pipeline.
 
 What it does today:
 
-- capture front RGB frames
-- capture current keyboard and Xbox controller inputs as Atlas-format action packets
+- capture front RGB frames at a 60 Hz runtime cadence
+- capture current keyboard and Xbox controller inputs as Atlas-format action packets at 60 Hz
 - expose mutable runtime settings through a central settings service
 - visualize the live stream with action overlays
 - optionally record frame/action sessions to disk for later training
@@ -168,6 +168,10 @@ uv run ./gtapilot/main.py --display-id 0
 The live capture path uses the native DX11 executable in
 `bin/DisplayCaptureDX11.exe` by default.
 
+The live desktop capture process publishes a fixed 60 Hz `vision.frames`
+stream. When the desktop duplication API has no fresh frame for a given
+deadline, it republishes the latest RGB frame with `is_repeat = true`.
+
 ### 2. Video override
 
 To test the pipeline without GTA running, feed it a local video file:
@@ -178,6 +182,10 @@ uv run ./gtapilot/main.py --video-override path/to/video.mp4
 
 This replaces live desktop capture with OpenCV video decode while keeping the
 rest of the runtime the same.
+
+The override path also publishes a fixed 60 Hz `vision.frames` stream. Lower
+FPS source files duplicate frames with `is_repeat = true`, and higher FPS
+source files are decimated to the 60 Hz output cadence.
 
 ### 3. Stop the system
 
@@ -208,6 +216,8 @@ metadata includes:
 - `channels`
 - `dtype`
 
+Current capture producers now publish `nominal_fps = 60.0`.
+
 ### Action stream
 
 The `input.actions` channel carries Atlas-format action packets with vector
@@ -217,6 +227,8 @@ order:
 
 Current action capture supports keyboard plus one XInput Xbox controller and is
 intended as an inference-time data source only.
+
+The action capture loop polls inputs and publishes packets at 60 Hz.
 
 The current keyboard mapping is:
 
@@ -302,6 +314,8 @@ recording on twice in one runtime, you will get two clips.
 
 Blackbox now requires `ffmpeg` on `PATH` when recording is enabled. Frames are
 streamed into ffmpeg as raw `bgr24` and encoded as H.264 in an MKV container.
+Current runtime producers publish 60 Hz vision streams, so new live and video
+override blackbox clips are authored with `video_nominal_fps = 60.0`.
 The JSON manifest is still the authoritative source for frame timing and action
 alignment. The current manifest schema version is `5`. The manifest contains:
 
@@ -366,9 +380,18 @@ Where:
 - `actions_hist` and `dt_hist` carry the long action/ego prior
 
 Blackbox `*_video.mkv + *_metadata.json` recordings are the canonical student
-training source. The clip loader preserves exact timestamp deltas from the
-manifest, including older `20 Hz` captures, rather than pretending all clips
-were collected at `24 Hz`.
+training source. Runtime blackbox collection stays at `60 Hz` for both video
+and action packets, and the Stage 1 clip loader resamples those recordings onto
+the model-time grids:
+
+- student recent / older / action history at `24 Hz`
+- teacher recent / older / action history at `36 Hz`
+- mid-summary sampling at `6 Hz`
+
+Frame selection uses the latest source frame at or before each desired model
+timestamp, and action history is built from the raw blackbox action stream when
+it exists. Older recordings without a raw `actions` stream fall back to the
+frame-aligned `action_vector` path while still preserving exact `dt`.
 
 ## IPC
 

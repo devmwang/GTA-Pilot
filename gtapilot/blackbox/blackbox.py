@@ -31,7 +31,7 @@ from gtapilot.ipc.types import ChannelEnvelope, ChannelMessage, ChannelSpec
 
 DEFAULT_OUTPUT_DIR = Path("blackbox-recordings")
 SCHEMA_VERSION = 5
-FLUSH_EVERY_FRAMES = 25
+FLUSH_EVERY_FRAMES = 120
 FLUSH_EVERY_SECONDS = 2.0
 PREROLL_JPEG_QUALITY = 85
 SETTINGS_REFRESH_INTERVAL_SECONDS = 0.5

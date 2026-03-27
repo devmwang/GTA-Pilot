@@ -1,255 +1,120 @@
 from __future__ import annotations
 
-from time import perf_counter
+import random
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
-from .. import Atlas, atlas_smoke_config, atlas_t1080_priv_config
-from ..losses import compute_stage_losses
+from .. import build_atlas_config
+from ..config import AtlasConfig
+from ..model import Atlas
 from ..teacher.privileged_teacher_model import PrivilegedTeacherModel
 
 
-def make_synthetic_batch(cfg, batch_size: int = 2) -> dict[str, torch.Tensor]:
-    recent_steps = cfg.temporal.recent_full_frames
-    older_steps = cfg.temporal.older_compressed_frames
-    mid_steps = cfg.temporal.mid_summary_frames
-    rgb_recent = torch.randn(
-        batch_size,
-        recent_steps,
-        cfg.image.channels,
-        cfg.image.raw_height,
-        cfg.image.raw_width,
-    )
-    rgb_older = torch.randn(
-        batch_size,
-        older_steps,
-        cfg.image.channels,
-        cfg.image.raw_height,
-        cfg.image.raw_width,
-    )
-    rgb_mid = torch.randn(
-        batch_size,
-        mid_steps,
-        cfg.image.channels,
-        cfg.image.raw_height,
-        cfg.image.raw_width,
-    )
-    actions = torch.randn(batch_size, cfg.action.history_len, cfg.action.action_dim)
-    dt_hist = torch.full((batch_size, cfg.action.history_len, 1), 1.0 / cfg.temporal.fast_loop_hz)
-    dt_recent = torch.full((batch_size, recent_steps, 1), 1.0 / cfg.temporal.fast_loop_hz)
-    dt_older = torch.full((batch_size, older_steps, 1), 1.0 / cfg.temporal.fast_loop_hz)
-    dt_mid = torch.full((batch_size, mid_steps, 1), 1.0 / max(1, cfg.temporal.mid_summary_hz))
-    route = torch.randn(batch_size, cfg.route_adapter.route_points, 3)
-    nav_cmd = torch.randn(batch_size, cfg.route_adapter.nav_cmd_dim)
-    reasoner = torch.randn(
-        batch_size,
-        recent_steps,
-        cfg.reasoner_adapter.output_tokens,
-        cfg.hidden_dim,
-    )
-    return {
-        "rgb_recent": rgb_recent,
-        "dt_recent": dt_recent,
-        "rgb_older": rgb_older,
-        "dt_older": dt_older,
-        "rgb_mid": rgb_mid,
-        "dt_mid": dt_mid,
-        "actions_hist": actions,
-        "dt_hist": dt_hist,
-        "route_polyline": route,
-        "nav_cmd": nav_cmd,
-        "reasoner_tok": reasoner,
-    }
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def make_synthetic_targets(outputs: dict[str, Any]) -> dict[str, torch.Tensor]:
-    last = outputs["last"]
-    batch_size = last["best_traj"].shape[0]
-    targets: dict[str, torch.Tensor] = {
-        "traj_target": last["best_traj"].detach().clone(),
-        "teacher_cost": torch.randn(batch_size, last["score"].shape[1]),
-        "ego_target": last["ego_out"].detach().clone()
-        if "ego_out" in last
-        else torch.randn(batch_size, 7),
-        "depth_target": last["depth_mean"].detach().clone(),
-        "future_dyn_target": last["future_dyn"].detach().clone(),
-        "future_spec_target": last["future_spec"].detach().clone(),
-    }
-    if "occ_state" in last:
-        targets["occ_state_target"] = torch.zeros(
-            last["occ_state"].shape[0],
-            last["occ_state"].shape[2],
-            last["occ_state"].shape[3],
-            last["occ_state"].shape[4],
-            dtype=torch.long,
-        )
-    if "occ_sem" in last:
-        targets["occ_sem_target"] = torch.zeros(
-            last["occ_sem"].shape[0],
-            last["occ_sem"].shape[2],
-            last["occ_sem"].shape[3],
-            last["occ_sem"].shape[4],
-            dtype=torch.long,
-        )
-    if "bev_lite" in last:
-        targets["bev_target"] = torch.zeros_like(last["bev_lite"])
-    if "dyn_flow_bev" in last:
-        targets["dyn_flow_target"] = torch.zeros_like(last["dyn_flow_bev"])
-    if "occl_risk_bev" in last:
-        targets["occl_risk_target"] = torch.zeros_like(last["occl_risk_bev"])
-    if "provenance" in last:
-        targets["provenance_target"] = torch.zeros(
-            last["provenance"].shape[0],
-            last["provenance"].shape[2],
-            last["provenance"].shape[3],
-            dtype=torch.long,
-        )
-    if "centerline" in last:
-        targets["centerline"] = last["centerline"].detach().clone()
-        targets["left_boundary"] = last["left_boundary"].detach().clone()
-        targets["right_boundary"] = last["right_boundary"].detach().clone()
-        targets["lane_sem_cls"] = torch.zeros(
-            last["lane_sem_cls"].shape[0],
-            last["lane_sem_cls"].shape[1],
-            dtype=torch.long,
-        )
-    if "map_poly" in last:
-        targets["map_poly"] = last["map_poly"].detach().clone()
-    if "actor_box" in last:
-        targets["actor_box"] = last["actor_box"].detach().clone()
-        targets["actor_vel"] = last["actor_vel"].detach().clone()
-        targets["actor_cls"] = torch.zeros(
-            last["actor_cls"].shape[0],
-            last["actor_cls"].shape[1],
-            dtype=torch.long,
-        )
-    if "curvature" in last:
-        targets["curvature_target"] = last["curvature"].detach().clone()
-        targets["speed_target"] = last["speed"].detach().clone()
-    return targets
+def resolve_device(device: str) -> torch.device:
+    if device == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(device)
 
 
-def build_model(stage: str):
-    if stage == "teacher":
-        cfg = atlas_t1080_priv_config()
-        cfg.image.raw_height = 128
-        cfg.image.raw_width = 192
-        cfg.image.padded_height = 128
-        cfg.image.padded_width = 192
-        cfg.vision.cam_tokens_per_frame = 16
-        cfg.temporal.recent_cam_tokens = 16
-        cfg.temporal.recent_full_frames = 4
-        cfg.temporal.older_compressed_frames = 4
-        cfg.temporal.older_compressed_tokens = 4
-        cfg.temporal.mid_summary_frames = 6
-        cfg.temporal.mid_summary_tokens = 2
-        cfg.temporal.short_context_tokens = 2
-        cfg.temporal.older_context_tokens = 2
-        cfg.temporal.long_context_tokens = 2
-        cfg.action.history_len = 8
-        cfg.world.static_grid_h = 6
-        cfg.world.static_grid_w = 4
-        cfg.world.dynamic_slots = 8
-        cfg.world.speculative_slots = 4
-        cfg.world.lane_slots = 6
-        cfg.world.map_elem_slots = 4
-        cfg.planner.control_steps = 6
-        cfg.planner.proposals = 4
-        return PrivilegedTeacherModel(cfg), cfg
-    cfg = atlas_smoke_config()
-    return Atlas(cfg), cfg
+def build_model_config(model_variant: str) -> AtlasConfig:
+    return build_atlas_config(model_variant)
 
 
-def run_stage_smoke(stage: str) -> dict[str, Any]:
-    stage_key = "teacher" if stage == "teacher" else stage
-    model, cfg = build_model(stage_key)
-    batch = make_synthetic_batch(cfg)
-    privileged = (
-        {
-            "lidar_tokens": torch.randn(batch["rgb_recent"].shape[0], 12, cfg.hidden_dim),
-            "pose_tokens": torch.randn(batch["rgb_recent"].shape[0], 8, 3),
-            "actor_tokens": torch.randn(batch["rgb_recent"].shape[0], 16, cfg.hidden_dim),
-            "map_tokens": torch.randn(batch["rgb_recent"].shape[0], 12, cfg.hidden_dim),
-            "hidden_actor_tokens": torch.randn(
-                batch["rgb_recent"].shape[0], 8, cfg.hidden_dim
-            ),
-            "visibility_tokens": torch.randn(batch["rgb_recent"].shape[0], 8, 4),
-            "flow_tokens": torch.randn(batch["rgb_recent"].shape[0], 8, 2),
-            "risk_tokens": torch.randn(batch["rgb_recent"].shape[0], 8, 2),
-            "hidden_actor_trajs": torch.randn(
-                batch["rgb_recent"].shape[0], 8, cfg.actor.future_steps, 2
-            ),
-            "visibility_mask": torch.ones(
-                batch["rgb_recent"].shape[0], 8, dtype=torch.float32
-            ),
-            "occupancy_flow": torch.randn(
-                batch["rgb_recent"].shape[0], 2, cfg.bev_lite.out_h, cfg.bev_lite.out_w
-            ),
-            "speculative_heatmap": torch.randn(
-                batch["rgb_recent"].shape[0], 2, cfg.bev_lite.out_h, cfg.bev_lite.out_w
-            ),
-            "actor_existence": torch.ones(
-                batch["rgb_recent"].shape[0], cfg.world.dynamic_slots, dtype=torch.float32
-            ),
-            "occluder_risk": torch.randn(
-                batch["rgb_recent"].shape[0], 2, cfg.bev_lite.out_h, cfg.bev_lite.out_w
-            ),
-        }
-        if stage == "teacher"
-        else None
-    )
-    start = perf_counter()
-    outputs = model.forward_train(
-        batch["rgb_recent"],
-        batch["dt_recent"],
-        batch["rgb_older"],
-        batch["dt_older"],
-        batch["rgb_mid"],
-        batch["dt_mid"],
-        batch["actions_hist"],
-        batch["dt_hist"],
-        route_polyline=batch["route_polyline"],
-        nav_cmd=batch["nav_cmd"],
-        reasoner_tok=batch["reasoner_tok"],
-        privileged=privileged,
-        stage="stage2" if stage == "teacher" else stage,
-    )
-    if stage == "stage1a":
-        outputs["last"]["cam_projector_pred"] = outputs["last"]["cam_now"]
-        outputs["last"]["summary_projector_pred"] = outputs["last"]["frame_summary"]
-    if stage == "stage1c":
-        outputs["last"]["world_projector_pred"] = outputs["last"][
-            "persistent_tokens"
+def build_model_from_variant(model_variant: str) -> Atlas:
+    cfg = build_model_config(model_variant)
+    if cfg.enable_privileged_teacher_adapters:
+        return PrivilegedTeacherModel(cfg)
+    return Atlas(cfg)
+
+
+def batch_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=device.type == "cuda")
+    if isinstance(value, dict):
+        return {key: batch_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [batch_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(batch_to_device(item, device) for item in value)
+    return value
+
+
+def batch_to_device_except(
+    value: Any,
+    device: torch.device,
+    *,
+    skip_top_level_keys: set[str] | None = None,
+    _depth: int = 0,
+) -> Any:
+    skip_top_level_keys = skip_top_level_keys or set()
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=device.type == "cuda")
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if _depth == 0 and key in skip_top_level_keys:
+                out[key] = item
+            else:
+                out[key] = batch_to_device_except(
+                    item,
+                    device,
+                    skip_top_level_keys=skip_top_level_keys,
+                    _depth=_depth + 1,
+                )
+        return out
+    if isinstance(value, list):
+        return [
+            batch_to_device_except(
+                item,
+                device,
+                skip_top_level_keys=skip_top_level_keys,
+                _depth=_depth + 1,
+            )
+            for item in value
         ]
-    targets = make_synthetic_targets(outputs)
-    if stage == "stage1a":
-        targets["cam_projector_target"] = outputs["last"]["cam_now"].detach().clone()
-        targets["cam_mask"] = torch.ones(
-            outputs["last"]["cam_now"].shape[:2], dtype=torch.float32
+    if isinstance(value, tuple):
+        return tuple(
+            batch_to_device_except(
+                item,
+                device,
+                skip_top_level_keys=skip_top_level_keys,
+                _depth=_depth + 1,
+            )
+            for item in value
         )
-        targets["summary_projector_target"] = outputs["last"][
-            "frame_summary"
-        ].detach().clone()
-        targets["summary_mask"] = torch.ones(
-            outputs["last"]["frame_summary"].shape[:2], dtype=torch.float32
-        )
-    if stage == "stage1c":
-        targets["world_projector_target"] = outputs["last"][
-            "persistent_tokens"
-        ].detach().clone()
-        targets["world_mask"] = torch.ones(
-            outputs["last"]["persistent_tokens"].shape[:2], dtype=torch.float32
-        )
-    losses = compute_stage_losses(
-        "stage2" if stage == "teacher" else stage,
-        outputs["last"],
-        targets,
-    )
-    total = losses["total"]
-    if not total.requires_grad:
-        total = total + outputs["last"]["best_traj"].mean() * 0.0
-        losses["total"] = total
-    losses["total"].backward()
-    elapsed = perf_counter() - start
-    return {"outputs": outputs, "losses": losses, "elapsed_s": elapsed}
+    return value
+
+
+def detach_state(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if hasattr(value, "__dataclass_fields__"):
+        fields = {
+            key: detach_state(getattr(value, key))
+            for key in value.__dataclass_fields__.keys()
+        }
+        return type(value)(**fields)
+    if isinstance(value, dict):
+        return {key: detach_state(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [detach_state(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(detach_state(item) for item in value)
+    return value
+
+
+def ensure_dir(path: str | Path) -> Path:
+    out = Path(path)
+    out.mkdir(parents=True, exist_ok=True)
+    return out

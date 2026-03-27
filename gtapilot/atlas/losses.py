@@ -47,6 +47,8 @@ def silog_depth(
 ) -> torch.Tensor:
     if valid is None:
         valid = torch.ones_like(target, dtype=torch.bool)
+    elif valid.ndim == pred.ndim - 1:
+        valid = valid.unsqueeze(2)
     pred = pred.clamp(min=1e-4)
     target = target.clamp(min=1e-4)
     log_diff = (pred.log() - target.log())[valid]
@@ -58,7 +60,12 @@ def silog_depth(
 def track_epe(
     pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None = None
 ) -> torch.Tensor:
-    epe = torch.linalg.norm(pred - target, dim=-3 if pred.ndim == 5 else -1)
+    if pred.ndim == 6:
+        epe = torch.linalg.norm(pred - target, dim=3)
+    elif pred.ndim == 5:
+        epe = torch.linalg.norm(pred - target, dim=-3)
+    else:
+        epe = torch.linalg.norm(pred - target, dim=-1)
     if valid is None:
         return epe.mean()
     valid = valid.to(epe.dtype)
@@ -418,6 +425,119 @@ def compute_stage_losses(
         )
 
     total = zero
+    for name, loss in losses.items():
+        total = total + weights.get(name) * loss
+    losses["total"] = total
+    return losses
+
+
+def compute_stage1a_losses(
+    outputs: Mapping[str, torch.Tensor],
+    targets: Mapping[str, torch.Tensor],
+    weights: StageWeights | None = None,
+) -> dict[str, torch.Tensor]:
+    weights = weights or stage_weight_preset("stage1a")
+    pred_cam = F.layer_norm(
+        outputs["cam_projector_pred"],
+        outputs["cam_projector_pred"].shape[-1:],
+    )
+    tgt_cam = F.layer_norm(
+        targets["cam_projector_target"],
+        targets["cam_projector_target"].shape[-1:],
+    )
+    pred_sum = F.layer_norm(
+        outputs["summary_projector_pred"],
+        outputs["summary_projector_pred"].shape[-1:],
+    )
+    tgt_sum = F.layer_norm(
+        targets["summary_projector_target"],
+        targets["summary_projector_target"].shape[-1:],
+    )
+    losses = {
+        "cam_jepa": masked_l2_jepa(pred_cam, tgt_cam, targets["cam_mask"]),
+        "summary_jepa": masked_l2_jepa(pred_sum, tgt_sum, targets["summary_mask"]),
+        "sigreg": 0.5 * (sigreg(pred_cam) + sigreg(pred_sum)),
+    }
+    total = pred_cam.new_zeros(())
+    for name, loss in losses.items():
+        total = total + weights.get(name) * loss
+    losses["total"] = total
+    return losses
+
+
+def compute_stage1b_losses(
+    outputs: Mapping[str, torch.Tensor],
+    targets: Mapping[str, torch.Tensor],
+    weights: StageWeights | None = None,
+) -> dict[str, torch.Tensor]:
+    weights = weights or stage_weight_preset("stage1b")
+    ego_valid = targets.get("pose_valid_recent")
+    kin_valid = None if ego_valid is None else ego_valid
+    losses = {
+        "ego": gaussian_nll(
+            outputs["pose_delta_seq"],
+            outputs["logvar_pose_seq"],
+            targets["pose_delta_recent"],
+            ego_valid,
+        ),
+        "kinematics": gaussian_nll(
+            outputs["kinematics_seq"],
+            torch.zeros_like(outputs["kinematics_seq"]),
+            targets["kinematics_recent"],
+            kin_valid,
+        ),
+        "depth": silog_depth(
+            outputs["depth_mean_seq"],
+            targets["depth_target_recent"],
+            targets.get("depth_valid_recent"),
+        ),
+        "track": track_epe(
+            outputs["track_offsets_seq"],
+            targets["track_target_recent"],
+            targets.get("track_valid_recent"),
+        ),
+    }
+    total = outputs["pose_delta_seq"].new_zeros(())
+    for name, loss in losses.items():
+        key = "ego" if name in {"ego", "kinematics"} else name
+        total = total + weights.get(key) * loss
+    losses["total"] = total
+    return losses
+
+
+def compute_stage1c_losses(
+    outputs: Mapping[str, torch.Tensor],
+    targets: Mapping[str, torch.Tensor],
+    weights: StageWeights | None = None,
+) -> dict[str, torch.Tensor]:
+    weights = weights or stage_weight_preset("stage1c")
+    losses = {
+        "world_jepa": masked_l2_jepa(
+            outputs["world_projector_pred"],
+            targets["world_projector_target"],
+            targets["world_mask"],
+        ),
+        "mem": F.smooth_l1_loss(
+            outputs["static_grid_seq"],
+            targets["teacher_static_grid_seq"],
+        ),
+    }
+    if "pose_delta_seq" in outputs and "pose_delta_recent" in targets:
+        losses["ego"] = gaussian_nll(
+            outputs["pose_delta_seq"],
+            outputs["logvar_pose_seq"],
+            targets["pose_delta_recent"],
+            targets.get("pose_valid_recent"),
+        )
+    if "kinematics_seq" in outputs and "kinematics_recent" in targets:
+        losses["ego"] = losses.get("ego", outputs["kinematics_seq"].new_zeros(())) + gaussian_nll(
+            outputs["kinematics_seq"],
+            torch.zeros_like(outputs["kinematics_seq"]),
+            targets["kinematics_recent"],
+            targets.get("pose_valid_recent"),
+        )
+    losses["sigreg"] = sigreg(outputs["world_projector_pred"])
+    total = outputs["world_projector_pred"].new_zeros(())
     for name, loss in losses.items():
         total = total + weights.get(name) * loss
     losses["total"] = total

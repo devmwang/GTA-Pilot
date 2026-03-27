@@ -32,7 +32,8 @@ static constexpr int CHANNEL_ENVELOPE_VERSION = 1;
 using Microsoft::WRL::ComPtr;
 using json = nlohmann::json;
 
-static constexpr int CAP_FPS = 24;
+static constexpr int CAP_FPS = 60;
+static constexpr int CAP_FRAME_TIMEOUT_MS = 17;
 static constexpr int RING_SIZE = 4;
 static constexpr DXGI_FORMAT CAP_FMT = DXGI_FORMAT_B8G8R8A8_UNORM;
 
@@ -82,7 +83,7 @@ struct DupCtx {
     ComPtr<ID3D11Texture2D> acquire() {
         ComPtr<IDXGIResource> res;
         DXGI_OUTDUPL_FRAME_INFO finfo{};
-        HRESULT hr = dup->AcquireNextFrame(16, &finfo, &res);
+        HRESULT hr = dup->AcquireNextFrame(CAP_FRAME_TIMEOUT_MS, &finfo, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT)
             return nullptr;
         if (hr == DXGI_ERROR_ACCESS_LOST)
@@ -245,7 +246,7 @@ int main(int argc, char **argv) {
         zmq::context_t zctx(1);
 
         zmq::socket_t pubRAW(zctx, zmq::socket_type::pub);
-        pubRAW.set(zmq::sockopt::sndhwm, 1);
+        pubRAW.set(zmq::sockopt::sndhwm, 8);
         pubRAW.set(zmq::sockopt::linger, 0);
         pubRAW.bind(PUBLISH_ADDRESS); // frames_raw
 

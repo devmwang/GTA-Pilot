@@ -182,7 +182,7 @@ class HistoryCompressor(nn.Module):
             valid = frame_valid[:, step_idx]
             if not valid.any():
                 continue
-            out[valid, step_idx] = self.pool(frame_tokens[valid, step_idx])
+            out[valid, step_idx] = self.pool(frame_tokens[valid, step_idx]).to(out.dtype)
         return out
 
 
@@ -284,7 +284,7 @@ class FrameSummaryProjector(nn.Module):
             valid = frame_valid[:, step_idx]
             if not valid.any():
                 continue
-            out[valid, step_idx] = self.pool(frame_tokens[valid, step_idx])
+            out[valid, step_idx] = self.pool(frame_tokens[valid, step_idx]).to(out.dtype)
         return out
 
 

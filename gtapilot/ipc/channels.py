@@ -156,10 +156,10 @@ VISION_FRAMES_CHANNEL = ChannelSpec(
     port="55550",
     topic=b"frames",
     codec=RawRGBFrameCodec(),
-    default_buffer_size=10,
+    default_buffer_size=16,
     default_latest_only=False,
-    default_sndhwm=1,
-    default_rcvhwm=1,
+    default_sndhwm=8,
+    default_rcvhwm=8,
 )
 
 

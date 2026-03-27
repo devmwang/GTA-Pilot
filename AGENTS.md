@@ -72,19 +72,19 @@ Current worker set:
 
 2. `DisplayCaptureDX11`
    Native executable `bin/DisplayCaptureDX11.exe`
-   Live desktop capture on Windows, publishes RGB frames to the `vision.frames`
-   channel.
+   Live desktop capture on Windows, publishes a fixed 60 Hz RGB stream to the
+   `vision.frames` channel.
 
 3. `DisplayOverride`
    `gtapilot.display_capture.display_override.main`
-   Uses a video file instead of live capture and publishes RGB frames to the
-   `vision.frames` channel.
+   Uses a video file instead of live capture and publishes a fixed 60 Hz RGB
+   stream to the `vision.frames` channel.
 
 4. `ActionCapture`
    `gtapilot.input_capture.input_capture.main`
-   Polls keyboard state plus one XInput controller, publishes generalized
-   driving action packets to `input.actions`, and updates mutable runtime
-   settings via the settings service.
+   Polls keyboard state plus one XInput controller at 60 Hz, publishes
+   generalized driving action packets to `input.actions`, and updates mutable
+   runtime settings via the settings service.
 
 5. `Visualization`
    `gtapilot.visualization.visualization.main`
@@ -121,6 +121,8 @@ Current active channel specs:
   - port: `55550`
   - topic: `b"frames"`
   - codec: `RawRGBFrameCodec`
+  - default buffer size / HWM tuned for 60 Hz runtime collection:
+    buffer `16`, send `8`, receive `8`
 - `INPUT_ACTIONS_CHANNEL`
   - name: `input.actions`
   - port: `55552`
@@ -149,6 +151,7 @@ Vision payload contract:
   - `channels`
   - `dtype`
   - `frame_id`
+  - `nominal_fps`
   - `capture_timestamp_ns`
   - `is_repeat`
 
@@ -263,6 +266,8 @@ Behavior notes:
   container timestamps
 - frame producers must publish `nominal_fps` in frame metadata; blackbox does
   not guess it
+- current live capture and video override producers publish `nominal_fps=60.0`
+  for the runtime collection path
 
 Do not silently change the manifest format. If it must evolve, bump
 `schema_version`.
@@ -316,6 +321,20 @@ Canonical training interface:
 - `rgb_older`, `dt_older`
 - `rgb_mid`, `dt_mid`
 - `actions_hist`, `dt_hist`
+
+Current Stage 1 data contract:
+
+- blackbox source capture remains `60 Hz` for both frames and actions
+- student training resamples that source timeline onto `24 Hz` recent/older/action grids
+- teacher training resamples that source timeline onto `36 Hz` recent/older/action grids
+- `mid_summary_hz = 6` is a sparse sampling grid over the same source timeline
+- for each desired model timestamp, the loader uses the latest source frame or raw
+  action packet at or before that timestamp
+- `actions_hist` should prefer the raw blackbox `actions` stream and only fall back
+  to frame-aligned `action_vector` for older recordings that do not have it
+- privileged Stage 1B / 1C targets should live in the sibling
+  `capture_<timestamp>_privileged/` directory and be indexed through
+  `AtlasTemporalClipIndex.privileged_dir`
 
 Atlas state must carry:
 
@@ -375,7 +394,7 @@ validation over adding unit or smoke tests by default.
 
 ## 12. Performance Notes
 
-- target student collection FPS is currently 24
+- target runtime collection FPS is currently 60
 - teacher temporal support targets 36 Hz inputs offline
 - visualization should avoid unnecessary resizes
 - heavy work should not run in the display capture loop

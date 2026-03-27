@@ -37,6 +37,10 @@ class PrivilegedTeacherModel(Atlas):
         self.pose_adapter = _PrivilegedTokenAdapter(3, 4, d_model)
         self.actor_adapter = _PrivilegedTokenAdapter(d_model, 32, d_model)
         self.map_adapter = _PrivilegedTokenAdapter(d_model, 16, d_model)
+        self.hidden_actor_adapter = _PrivilegedTokenAdapter(d_model, 32, d_model)
+        self.visibility_adapter = _PrivilegedTokenAdapter(4, 8, d_model)
+        self.flow_adapter = _PrivilegedTokenAdapter(2, 16, d_model)
+        self.risk_adapter = _PrivilegedTokenAdapter(2, 16, d_model)
 
     def encode_privileged_tokens(
         self,
@@ -59,6 +63,18 @@ class PrivilegedTeacherModel(Atlas):
             "priv_map_tokens": self.map_adapter(
                 privileged.get("map_tokens"), batch_size, device, dtype
             ),
+            "priv_hidden_actor_tokens": self.hidden_actor_adapter(
+                privileged.get("hidden_actor_tokens"), batch_size, device, dtype
+            ),
+            "priv_visibility_tokens": self.visibility_adapter(
+                privileged.get("visibility_tokens"), batch_size, device, dtype
+            ),
+            "priv_flow_tokens": self.flow_adapter(
+                privileged.get("flow_tokens"), batch_size, device, dtype
+            ),
+            "priv_risk_tokens": self.risk_adapter(
+                privileged.get("risk_tokens"), batch_size, device, dtype
+            ),
         }
 
     def forward_train(self, *args: Any, privileged: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
@@ -66,7 +82,30 @@ class PrivilegedTeacherModel(Atlas):
         batch_size = outputs["final_state"].static_grid.shape[0]
         device = outputs["final_state"].static_grid.device
         dtype = outputs["final_state"].static_grid.dtype
+        last = outputs["last"]
         outputs["teacher_privileged_tokens"] = self.encode_privileged_tokens(
             privileged, batch_size=batch_size, device=device, dtype=dtype
         )
+        outputs["teacher_privileged_supervision"] = {
+            "hidden_actor_trajs": None if privileged is None else privileged.get("hidden_actor_trajs"),
+            "visibility_mask": None if privileged is None else privileged.get("visibility_mask"),
+            "occupancy_flow": None if privileged is None else privileged.get("occupancy_flow"),
+            "speculative_heatmap": None if privileged is None else privileged.get("speculative_heatmap"),
+            "actor_existence": None if privileged is None else privileged.get("actor_existence"),
+            "occluder_risk": None if privileged is None else privileged.get("occluder_risk"),
+        }
+        outputs["teacher_distill_bundle"] = {
+            "dynamic_slots_target": last["dynamic_slots"].detach().clone(),
+            "speculative_slots_target": last["speculative_slots"].detach().clone(),
+            "dyn_flow_target": last["dyn_flow_bev"].detach().clone(),
+            "occl_risk_target": last["occl_risk_bev"].detach().clone(),
+            "provenance_target": last["provenance"].detach().clone(),
+            "future_spec_target": last["future_spec"].detach().clone(),
+            "hidden_risk_penalty_target": last["hidden_risk_penalty"].detach().clone(),
+            "hidden_actor_trajs": None if privileged is None else privileged.get("hidden_actor_trajs"),
+            "visibility_mask": None if privileged is None else privileged.get("visibility_mask"),
+            "occupancy_flow": None if privileged is None else privileged.get("occupancy_flow"),
+            "speculative_heatmap": None if privileged is None else privileged.get("speculative_heatmap"),
+            "occluder_risk": None if privileged is None else privileged.get("occluder_risk"),
+        }
         return outputs

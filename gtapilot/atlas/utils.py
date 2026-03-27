@@ -109,11 +109,50 @@ class LearnedQueryPool(nn.Module):
         self.norm_kv = nn.LayerNorm(dim)
         self.mlp = MLP(dim, dim * 4, dim, dropout)
 
-    def forward(self, src: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _append_fallback_token(
+        src: torch.Tensor,
+        key_padding_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if key_padding_mask is None:
+            return src, None
+        key_padding_mask = key_padding_mask.to(dtype=torch.bool, device=src.device)
+        if key_padding_mask.shape != src.shape[:2]:
+            raise ValueError(
+                "key_padding_mask must match src batch/sequence dimensions"
+            )
+        fallback = src.new_zeros(src.shape[0], 1, src.shape[-1])
+        src = torch.cat([src, fallback], dim=1)
+        key_padding_mask = torch.cat(
+            [
+                key_padding_mask,
+                torch.zeros(
+                    src.shape[0],
+                    1,
+                    device=src.device,
+                    dtype=torch.bool,
+                ),
+            ],
+            dim=1,
+        )
+        return src, key_padding_mask
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         assert_rank(src, 3, "src")
         b = src.shape[0]
         q = self.queries.expand(b, -1, -1)
-        out, _ = self.attn(self.norm_q(q), self.norm_kv(src), self.norm_kv(src), need_weights=False)
+        src, key_padding_mask = self._append_fallback_token(src, key_padding_mask)
+        out, _ = self.attn(
+            self.norm_q(q),
+            self.norm_kv(src),
+            self.norm_kv(src),
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         out = out + self.mlp(out)
         return out
 
@@ -126,8 +165,24 @@ class SelfAttentionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, dim * 4, dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x_norm = self.norm1(x)
+        x_src, key_padding_mask = LearnedQueryPool._append_fallback_token(
+            x_norm,
+            key_padding_mask,
+        )
+        y, _ = self.attn(
+            x_src,
+            x_src,
+            x_src,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        y = y[:, : x.shape[1]]
         x = x + y
         x = x + self.mlp(self.norm2(x))
         return x
@@ -142,8 +197,24 @@ class CrossAttentionBlock(nn.Module):
         self.norm_mlp = nn.LayerNorm(dim)
         self.mlp = MLP(dim, dim * 4, dropout=dropout)
 
-    def forward(self, x: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-        y, _ = self.attn(self.norm_q(x), self.norm_kv(src), self.norm_kv(src), need_weights=False)
+    def forward(
+        self,
+        x: torch.Tensor,
+        src: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        src_norm = self.norm_kv(src)
+        src_norm, key_padding_mask = LearnedQueryPool._append_fallback_token(
+            src_norm,
+            key_padding_mask,
+        )
+        y, _ = self.attn(
+            self.norm_q(x),
+            src_norm,
+            src_norm,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = x + y
         x = x + self.mlp(self.norm_mlp(x))
         return x

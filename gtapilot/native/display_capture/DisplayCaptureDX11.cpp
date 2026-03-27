@@ -32,7 +32,7 @@ static constexpr int CHANNEL_ENVELOPE_VERSION = 1;
 using Microsoft::WRL::ComPtr;
 using json = nlohmann::json;
 
-static constexpr int CAP_FPS = 20;
+static constexpr int CAP_FPS = 24;
 static constexpr int RING_SIZE = 4;
 static constexpr DXGI_FORMAT CAP_FMT = DXGI_FORMAT_B8G8R8A8_UNORM;
 

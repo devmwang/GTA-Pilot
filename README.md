@@ -316,6 +316,60 @@ alignment. The current manifest schema version is `5`. The manifest contains:
 This is the current usable dataset path for Atlas Stage 1A and related
 inference-time training work.
 
+## Atlas Temporal Training Contract
+
+Atlas training is now built around a three-tier temporal/context interface
+rather than the older flat short-window design.
+
+Student baseline:
+
+- `24 Hz` fast loop
+- `32` recent full-token frames
+- `64` older compressed-history frames
+- `120` sparse summary steps at `6 Hz`
+- `128` action-history steps
+- `64` dynamic slots
+- `16` speculative slots
+
+Teacher target:
+
+- `36 Hz` fast loop
+- `48` recent full-token frames
+- `96` older compressed-history frames
+- `180` sparse summary steps at `6 Hz`
+- `192` action-history steps
+- `96` dynamic slots
+- `24` speculative slots
+
+The canonical Atlas training call is now:
+
+```python
+forward_train(
+    rgb_recent,
+    dt_recent,
+    rgb_older,
+    dt_older,
+    rgb_mid,
+    dt_mid,
+    actions_hist,
+    dt_hist,
+    ...,
+)
+```
+
+Where:
+
+- `rgb_recent` is the dense recent bank
+- `rgb_older` is the older dense-rate history that gets compressed into the
+  older bank
+- `rgb_mid` is the sparse long-horizon summary input
+- `actions_hist` and `dt_hist` carry the long action/ego prior
+
+Blackbox `*_video.mkv + *_metadata.json` recordings are the canonical student
+training source. The clip loader preserves exact timestamp deltas from the
+manifest, including older `20 Hz` captures, rather than pretending all clips
+were collected at `24 Hz`.
+
 ## IPC
 
 The runtime uses two IPC layers:

@@ -20,11 +20,25 @@ class ObservationPool(nn.Module):
     def forward(
         self,
         cam_now: torch.Tensor,
+        short_ctx: torch.Tensor,
+        older_ctx: torch.Tensor,
+        long_ctx: torch.Tensor,
         frustum_tokens: torch.Tensor,
         ego_tokens: torch.Tensor,
         act_tokens: torch.Tensor,
     ) -> torch.Tensor:
         assert_rank(cam_now, 3, "cam_now")
         assert_rank(frustum_tokens, 3, "frustum_tokens")
-        src = torch.cat([cam_now, frustum_tokens, ego_tokens, act_tokens], dim=1)
+        src = torch.cat(
+            [
+                cam_now,
+                short_ctx,
+                older_ctx,
+                long_ctx,
+                frustum_tokens,
+                ego_tokens,
+                act_tokens,
+            ],
+            dim=1,
+        )
         return self.pool(src)

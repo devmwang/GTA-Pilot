@@ -198,7 +198,7 @@ class StageWeights:
 
 def stage_weight_preset(stage: str) -> StageWeights:
     presets = {
-        "stage1a": {"cam_jepa": 1.0, "sigreg": 0.05},
+        "stage1a": {"cam_jepa": 1.0, "summary_jepa": 0.5, "sigreg": 0.05},
         "stage1b": {"cam_jepa": 0.3, "sigreg": 0.05, "depth": 1.0, "track": 0.5, "ego": 0.5},
         "stage1c": {"world_jepa": 1.0, "sigreg": 0.05, "mem": 0.5, "ego": 0.5},
         "stage1p5": {"lane": 1.0, "map": 0.5, "sigreg": 0.02},
@@ -206,6 +206,11 @@ def stage_weight_preset(stage: str) -> StageWeights:
             "occ_state": 2.0,
             "occ_sem": 1.0,
             "bev": 1.0,
+            "dyn_flow": 0.6,
+            "occl_risk": 0.6,
+            "dyn_slots_distill": 0.2,
+            "spec_slots_distill": 0.2,
+            "hidden_risk_distill": 0.15,
             "lane": 1.0,
             "map": 0.4,
             "actors": 0.4,
@@ -220,6 +225,10 @@ def stage_weight_preset(stage: str) -> StageWeights:
             "rank": 1.0,
             "ctrl": 0.4,
             "future": 0.4,
+            "future_spec": 0.2,
+            "dyn_slots_distill": 0.2,
+            "spec_slots_distill": 0.2,
+            "hidden_risk_distill": 0.15,
             "occ_state": 0.3,
             "lane": 0.3,
             "ego": 0.2,
@@ -230,8 +239,14 @@ def stage_weight_preset(stage: str) -> StageWeights:
             "rank": 1.0,
             "ctrl": 0.3,
             "future": 0.3,
+            "future_spec": 0.2,
+            "dyn_slots_distill": 0.2,
+            "spec_slots_distill": 0.2,
+            "hidden_risk_distill": 0.15,
             "occ_state": 0.35,
             "occ_sem": 0.25,
+            "dyn_flow": 0.15,
+            "occl_risk": 0.15,
             "lane": 0.30,
             "map": 0.10,
             "actors": 0.15,
@@ -260,6 +275,12 @@ def compute_stage_losses(
             targets["cam_projector_target"],
             targets.get("cam_mask"),
         )
+    if "summary_projector_pred" in outputs and "summary_projector_target" in targets:
+        losses["summary_jepa"] = masked_l2_jepa(
+            outputs["summary_projector_pred"],
+            targets["summary_projector_target"],
+            targets.get("summary_mask"),
+        )
     if "world_projector_pred" in outputs and "world_projector_target" in targets:
         losses["world_jepa"] = masked_l2_jepa(
             outputs["world_projector_pred"],
@@ -268,7 +289,12 @@ def compute_stage_losses(
         )
 
     sig_terms = []
-    for key in ("cam_projector_pred", "world_projector_pred", "proposal_embed"):
+    for key in (
+        "cam_projector_pred",
+        "summary_projector_pred",
+        "world_projector_pred",
+        "proposal_embed",
+    ):
         if key in outputs:
             sig_terms.append(sigreg(outputs[key]))
     if sig_terms:
@@ -305,6 +331,13 @@ def compute_stage_losses(
     if "bev_lite" in outputs and "bev_target" in targets:
         losses["bev"] = F.binary_cross_entropy_with_logits(
             outputs["bev_lite"], targets["bev_target"].float()
+        )
+    if "dyn_flow_bev" in outputs and "dyn_flow_target" in targets:
+        losses["dyn_flow"] = F.mse_loss(outputs["dyn_flow_bev"], targets["dyn_flow_target"])
+    if "occl_risk_bev" in outputs and "occl_risk_target" in targets:
+        losses["occl_risk"] = F.binary_cross_entropy_with_logits(
+            outputs["occl_risk_bev"],
+            targets["occl_risk_target"].float(),
         )
     if "provenance" in outputs and "provenance_target" in targets:
         losses["provenance"] = F.cross_entropy(
@@ -359,6 +392,29 @@ def compute_stage_losses(
             outputs["future_dyn"],
             targets["future_dyn_target"],
             targets.get("future_valid"),
+        )
+    if "future_spec" in outputs and "future_spec_target" in targets:
+        losses["future_spec"] = future_dyn_l2(
+            outputs["future_spec"],
+            targets["future_spec_target"],
+            targets.get("future_spec_valid"),
+        )
+    if "dynamic_slots" in outputs and "dynamic_slots_target" in targets:
+        losses["dyn_slots_distill"] = future_dyn_l2(
+            outputs["dynamic_slots"],
+            targets["dynamic_slots_target"],
+            targets.get("dynamic_slots_valid"),
+        )
+    if "speculative_slots" in outputs and "speculative_slots_target" in targets:
+        losses["spec_slots_distill"] = future_dyn_l2(
+            outputs["speculative_slots"],
+            targets["speculative_slots_target"],
+            targets.get("speculative_slots_valid"),
+        )
+    if "hidden_risk_penalty" in outputs and "hidden_risk_penalty_target" in targets:
+        losses["hidden_risk_distill"] = F.l1_loss(
+            outputs["hidden_risk_penalty"],
+            targets["hidden_risk_penalty_target"],
         )
 
     total = zero

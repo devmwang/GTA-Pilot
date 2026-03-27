@@ -1,18 +1,19 @@
-from .collate import collate_logged_steps, collate_optional_tensor
-from .gta_dataset import AtlasLoggedStepDataset
+from .collate import collate_temporal_clips
+from .gta_dataset import AtlasBlackboxClipDataset
 from .schema import (
+    AtlasTemporalClipIndex,
+    BlackboxFrameRecord,
     ConvertedLaneSample,
     LaneSegment3D,
-    LoggedStep,
     MapElement3D,
 )
 
 __all__ = [
-    "AtlasLoggedStepDataset",
+    "AtlasBlackboxClipDataset",
+    "AtlasTemporalClipIndex",
+    "BlackboxFrameRecord",
     "ConvertedLaneSample",
     "LaneSegment3D",
-    "LoggedStep",
     "MapElement3D",
-    "collate_logged_steps",
-    "collate_optional_tensor",
+    "collate_temporal_clips",
 ]

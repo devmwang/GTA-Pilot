@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -58,56 +59,50 @@ class ConvertedLaneSample:
 
 
 @dataclass
-class LoggedStep:
-    episode_id: str
-    frame_idx: int
-    timestamp_ms: int
+class BlackboxFrameRecord:
+    video_frame_index: int
+    capture_timestamp_ns: int
+    publish_timestamp_ns: int
+    frame_id: int
+    frame_source: str
+    frame_metadata: dict[str, Any]
+    action: dict[str, Any] | None
+    action_vector: np.ndarray
 
-    rgb_front_path: str
-    action: np.ndarray
-    dt_s: float
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "BlackboxFrameRecord":
+        return cls(
+            video_frame_index=int(payload["video_frame_index"]),
+            capture_timestamp_ns=int(payload["capture_timestamp_ns"]),
+            publish_timestamp_ns=int(payload["publish_timestamp_ns"]),
+            frame_id=int(payload.get("frame_id", -1)),
+            frame_source=str(payload.get("frame_source", "")),
+            frame_metadata=dict(payload.get("frame_metadata", {})),
+            action=None if payload.get("action") is None else dict(payload["action"]),
+            action_vector=np.asarray(payload["action_vector"], dtype=np.float32),
+        )
 
-    route_polyline: np.ndarray | None = None
-    nav_cmd: np.ndarray | None = None
 
-    gt_pose_local: np.ndarray | None = None
-    gt_kinematics: np.ndarray | None = None
-    gt_actors: dict[str, Any] | None = None
-    gt_occ_state: np.ndarray | None = None
-    gt_occ_sem: np.ndarray | None = None
-    gt_bev_lite: np.ndarray | None = None
-    gt_provenance: np.ndarray | None = None
-    gt_lane_segments: list[LaneSegment3D] | None = None
-    gt_map_elements: list[MapElement3D] | None = None
-    gt_teacher_trajs: np.ndarray | None = None
-    gt_teacher_costs: np.ndarray | None = None
-    gt_teacher_best: int | None = None
-    valid_mask: dict[str, bool] = field(default_factory=dict)
+@dataclass
+class AtlasTemporalClipIndex:
+    clip_id: str
+    metadata_path: str
+    video_path: str
+    target_frame_index: int
+    recent_frame_indices: list[int]
+    older_frame_indices: list[int]
+    mid_frame_indices: list[int]
+    action_frame_indices: list[int]
+    nominal_fps: float
+    frame_source: str
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        for key in (
-            "action",
-            "route_polyline",
-            "nav_cmd",
-            "gt_pose_local",
-            "gt_kinematics",
-            "gt_occ_state",
-            "gt_occ_sem",
-            "gt_bev_lite",
-            "gt_provenance",
-            "gt_teacher_trajs",
-            "gt_teacher_costs",
-        ):
-            value = payload.get(key)
-            if value is not None:
-                payload[key] = np.asarray(value).tolist()
-        if payload.get("gt_lane_segments") is not None:
-            payload["gt_lane_segments"] = [
-                segment.to_dict() for segment in self.gt_lane_segments or []
-            ]
-        if payload.get("gt_map_elements") is not None:
-            payload["gt_map_elements"] = [
-                element.to_dict() for element in self.gt_map_elements or []
-            ]
-        return payload
+        return asdict(self)
+
+    @property
+    def metadata_file(self) -> Path:
+        return Path(self.metadata_path)
+
+    @property
+    def video_file(self) -> Path:
+        return Path(self.video_path)

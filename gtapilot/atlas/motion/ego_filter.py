@@ -13,7 +13,7 @@ class EgoFilter(nn.Module):
         self.cfg = cfg
         D = cfg.hidden_dim
         H = cfg.ego.hidden_size
-        self.in_proj = nn.Linear(D * 3, H)
+        self.in_proj = nn.Linear(D * 5, H)
         self.gru = nn.GRU(
             input_size=H,
             hidden_size=H,
@@ -28,17 +28,26 @@ class EgoFilter(nn.Module):
     def forward(
         self,
         cam_now: torch.Tensor,
-        frame_sum: torch.Tensor,
+        short_ctx: torch.Tensor,
+        older_ctx: torch.Tensor,
+        long_ctx: torch.Tensor,
         act_tokens: torch.Tensor,
         hidden: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         assert_rank(cam_now, 3, "cam_now")
-        assert_rank(frame_sum, 3, "frame_sum")
+        assert_rank(short_ctx, 3, "short_ctx")
+        assert_rank(older_ctx, 3, "older_ctx")
+        assert_rank(long_ctx, 3, "long_ctx")
         assert_rank(act_tokens, 3, "act_tokens")
         cam_summary = cam_now.mean(dim=1)
-        frame_summary = frame_sum[:, -1]
+        short_summary = short_ctx.mean(dim=1)
+        older_summary = older_ctx.mean(dim=1)
+        long_summary = long_ctx.mean(dim=1)
         act_summary = act_tokens.mean(dim=1)
-        x = torch.cat([cam_summary, frame_summary, act_summary], dim=-1)
+        x = torch.cat(
+            [cam_summary, short_summary, older_summary, long_summary, act_summary],
+            dim=-1,
+        )
         x = self.in_proj(x).unsqueeze(1)
         out, hidden_next = self.gru(x, hidden)
         h = out[:, 0]

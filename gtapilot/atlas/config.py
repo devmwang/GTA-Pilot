@@ -63,18 +63,43 @@ class VisionTokenizerConfig:
 
 
 @dataclass
-class TemporalMixerConfig:
-    num_frames: int = 8
-    mixer_blocks: int = 4
+class TemporalContextConfig:
+    fast_loop_hz: int = 24
+    recent_full_frames: int = 32
+    recent_cam_tokens: int = 192
+    older_compressed_frames: int = 64
+    older_compressed_tokens: int = 64
+    mid_summary_hz: int = 6
+    mid_summary_frames: int = 120
+    mid_summary_tokens: int = 4
+    summary_stride_steps: int = 4
+    short_context_tokens: int = 8
+    older_context_tokens: int = 8
+    long_context_tokens: int = 8
+    recent_mixer_blocks: int = 4
+    older_mixer_blocks: int = 2
+    mid_mixer_blocks: int = 2
     num_heads: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.1
+
+    @property
+    def recent_cache_frames(self) -> int:
+        return max(0, self.recent_full_frames - 1)
+
+    @property
+    def explicit_history_frames(self) -> int:
+        return self.recent_full_frames + self.older_compressed_frames
+
+    @property
+    def explicit_history_seconds(self) -> float:
+        return self.explicit_history_frames / float(max(1, self.fast_loop_hz))
 
 
 @dataclass
 class ActionEncoderConfig:
     action_dim: int = 6
-    history_len: int = 20
+    history_len: int = 128
     act_tokens: int = 4
     hidden_dim: int = 192
     num_heads: int = 8
@@ -92,7 +117,7 @@ class EgoFilterConfig:
 class GeometryLifterConfig:
     frustum_tokens: int = 384
     depth_bins: int = 64
-    track_history: int = 7
+    track_history: int = 31
     grid_h_8x: int = 136
     grid_w_8x: int = 240
     min_depth_m: float = 0.5
@@ -110,6 +135,7 @@ class WorldMemoryConfig:
     static_grid_h: int = 20
     static_grid_w: int = 14
     dynamic_slots: int = 64
+    speculative_slots: int = 16
     lane_slots: int = 32
     map_elem_slots: int = 16
     ego_tokens: int = 6
@@ -117,6 +143,7 @@ class WorldMemoryConfig:
     reasoner_tokens: int = 8
     world_blocks: int = 8
     num_heads: int = 8
+    actor_memory_survival_s: float = 8.0
     x_range_m: Tuple[float, float] = (-16.0, 64.0)
     y_range_m: Tuple[float, float] = (-21.0, 21.0)
     static_write_dropout: float = 0.1
@@ -146,6 +173,7 @@ class PlannerConfig:
         "comfort",
         "uncertainty",
         "route",
+        "hidden_risk",
     )
     num_heads: int = 8
 
@@ -236,6 +264,7 @@ class BEVLiteHeadConfig:
 @dataclass
 class ActorHeadConfig:
     queries: int = 40
+    speculative_queries: int = 16
     classes: Tuple[str, ...] = (
         "car",
         "large_vehicle",
@@ -257,7 +286,7 @@ class HeadSchedulerConfig:
             "map": 1,
             "bev": 1,
             "actors": 2,
-            "occupancy": 3,
+            "occupancy": 4,
         }
     )
     inspect_mode_cadence: Dict[str, int] = field(
@@ -267,8 +296,8 @@ class HeadSchedulerConfig:
             "lane": 1,
             "map": 1,
             "bev": 1,
-            "actors": 1,
-            "occupancy": 1,
+            "actors": 2,
+            "occupancy": 4,
         }
     )
 
@@ -293,7 +322,7 @@ class AtlasConfig:
     hidden_dim: int
     image: ImageConfig = field(default_factory=ImageConfig)
     vision: VisionTokenizerConfig = field(default_factory=VisionTokenizerConfig)
-    temporal: TemporalMixerConfig = field(default_factory=TemporalMixerConfig)
+    temporal: TemporalContextConfig = field(default_factory=TemporalContextConfig)
     action: ActionEncoderConfig = field(default_factory=ActionEncoderConfig)
     ego: EgoFilterConfig = field(default_factory=EgoFilterConfig)
     geometry: GeometryLifterConfig = field(default_factory=GeometryLifterConfig)
@@ -337,25 +366,47 @@ def atlas_s1080_config() -> AtlasConfig:
     cfg.vision.fusion_dim = 256
     cfg.vision.bifpn_repeats = 2
     cfg.vision.freeze_stages = 2
-    cfg.temporal.mixer_blocks = 4
+
+    cfg.temporal.fast_loop_hz = 24
+    cfg.temporal.recent_full_frames = 32
+    cfg.temporal.recent_cam_tokens = 192
+    cfg.temporal.older_compressed_frames = 64
+    cfg.temporal.older_compressed_tokens = 64
+    cfg.temporal.mid_summary_hz = 6
+    cfg.temporal.mid_summary_frames = 120
+    cfg.temporal.mid_summary_tokens = 4
+    cfg.temporal.summary_stride_steps = 4
+    cfg.temporal.short_context_tokens = 8
+    cfg.temporal.older_context_tokens = 8
+    cfg.temporal.long_context_tokens = 8
+    cfg.temporal.recent_mixer_blocks = 4
+    cfg.temporal.older_mixer_blocks = 2
+    cfg.temporal.mid_mixer_blocks = 2
+    cfg.temporal.num_heads = 8
+
+    cfg.action.history_len = 128
     cfg.action.hidden_dim = 192
     cfg.ego.hidden_size = 192
     cfg.geometry.frustum_tokens = 384
+    cfg.geometry.track_history = cfg.temporal.recent_cache_frames
     cfg.obs_pool.obs_tokens = 96
     cfg.world.static_grid_h = 20
     cfg.world.static_grid_w = 14
     cfg.world.dynamic_slots = 64
+    cfg.world.speculative_slots = 16
     cfg.world.lane_slots = 32
     cfg.world.map_elem_slots = 16
     cfg.world.ego_tokens = 6
     cfg.world.route_tokens = 8
     cfg.world.reasoner_tokens = 8
     cfg.world.world_blocks = 8
+    cfg.world.actor_memory_survival_s = 8.0
     cfg.planner.proposals = 10
     cfg.planner.decoder_blocks = 4
     cfg.planner.evaluator_rollout_steps = 5
     cfg.map_elem.queries = 16
     cfg.actor.queries = 40
+    cfg.actor.speculative_queries = 16
     cfg.reasoner_adapter.input_dim = 448
     return cfg
 
@@ -377,18 +428,37 @@ def atlas_t1080_priv_config() -> AtlasConfig:
     cfg.vision.bifpn_repeats = 3
     cfg.vision.query_pool_heads = 10
     cfg.vision.freeze_stages = 1
-    cfg.temporal.mixer_blocks = 6
+
+    cfg.temporal.fast_loop_hz = 36
+    cfg.temporal.recent_full_frames = 48
+    cfg.temporal.recent_cam_tokens = 256
+    cfg.temporal.older_compressed_frames = 96
+    cfg.temporal.older_compressed_tokens = 96
+    cfg.temporal.mid_summary_hz = 6
+    cfg.temporal.mid_summary_frames = 180
+    cfg.temporal.mid_summary_tokens = 8
+    cfg.temporal.summary_stride_steps = 6
+    cfg.temporal.short_context_tokens = 8
+    cfg.temporal.older_context_tokens = 8
+    cfg.temporal.long_context_tokens = 8
+    cfg.temporal.recent_mixer_blocks = 6
+    cfg.temporal.older_mixer_blocks = 3
+    cfg.temporal.mid_mixer_blocks = 3
     cfg.temporal.num_heads = 10
+
+    cfg.action.history_len = 192
     cfg.action.hidden_dim = 256
     cfg.action.num_heads = 10
     cfg.ego.hidden_size = 256
     cfg.ego.ego_tokens = 8
     cfg.geometry.frustum_tokens = 512
+    cfg.geometry.track_history = cfg.temporal.recent_cache_frames
     cfg.obs_pool.obs_tokens = 128
     cfg.obs_pool.num_heads = 10
     cfg.world.static_grid_h = 24
     cfg.world.static_grid_w = 16
     cfg.world.dynamic_slots = 96
+    cfg.world.speculative_slots = 24
     cfg.world.lane_slots = 48
     cfg.world.map_elem_slots = 24
     cfg.world.ego_tokens = 8
@@ -396,6 +466,7 @@ def atlas_t1080_priv_config() -> AtlasConfig:
     cfg.world.reasoner_tokens = 8
     cfg.world.world_blocks = 10
     cfg.world.num_heads = 10
+    cfg.world.actor_memory_survival_s = 12.0
     cfg.planner.proposals = 14
     cfg.planner.decoder_blocks = 5
     cfg.planner.evaluator_rollout_steps = 6
@@ -403,6 +474,7 @@ def atlas_t1080_priv_config() -> AtlasConfig:
     cfg.lane.lane_queries = 48
     cfg.map_elem.queries = 24
     cfg.actor.queries = 64
+    cfg.actor.speculative_queries = 24
     cfg.reasoner_adapter.input_dim = 640
     cfg.enable_privileged_teacher_adapters = True
     return cfg
@@ -428,9 +500,24 @@ def atlas_smoke_config() -> AtlasConfig:
     cfg.vision.fusion_dim = 32
     cfg.vision.bifpn_repeats = 1
     cfg.vision.query_pool_heads = 2
-    cfg.temporal.num_frames = 4
-    cfg.temporal.mixer_blocks = 2
+
+    cfg.temporal.fast_loop_hz = 8
+    cfg.temporal.recent_full_frames = 4
+    cfg.temporal.recent_cam_tokens = 8
+    cfg.temporal.older_compressed_frames = 4
+    cfg.temporal.older_compressed_tokens = 4
+    cfg.temporal.mid_summary_hz = 2
+    cfg.temporal.mid_summary_frames = 6
+    cfg.temporal.mid_summary_tokens = 2
+    cfg.temporal.summary_stride_steps = 2
+    cfg.temporal.short_context_tokens = 2
+    cfg.temporal.older_context_tokens = 2
+    cfg.temporal.long_context_tokens = 2
+    cfg.temporal.recent_mixer_blocks = 2
+    cfg.temporal.older_mixer_blocks = 1
+    cfg.temporal.mid_mixer_blocks = 1
     cfg.temporal.num_heads = 2
+
     cfg.action.history_len = 8
     cfg.action.act_tokens = 2
     cfg.action.hidden_dim = 32
@@ -440,12 +527,13 @@ def atlas_smoke_config() -> AtlasConfig:
     cfg.geometry.frustum_tokens = 8
     cfg.geometry.grid_h_8x = cfg.image.padded_height // 8
     cfg.geometry.grid_w_8x = cfg.image.padded_width // 8
-    cfg.geometry.track_history = cfg.temporal.num_frames - 1
+    cfg.geometry.track_history = cfg.temporal.recent_cache_frames
     cfg.obs_pool.obs_tokens = 4
-    cfg.obs_pool.num_heads = 4
+    cfg.obs_pool.num_heads = 2
     cfg.world.static_grid_h = 4
     cfg.world.static_grid_w = 3
     cfg.world.dynamic_slots = 4
+    cfg.world.speculative_slots = 2
     cfg.world.lane_slots = 4
     cfg.world.map_elem_slots = 2
     cfg.world.ego_tokens = 3
@@ -453,6 +541,7 @@ def atlas_smoke_config() -> AtlasConfig:
     cfg.world.reasoner_tokens = 2
     cfg.world.world_blocks = 1
     cfg.world.num_heads = 2
+    cfg.world.actor_memory_survival_s = 2.0
     cfg.planner.proposals = 3
     cfg.planner.decoder_blocks = 1
     cfg.planner.evaluator_rollout_steps = 2
@@ -468,6 +557,7 @@ def atlas_smoke_config() -> AtlasConfig:
     cfg.bev_lite.out_h = 6
     cfg.bev_lite.out_w = 8
     cfg.actor.queries = 2
+    cfg.actor.speculative_queries = 1
     cfg.actor.future_steps = 2
     cfg.reasoner_adapter.input_dim = 64
     return cfg

@@ -279,7 +279,64 @@ For now, only collect inference-time sources needed by Atlas:
 Do not add fake placeholders for privileged labels. Those belong in a later
 ScriptHook-based data engine.
 
-## 8. Safe Extension Patterns
+## 8. Atlas Temporal Architecture
+
+Atlas no longer uses the old flat `num_frames`/`rgb_past` temporal contract.
+
+The active temporal API is the three-tier context design:
+
+- recent full-token bank
+- older compressed-history bank
+- sparse mid-summary bank
+- persistent dynamic and speculative memory slots
+
+Student baseline:
+
+- `24 Hz`
+- `32` recent full-token frames
+- `64` older compressed frames
+- `120` mid-summary steps at `6 Hz`
+- `128` action-history steps
+- `64` dynamic slots
+- `16` speculative slots
+
+Teacher target:
+
+- `36 Hz`
+- `48` recent full-token frames
+- `96` older compressed frames
+- `180` mid-summary steps at `6 Hz`
+- `192` action-history steps
+- `96` dynamic slots
+- `24` speculative slots
+
+Canonical training interface:
+
+- `rgb_recent`, `dt_recent`
+- `rgb_older`, `dt_older`
+- `rgb_mid`, `dt_mid`
+- `actions_hist`, `dt_hist`
+
+Atlas state must carry:
+
+- `recent_cam_cache`, `older_cam_cache`, `mid_summary_cache`
+- `recent_dt_cache`, `older_dt_cache`, `mid_dt_cache`
+- `recent_valid`, `older_valid`, `mid_valid`
+- `action_buffer`, `dt_buffer`
+- `dynamic_slots`, `speculative_slots`
+- `dynamic_slot_age_s`, `speculative_slot_age_s`
+- `dynamic_slot_alive`, `speculative_slot_alive`
+
+When changing Atlas temporal code:
+
+1. Preserve the three-tier interface; do not reintroduce flat `rgb_past`.
+2. Use exact `dt` values from data sources; do not fake all clips to `24 Hz`.
+3. Ignore invalid temporal-bank entries with masks instead of attending to zero
+   padding.
+4. Keep hidden-actor reasoning explicit through `dynamic_slots`,
+   `speculative_slots`, `dyn_flow_bev`, `occl_risk_bev`, and `provenance`.
+
+## 9. Safe Extension Patterns
 
 When adding a new worker:
 
@@ -292,7 +349,7 @@ When adding a new worker:
 If a worker needs graceful flushing, make it periodic and incremental. Do not
 reintroduce a global shutdown event.
 
-## 9. Deprecated Systems
+## 10. Deprecated Systems
 
 These old systems are no longer part of the runtime contract:
 
@@ -307,7 +364,7 @@ When cleaning up similar code in the future:
 - remove the IPC surface
 - remove dead imports and docs in the same change
 
-## 10. Testing Guidance
+## 11. Testing Guidance
 
 Do not automatically add tests, test files, or test scaffolding.
 
@@ -316,9 +373,10 @@ Only create or update tests if the user explicitly asks for them.
 For early runtime work in this repo, prioritize implementation speed and manual
 validation over adding unit or smoke tests by default.
 
-## 11. Performance Notes
+## 12. Performance Notes
 
-- target capture FPS is currently 20
+- target student collection FPS is currently 24
+- teacher temporal support targets 36 Hz inputs offline
 - visualization should avoid unnecessary resizes
 - heavy work should not run in the display capture loop
 - if latency rises, prefer conflation or bounded buffering over unbounded queues
@@ -326,14 +384,14 @@ validation over adding unit or smoke tests by default.
 For Atlas itself, keep the current runtime focused on data movement and
 recording. Do not move training or inference into the capture workers.
 
-## 12. Documentation Rules
+## 13. Documentation Rules
 
 `AGENTS.md` is the source-of-truth runtime playbook for this repository.
 
 If you change the generic channel framework, blackbox schema, or the active
 runtime graph, update `AGENTS.md` in the same change.
 
-## 13. When Unsure
+## 14. When Unsure
 
 Inspect the runtime in data-flow order:
 

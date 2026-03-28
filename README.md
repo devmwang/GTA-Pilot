@@ -206,17 +206,22 @@ The `vision.frames` channel carries raw RGB frames plus metadata. Current frame
 metadata includes:
 
 - `frame_id`
+- `capture_frame_id`
 - `capture_timestamp_ns`
 - `nominal_fps`
 - `publish_timestamp_ns`
 - `source`
 - `is_repeat`
+- `pipeline_stats` for native live-capture overload telemetry
 - `w`
 - `h`
 - `channels`
 - `dtype`
 
 Current capture producers now publish `nominal_fps = 60.0`.
+`frame_id` advances for every published 60 Hz output. `capture_frame_id`
+advances only when a fresh source frame is captured; repeated 60 Hz outputs keep
+the same `capture_frame_id`.
 
 ### Action stream
 
@@ -317,15 +322,36 @@ streamed into ffmpeg as raw `bgr24` and encoded as H.264 in an MKV container.
 Current runtime producers publish 60 Hz vision streams, so new live and video
 override blackbox clips are authored with `video_nominal_fps = 60.0`.
 The JSON manifest is still the authoritative source for frame timing and action
-alignment. The current manifest schema version is `5`. The manifest contains:
+alignment. The current manifest schema version is `6`. Recording now uses
+append-only temporary frame/action journals during capture and synthesizes the
+final `capture_<timestamp>_metadata.json` once when the session stops.
+
+Schema `6` manifests contain:
 
 - session-level metadata
 - session video settings
+- session integrity status plus structured drop/overflow events
+- transport stats for `vision.frames` and `input.actions`
+- writer queue / writer-lag stats
 - frame envelope and frame metadata
 - per-frame video file name and video frame index
+- per-frame `capture_frame_id`
+- per-frame `subscriber_received_timestamp_ns`
+- per-frame `writer_committed_timestamp_ns`
+- per-frame `subscriber_queue_latency_ns`
 - frame-aligned action payloads
 - frame-aligned action vectors
 - the raw action stream seen during capture
+
+Any detected transport gap, subscriber overflow, writer overflow, or native
+capture overload marks the session integrity status as `degraded` instead of
+silently hiding the issue.
+
+To audit a saved clip:
+
+```bash
+uv run python -m gtapilot.blackbox.audit --metadata-path blackbox-recordings/capture_<timestamp>_metadata.json
+```
 
 This is the current usable dataset path for Atlas Stage 1A and related
 inference-time training work.

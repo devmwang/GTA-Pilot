@@ -225,6 +225,7 @@ def main(
             _draw_text(
                 frame,
                 f"Frame {packet.envelope.metadata.get('frame_id', '?')} "
+                f"capture={packet.envelope.metadata.get('capture_frame_id', '?')} "
                 f"source={packet.envelope.source} repeat={1 if is_repeat else 0}",
                 80,
             )

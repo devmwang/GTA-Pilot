@@ -43,6 +43,8 @@ class LoopingVideoSource:
         self._decoded_frame_index = -1
         self._last_output_source_index: int | None = None
         self._last_frame_rgb: np.ndarray | None = None
+        self._last_capture_frame_id = 0
+        self._last_capture_timestamp_ns = 0
 
     def _reset_capture(self) -> None:
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -96,12 +98,20 @@ class LoopingVideoSource:
                     raise RuntimeError("Video override could not decode a frame.")
                 return target_source_index, self._last_frame_rgb
 
-    def next_output_frame(self) -> tuple[np.ndarray, bool]:
+    def next_output_frame(self) -> tuple[np.ndarray, bool, int, int]:
         source_index, frame_rgb = self._frame_for_current_cursor()
         is_repeat = self._last_output_source_index == source_index
+        if not is_repeat:
+            self._last_capture_frame_id += 1
+            self._last_capture_timestamp_ns = time.time_ns()
         self._last_output_source_index = source_index
         self._source_cursor += self._source_step
-        return frame_rgb, is_repeat
+        return (
+            frame_rgb,
+            is_repeat,
+            self._last_capture_frame_id,
+            self._last_capture_timestamp_ns,
+        )
 
     def close(self) -> None:
         self.cap.release()
@@ -124,13 +134,18 @@ def main(video_path: str):
         with HighResolutionTimer(1):
             while True:
                 sleep_until(next_frame_time)
-                frame_rgb, is_repeat = video_source.next_output_frame()
-                capture_timestamp_ns = time.time_ns()
+                (
+                    frame_rgb,
+                    is_repeat,
+                    capture_frame_id,
+                    capture_timestamp_ns,
+                ) = video_source.next_output_frame()
                 publisher.publish(
                     frame_rgb,
                     timestamp_ns=capture_timestamp_ns,
                     metadata={
                         "frame_id": frame_id,
+                        "capture_frame_id": capture_frame_id,
                         "capture_timestamp_ns": capture_timestamp_ns,
                         "nominal_fps": OUTPUT_FPS,
                         "is_repeat": is_repeat,

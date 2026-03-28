@@ -151,9 +151,11 @@ Vision payload contract:
   - `channels`
   - `dtype`
   - `frame_id`
+  - `capture_frame_id`
   - `nominal_fps`
   - `capture_timestamp_ns`
   - `is_repeat`
+  - optional `pipeline_stats` for native overload telemetry
 
 Action payload contract:
 
@@ -238,14 +240,21 @@ Outputs under `blackbox-recordings/`:
 - `capture_<timestamp>_video.mkv`
 - `capture_<timestamp>_metadata.json`
 
-Current manifest schema version: `5`
+Current manifest schema version: `6`
 
 The manifest records:
 
 - session metadata
 - session video settings
+- session integrity and drop-event summaries
+- transport stats for `vision.frames` and `input.actions`
+- writer queue / latency stats
 - per-frame metadata and video frame index
 - per-frame envelope data
+- per-frame `capture_frame_id`
+- per-frame `subscriber_received_timestamp_ns`
+- per-frame `writer_committed_timestamp_ns`
+- per-frame `subscriber_queue_latency_ns`
 - frame-aligned action payload
 - frame-aligned action envelope data
 - frame-aligned action vector
@@ -260,7 +269,8 @@ Behavior notes:
 - while idle, blackbox keeps a bounded in-memory pre-roll buffer
 - each start/stop cycle produces a separate `capture_<timestamp>_*` pair
 - frames are encoded into H.264 video in an MKV container via `ffmpeg`
-- metadata is flushed incrementally during capture
+- active recording uses append-only temporary frame/action journals and writes the
+  final metadata JSON once at stop
 - abrupt termination can still lose a small tail of in-memory state
 - the JSON manifest is the authoritative timestamp/alignment source, not the
   container timestamps
@@ -268,6 +278,13 @@ Behavior notes:
   not guess it
 - current live capture and video override producers publish `nominal_fps=60.0`
   for the runtime collection path
+- `frame_id` advances for every published 60 Hz output; `capture_frame_id`
+  advances only for fresh captured frames, so repeats keep the same
+  `capture_frame_id`
+- any transport gap, subscriber overflow, writer overflow, or native capture
+  overload marks the session integrity status as `degraded`
+- use `python -m gtapilot.blackbox.audit --metadata-path ...` to summarize
+  cadence, repeat rate, transport gaps, writer lag, and native overload stats
 
 Do not silently change the manifest format. If it must evolve, bump
 `schema_version`.

@@ -64,11 +64,15 @@ class BlackboxFrameRecord:
     capture_timestamp_ns: int
     publish_timestamp_ns: int
     frame_id: int
+    capture_frame_id: int
     frame_source: str
     frame_metadata: dict[str, Any]
     action: dict[str, Any] | None
     action_vector: np.ndarray
     action_message_timestamp_ns: int | None = None
+    subscriber_received_timestamp_ns: int | None = None
+    writer_committed_timestamp_ns: int | None = None
+    subscriber_queue_latency_ns: int | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BlackboxFrameRecord":
@@ -78,6 +82,9 @@ class BlackboxFrameRecord:
             capture_timestamp_ns=int(payload["capture_timestamp_ns"]),
             publish_timestamp_ns=int(payload["publish_timestamp_ns"]),
             frame_id=int(payload.get("frame_id", -1)),
+            capture_frame_id=int(
+                payload.get("capture_frame_id", payload.get("frame_id", -1))
+            ),
             frame_source=str(payload.get("frame_source", "")),
             frame_metadata=dict(payload.get("frame_metadata", {})),
             action=None if payload.get("action") is None else dict(payload["action"]),
@@ -85,6 +92,15 @@ class BlackboxFrameRecord:
             action_message_timestamp_ns=None
             if action_envelope.get("message_timestamp_ns") is None
             else int(action_envelope["message_timestamp_ns"]),
+            subscriber_received_timestamp_ns=None
+            if payload.get("subscriber_received_timestamp_ns") is None
+            else int(payload["subscriber_received_timestamp_ns"]),
+            writer_committed_timestamp_ns=None
+            if payload.get("writer_committed_timestamp_ns") is None
+            else int(payload["writer_committed_timestamp_ns"]),
+            subscriber_queue_latency_ns=None
+            if payload.get("subscriber_queue_latency_ns") is None
+            else int(payload["subscriber_queue_latency_ns"]),
         )
 
 

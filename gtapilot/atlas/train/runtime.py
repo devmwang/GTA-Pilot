@@ -59,6 +59,72 @@ def _has_explicit_source(data_cfg: DataConfig) -> bool:
     return bool(data_cfg.metadata_paths or data_cfg.split_file)
 
 
+def _resolve_metadata_source_paths(data_cfg: DataConfig) -> list[Path]:
+    root = Path(data_cfg.recordings_root)
+
+    def _resolve_entry(
+        raw_path: str | Path,
+        *,
+        split_parent: Path | None = None,
+    ) -> Path:
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path.resolve()
+        candidates: list[Path] = []
+        if split_parent is not None:
+            candidates.append(split_parent / path)
+        candidates.append(root / path)
+        candidates.append(path)
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return candidates[0].resolve()
+
+    if data_cfg.metadata_paths:
+        return [_resolve_entry(path) for path in data_cfg.metadata_paths]
+    if data_cfg.split_file:
+        split_path = Path(data_cfg.split_file).resolve()
+        lines = split_path.read_text(encoding="utf-8").splitlines()
+        return [
+            _resolve_entry(line.strip(), split_parent=split_path.parent)
+            for line in lines
+            if line.strip()
+        ]
+    return sorted(root.glob("capture_*_metadata.json"))
+
+
+def _missing_privileged_message(
+    *,
+    stage: str,
+    data_cfg: DataConfig,
+) -> str:
+    root = Path(data_cfg.recordings_root)
+    metadata_paths = _resolve_metadata_source_paths(data_cfg)
+    expected_dirs = [
+        metadata_path.with_name(
+            f"{metadata_path.stem.replace('_metadata', '')}_privileged"
+        )
+        for metadata_path in metadata_paths
+    ]
+    present = [
+        privileged_dir
+        for privileged_dir in expected_dirs
+        if (privileged_dir / "manifest.json").exists()
+    ]
+    if not expected_dirs:
+        coverage = f"found 0 source metadata files under {root}"
+    else:
+        coverage = (
+            f"found {len(present)} of {len(expected_dirs)} expected privileged sibling packages"
+        )
+    return (
+        f"{stage} requires privileged clip packages, but {coverage}. "
+        "Build sibling capture_<timestamp>_privileged/ manifests first, for example with "
+        "`python -m gtapilot.atlas.data.build_stage1b_privileged_dataset ...`, "
+        "or point the split at clips that already have privileged packages."
+    )
+
+
 def _build_dataset(
     stage: str,
     data_cfg: DataConfig,
@@ -165,6 +231,19 @@ def _stage_batch_to_device(
 
 def _build_horizons(values: list[float], device: torch.device) -> torch.Tensor:
     return torch.tensor(values, device=device, dtype=torch.float32)
+
+
+def _forward_stage_model(
+    atlas: nn.Module,
+    stage: str,
+    *,
+    privileged: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    teacher_method = getattr(atlas, f"forward_{stage}_teacher", None)
+    if callable(teacher_method) and getattr(atlas.cfg, "enable_privileged_teacher_adapters", False):
+        return teacher_method(privileged=privileged, **kwargs)
+    return getattr(atlas, f"forward_{stage}")(**kwargs)
 
 
 def _summary_insert_sequence(
@@ -286,6 +365,17 @@ def _load_partial_module_state(module: nn.Module, path: str | Path) -> int:
 def _build_optimizer(module: StageTrainModule, trainer_cfg: TrainerConfig) -> torch.optim.Optimizer:
     opt_cfg = trainer_cfg.optimizer
     vision_ids = {id(param) for param in module.atlas.vision.parameters() if param.requires_grad}
+    explicit_no_decay_suffixes = (
+        "current_pos",
+        "recent_pos",
+        "pos",
+        "queries",
+        "base_queries",
+        "proposal_queries",
+        "query_tokens",
+        "scale_embeddings",
+        "relative_position_bias_table",
+    )
     groups = {
         "vision_decay": [],
         "vision_no_decay": [],
@@ -306,11 +396,10 @@ def _build_optimizer(module: StageTrainModule, trainer_cfg: TrainerConfig) -> to
             or lower_name.endswith(".ln")
             or ".ln" in lower_name
             or "bn" in lower_name
-            or "query" in lower_name
-            or "embed" in lower_name
-            or "pos_embed" in lower_name
-            or "position" in lower_name
-            or "relative" in lower_name
+            or any(
+                lower_name == suffix or lower_name.endswith(f".{suffix}")
+                for suffix in explicit_no_decay_suffixes
+            )
         )
         group_name = "vision_" if id(param) in vision_ids else "base_"
         group_name += "no_decay" if no_decay else "decay"
@@ -439,13 +528,16 @@ def _stage1a_forward_loss(
         "summary_frame_drop_prob": trainer_cfg.stage1a.summary_frame_drop_prob,
     }
     with _autocast_context(device, amp_enabled):
-        student = module.atlas.forward_stage1a(
-            batch["rgb_recent"],
-            batch["dt_recent"],
-            batch["rgb_older"],
-            batch["dt_older"],
-            batch["rgb_mid"],
-            batch["dt_mid"],
+        student = _forward_stage_model(
+            module.atlas,
+            "stage1a",
+            rgb_recent=batch["rgb_recent"],
+            dt_recent=batch["dt_recent"],
+            rgb_older=batch["rgb_older"],
+            dt_older=batch["dt_older"],
+            rgb_mid=batch["rgb_mid"],
+            dt_mid=batch["dt_mid"],
+            privileged=batch.get("teacher_privileged"),
             student_masking=masking,
             seed_older_with_grad=data_cfg.seed_older_with_grad,
             seed_mid_with_grad=data_cfg.seed_mid_with_grad,
@@ -464,13 +556,16 @@ def _stage1a_forward_loss(
     del student
     with torch.no_grad():
         with _autocast_context(device, amp_enabled):
-            teacher = ema_modules["atlas"].module.forward_stage1a(
-                batch["rgb_recent"],
-                batch["dt_recent"],
-                batch["rgb_older"],
-                batch["dt_older"],
-                batch["rgb_mid"],
-                batch["dt_mid"],
+            teacher = _forward_stage_model(
+                ema_modules["atlas"].module,
+                "stage1a",
+                rgb_recent=batch["rgb_recent"],
+                dt_recent=batch["dt_recent"],
+                rgb_older=batch["rgb_older"],
+                dt_older=batch["dt_older"],
+                rgb_mid=batch["rgb_mid"],
+                dt_mid=batch["dt_mid"],
+                privileged=batch.get("teacher_privileged"),
                 seed_older_with_grad=data_cfg.seed_older_with_grad,
                 seed_mid_with_grad=data_cfg.seed_mid_with_grad,
             )
@@ -503,15 +598,18 @@ def _stage1b_forward_loss(
     amp_enabled: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     with _autocast_context(device, amp_enabled):
-        outputs = module.atlas.forward_stage1b(
-            batch["rgb_recent"],
-            batch["dt_recent"],
-            batch["rgb_older"],
-            batch["dt_older"],
-            batch["rgb_mid"],
-            batch["dt_mid"],
-            batch["actions_hist"],
-            batch["dt_hist"],
+        outputs = _forward_stage_model(
+            module.atlas,
+            "stage1b",
+            rgb_recent=batch["rgb_recent"],
+            dt_recent=batch["dt_recent"],
+            rgb_older=batch["rgb_older"],
+            dt_older=batch["dt_older"],
+            rgb_mid=batch["rgb_mid"],
+            dt_mid=batch["dt_mid"],
+            actions_hist=batch["actions_hist"],
+            dt_hist=batch["dt_hist"],
+            privileged=batch.get("teacher_privileged"),
             seed_older_with_grad=data_cfg.seed_older_with_grad,
             seed_mid_with_grad=data_cfg.seed_mid_with_grad,
         )
@@ -539,13 +637,16 @@ def _stage1b_forward_loss(
         del outputs, canonical
         with torch.no_grad():
             with _autocast_context(device, amp_enabled):
-                teacher = ema_modules["atlas"].module.forward_stage1a(
-                    batch["rgb_recent"],
-                    batch["dt_recent"],
-                    batch["rgb_older"],
-                    batch["dt_older"],
-                    batch["rgb_mid"],
-                    batch["dt_mid"],
+                teacher = _forward_stage_model(
+                    ema_modules["atlas"].module,
+                    "stage1a",
+                    rgb_recent=batch["rgb_recent"],
+                    dt_recent=batch["dt_recent"],
+                    rgb_older=batch["rgb_older"],
+                    dt_older=batch["dt_older"],
+                    rgb_mid=batch["rgb_mid"],
+                    dt_mid=batch["dt_mid"],
+                    privileged=batch.get("teacher_privileged"),
                     seed_older_with_grad=data_cfg.seed_older_with_grad,
                     seed_mid_with_grad=data_cfg.seed_mid_with_grad,
                 )
@@ -573,6 +674,74 @@ def _stage1b_forward_loss(
     return losses["total"], losses
 
 
+def _stage1c_burn_in_batch(
+    batch: dict[str, Any],
+    burn_in_recent_steps: int | None,
+) -> dict[str, Any] | None:
+    total_older_steps = int(batch["rgb_older"].shape[1])
+    current_recent_steps = int(batch["rgb_recent"].shape[1])
+    if total_older_steps <= 0:
+        return None
+    available_action_steps = int(batch["actions_hist"].shape[1]) - current_recent_steps
+    if available_action_steps <= 0:
+        return None
+    burn_in_steps = total_older_steps if burn_in_recent_steps is None else int(burn_in_recent_steps)
+    burn_in_steps = max(0, min(burn_in_steps, total_older_steps, available_action_steps))
+    if burn_in_steps <= 0:
+        return None
+    burn_in_actions = batch["actions_hist"][:, :-current_recent_steps]
+    burn_in_dt_hist = batch["dt_hist"][:, :-current_recent_steps]
+    if burn_in_actions.shape[1] < burn_in_steps or burn_in_dt_hist.shape[1] < burn_in_steps:
+        return None
+    return {
+        "rgb_recent": batch["rgb_older"][:, -burn_in_steps:],
+        "dt_recent": batch["dt_older"][:, -burn_in_steps:],
+        "rgb_older": batch["rgb_older"][:, :-burn_in_steps],
+        "dt_older": batch["dt_older"][:, :-burn_in_steps],
+        "rgb_mid": batch["rgb_mid"],
+        "dt_mid": batch["dt_mid"],
+        "actions_hist": burn_in_actions,
+        "dt_hist": burn_in_dt_hist,
+        "route_polyline": batch.get("route_polyline"),
+        "nav_cmd": batch.get("nav_cmd"),
+        # Reasoner tokens are optional and currently not part of the Stage 1 data path.
+        "reasoner_tok": None,
+    }
+
+
+def _stage1c_burn_in_state(
+    atlas: nn.Module,
+    burn_in_batch: dict[str, Any] | None,
+    data_cfg: DataConfig,
+    device: torch.device,
+    *,
+    amp_enabled: bool,
+):
+    if burn_in_batch is None:
+        return None
+    with torch.no_grad():
+        with _autocast_context(device, amp_enabled):
+            burn_in_outputs = _forward_stage_model(
+                atlas,
+                "stage1c",
+                rgb_recent=burn_in_batch["rgb_recent"],
+                dt_recent=burn_in_batch["dt_recent"],
+                rgb_older=burn_in_batch["rgb_older"],
+                dt_older=burn_in_batch["dt_older"],
+                rgb_mid=burn_in_batch["rgb_mid"],
+                dt_mid=burn_in_batch["dt_mid"],
+                actions_hist=burn_in_batch["actions_hist"],
+                dt_hist=burn_in_batch["dt_hist"],
+                route_polyline=burn_in_batch.get("route_polyline"),
+                nav_cmd=burn_in_batch.get("nav_cmd"),
+                reasoner_tok=burn_in_batch.get("reasoner_tok"),
+                privileged=burn_in_batch.get("teacher_privileged"),
+                seed_older_with_grad=data_cfg.seed_older_with_grad,
+                seed_mid_with_grad=data_cfg.seed_mid_with_grad,
+            )
+    return burn_in_outputs["final_state"]
+
+
 def _stage1c_forward_loss(
     module: StageTrainModule,
     batch: dict[str, Any],
@@ -588,19 +757,34 @@ def _stage1c_forward_loss(
     if "atlas" not in ema_modules or "stage1c_heads" not in ema_modules:
         raise RuntimeError("Stage 1C requires EMA atlas and Stage1CPretrainHeads.")
     horizons_world = _build_horizons(trainer_cfg.stage1c.world_horizons_s, device)
+    burn_in_batch = _stage1c_burn_in_batch(
+        batch,
+        trainer_cfg.stage1c.burn_in_recent_steps,
+    )
+    init_state = _stage1c_burn_in_state(
+        module.atlas,
+        burn_in_batch,
+        data_cfg,
+        device,
+        amp_enabled=amp_enabled,
+    )
     with _autocast_context(device, amp_enabled):
-        outputs = module.atlas.forward_stage1c(
-            batch["rgb_recent"],
-            batch["dt_recent"],
-            batch["rgb_older"],
-            batch["dt_older"],
-            batch["rgb_mid"],
-            batch["dt_mid"],
-            batch["actions_hist"],
-            batch["dt_hist"],
+        outputs = _forward_stage_model(
+            module.atlas,
+            "stage1c",
+            rgb_recent=batch["rgb_recent"],
+            dt_recent=batch["dt_recent"],
+            rgb_older=batch["rgb_older"],
+            dt_older=batch["dt_older"],
+            rgb_mid=batch["rgb_mid"],
+            dt_mid=batch["dt_mid"],
+            actions_hist=batch["actions_hist"],
+            dt_hist=batch["dt_hist"],
             route_polyline=batch.get("route_polyline"),
             nav_cmd=batch.get("nav_cmd"),
             reasoner_tok=batch.get("reasoner_tok"),
+            privileged=batch.get("teacher_privileged"),
+            init_state=init_state,
             student_corruption={
                 "cam_drop_prob": trainer_cfg.stage1c.cam_drop_prob,
                 "frustum_drop_prob": trainer_cfg.stage1c.frustum_drop_prob,
@@ -627,20 +811,31 @@ def _stage1c_forward_loss(
             horizons_world,
         )
     del outputs
+    teacher_init_state = _stage1c_burn_in_state(
+        ema_modules["atlas"].module,
+        burn_in_batch,
+        data_cfg,
+        device,
+        amp_enabled=amp_enabled,
+    )
     with torch.no_grad():
         with _autocast_context(device, amp_enabled):
-            teacher = ema_modules["atlas"].module.forward_stage1c(
-                batch["rgb_recent"],
-                batch["dt_recent"],
-                batch["rgb_older"],
-                batch["dt_older"],
-                batch["rgb_mid"],
-                batch["dt_mid"],
-                batch["actions_hist"],
-                batch["dt_hist"],
+            teacher = _forward_stage_model(
+                ema_modules["atlas"].module,
+                "stage1c",
+                rgb_recent=batch["rgb_recent"],
+                dt_recent=batch["dt_recent"],
+                rgb_older=batch["rgb_older"],
+                dt_older=batch["dt_older"],
+                rgb_mid=batch["rgb_mid"],
+                dt_mid=batch["dt_mid"],
+                actions_hist=batch["actions_hist"],
+                dt_hist=batch["dt_hist"],
                 route_polyline=batch.get("route_polyline"),
                 nav_cmd=batch.get("nav_cmd"),
                 reasoner_tok=batch.get("reasoner_tok"),
+                privileged=batch.get("teacher_privileged"),
+                init_state=teacher_init_state,
                 seed_older_with_grad=data_cfg.seed_older_with_grad,
                 seed_mid_with_grad=data_cfg.seed_mid_with_grad,
             )
@@ -768,10 +963,11 @@ def _train_one_step(
     scaler.step(optimizer)
     scaler.update()
     optimizer_step_applied = scaler.get_scale() >= prev_scale
-    if "atlas" in ema_modules:
-        ema_modules["atlas"].update(module.atlas)
-    if "stage1c_heads" in ema_modules and module.stage1c_heads is not None:
-        ema_modules["stage1c_heads"].update(module.stage1c_heads)
+    if optimizer_step_applied:
+        if "atlas" in ema_modules:
+            ema_modules["atlas"].update(module.atlas)
+        if "stage1c_heads" in ema_modules and module.stage1c_heads is not None:
+            ema_modules["stage1c_heads"].update(module.stage1c_heads)
     batch_total = float(batch["rgb_recent"].shape[0])
     for key in aggregated:
         aggregated[key] /= max(1.0, batch_total)
@@ -823,7 +1019,6 @@ def run_training_stage(
     set_seed(trainer_cfg.seed)
     device = resolve_device(trainer_cfg.device)
     output_dir = ensure_dir(Path(trainer_cfg.checkpoint.output_dir) / stage)
-    trainer_cfg.save_json(output_dir / "trainer_config.json")
 
     module = _build_train_module(stage, trainer_cfg.model_variant, trainer_cfg)
     atlas_cfg = module.atlas.cfg
@@ -836,10 +1031,15 @@ def run_training_stage(
                 "Current Stage 1C runtime uses the recent clip length as the TBPTT window. "
                 f"Set tbptt_steps={recent_steps} for this model configuration."
             )
+    trainer_cfg.save_json(output_dir / "trainer_config.json")
     module.to(device)
 
     train_dataset = _build_dataset(stage, trainer_cfg.train, atlas_cfg)
     if len(train_dataset) == 0:
+        if stage == "stage1b" or trainer_cfg.train.use_privileged_dataset:
+            raise RuntimeError(
+                _missing_privileged_message(stage=stage, data_cfg=trainer_cfg.train)
+            )
         raise RuntimeError("Training dataset is empty.")
     train_loader = _build_loader(
         train_dataset,
@@ -857,6 +1057,11 @@ def run_training_stage(
             )
         val_dataset = _build_dataset(stage, trainer_cfg.val, atlas_cfg)
         if len(val_dataset) == 0:
+            if stage == "stage1b" or trainer_cfg.val.use_privileged_dataset:
+                raise RuntimeError(
+                    "Validation was requested, but the privileged validation dataset is empty. "
+                    + _missing_privileged_message(stage=stage, data_cfg=trainer_cfg.val)
+                )
             raise RuntimeError("Validation was requested, but the validation dataset is empty.")
         val_loader = _build_loader(
             val_dataset,

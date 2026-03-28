@@ -16,7 +16,7 @@ from ..utils import (
 
 
 def _masked_slot_mean(slots: torch.Tensor, alive: torch.Tensor) -> torch.Tensor:
-    weights = alive.to(dtype=slots.dtype, device=slots.device).unsqueeze(-1)
+    weights = alive.to(dtype=slots.dtype, device=slots.device).clamp(0.0, 1.0).unsqueeze(-1)
     denom = weights.sum(dim=1).clamp(min=1.0)
     return (slots * weights).sum(dim=1) / denom
 

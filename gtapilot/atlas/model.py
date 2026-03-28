@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .config import AtlasConfig
 from .geometry.geometry_lifter import GeometryLifter
@@ -183,7 +184,7 @@ class Atlas(nn.Module):
         recent_valid: torch.Tensor,
         mid_valid: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        cam_now, short_ctx, older_ctx, long_ctx, frame_summary = self._temporal_forward_tuple(
+        temporal_args = (
             cam_tokens_cur,
             state.recent_cam_cache,
             state.recent_dt_cache,
@@ -195,6 +196,21 @@ class Atlas(nn.Module):
             state.mid_dt_cache,
             mid_valid,
         )
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and cam_tokens_cur.device.type == "cuda"
+            and any(tensor.requires_grad for tensor in temporal_args if torch.is_tensor(tensor))
+        ):
+            cam_now, short_ctx, older_ctx, long_ctx, frame_summary = checkpoint(
+                self._temporal_forward_tuple,
+                *temporal_args,
+                use_reentrant=True,
+            )
+        else:
+            cam_now, short_ctx, older_ctx, long_ctx, frame_summary = self._temporal_forward_tuple(
+                *temporal_args
+            )
         return {
             "cam_now": cam_now,
             "short_ctx": short_ctx,
@@ -707,7 +723,9 @@ class Atlas(nn.Module):
         )
         recent_steps = rgb_recent.shape[1]
         action_seq = actions_hist[:, -recent_steps:]
-        dt_seq = dt_recent[:, -recent_steps:]
+        frame_dt_seq = dt_recent[:, -recent_steps:]
+        action_dt_seq = dt_hist[:, -recent_steps:]
+        summary_dt_buffer_state = torch.zeros_like(state.dt_buffer)
         per_step: list[dict[str, torch.Tensor]] = []
         for step_idx in range(recent_steps):
             action_buffer = self._append_keep_last(
@@ -715,19 +733,25 @@ class Atlas(nn.Module):
                 action_seq[:, step_idx : step_idx + 1],
                 self.cfg.action.history_len,
             )
-            dt_buffer = self._append_keep_last(
+            action_dt_buffer = self._append_keep_last(
                 state.dt_buffer,
-                dt_seq[:, step_idx : step_idx + 1],
+                action_dt_seq[:, step_idx : step_idx + 1],
+                self.cfg.action.history_len,
+            )
+            summary_dt_buffer = self._append_keep_last(
+                summary_dt_buffer_state,
+                frame_dt_seq[:, step_idx : step_idx + 1],
                 self.cfg.action.history_len,
             )
             temporal_out, state = self._temporal_only_step(
                 rgb_t=rgb_recent[:, step_idx],
-                dt_t=dt_seq[:, step_idx],
+                dt_t=frame_dt_seq[:, step_idx],
                 state=state,
-                dt_buffer_for_summary=dt_buffer,
+                dt_buffer_for_summary=summary_dt_buffer,
                 need_ctx_8x=True,
             )
-            act_tokens = self.action_encoder(action_buffer, dt_buffer)
+            summary_dt_buffer_state = summary_dt_buffer
+            act_tokens = self.action_encoder(action_buffer, action_dt_buffer)
             ego_out = self.ego_filter(
                 temporal_out["cam_now"],
                 temporal_out["short_ctx"],
@@ -744,7 +768,7 @@ class Atlas(nn.Module):
             state = replace(
                 state,
                 action_buffer=action_buffer,
-                dt_buffer=dt_buffer,
+                dt_buffer=action_dt_buffer,
                 ego_filter_hidden=ego_out["hidden_next"],
                 ego_tokens=ego_out["ego_tokens"],
                 pose_belief=torch.cat(
@@ -823,7 +847,9 @@ class Atlas(nn.Module):
         )
         recent_steps = rgb_recent.shape[1]
         action_seq = actions_hist[:, -recent_steps:]
-        dt_seq = dt_recent[:, -recent_steps:]
+        frame_dt_seq = dt_recent[:, -recent_steps:]
+        action_dt_seq = dt_hist[:, -recent_steps:]
+        summary_dt_buffer_state = torch.zeros_like(state.dt_buffer)
         per_step: list[dict[str, torch.Tensor]] = []
         for step_idx in range(recent_steps):
             action_buffer = self._append_keep_last(
@@ -831,19 +857,29 @@ class Atlas(nn.Module):
                 action_seq[:, step_idx : step_idx + 1],
                 self.cfg.action.history_len,
             )
-            dt_buffer = self._append_keep_last(
+            action_dt_buffer = self._append_keep_last(
                 state.dt_buffer,
-                dt_seq[:, step_idx : step_idx + 1],
+                action_dt_seq[:, step_idx : step_idx + 1],
+                self.cfg.action.history_len,
+            )
+            summary_dt_buffer = self._append_keep_last(
+                summary_dt_buffer_state,
+                frame_dt_seq[:, step_idx : step_idx + 1],
                 self.cfg.action.history_len,
             )
             temporal_out, state = self._temporal_only_step(
                 rgb_t=rgb_recent[:, step_idx],
-                dt_t=dt_seq[:, step_idx],
+                dt_t=frame_dt_seq[:, step_idx],
                 state=state,
-                dt_buffer_for_summary=dt_buffer,
+                dt_buffer_for_summary=summary_dt_buffer,
                 need_ctx_8x=True,
             )
-            act_tokens = self.action_encoder(action_buffer, dt_buffer)
+            summary_dt_buffer_state = summary_dt_buffer
+            temporal_out = self._apply_stage1c_temporal_corruption(
+                temporal_out=temporal_out,
+                corruption=student_corruption,
+            )
+            act_tokens = self.action_encoder(action_buffer, action_dt_buffer)
             ego_out = self.ego_filter(
                 temporal_out["cam_now"],
                 temporal_out["short_ctx"],
@@ -904,12 +940,12 @@ class Atlas(nn.Module):
                 ego_tokens_new=ego_out["ego_tokens"],
                 route_tokens=route_tokens,
                 reasoner_tokens=reasoner_tokens,
-                step_dt_s=dt_seq[:, step_idx],
+                step_dt_s=frame_dt_seq[:, step_idx],
             )
             state = replace(
                 state,
                 action_buffer=action_buffer,
-                dt_buffer=dt_buffer,
+                dt_buffer=action_dt_buffer,
                 static_grid=world_view.static_grid,
                 dynamic_slots=world_view.dynamic_slots,
                 speculative_slots=world_view.speculative_slots,

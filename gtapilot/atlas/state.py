@@ -180,13 +180,13 @@ class AtlasState:
                 batch_size,
                 cfg.world.dynamic_slots,
                 device=device,
-                dtype=torch.bool,
+                dtype=dtype,
             ),
             speculative_slot_alive=torch.zeros(
                 batch_size,
                 cfg.world.speculative_slots,
                 device=device,
-                dtype=torch.bool,
+                dtype=dtype,
             ),
             lane_slots=torch.zeros(
                 batch_size,

@@ -95,6 +95,7 @@ class Stage1CConfig:
     cam_drop_prob: float = 0.1
     frustum_drop_prob: float = 0.1
     context_family_drop_prob: float = 0.05
+    burn_in_recent_steps: int | None = None
     tbptt_steps: int | None = None
     init_checkpoint: str | None = None
 

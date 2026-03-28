@@ -10,6 +10,20 @@ from ..state import AtlasWorldMemoryView
 from ..utils import CrossAttentionBlock, LearnedQueryPool, flatten_hw, sinusoidal_embedding
 
 
+def _alive_weights(alive: torch.Tensor | None, ref: torch.Tensor) -> torch.Tensor | None:
+    if alive is None:
+        return None
+    return alive.to(dtype=ref.dtype, device=ref.device).clamp(0.0, 1.0)
+
+
+def _alive_padding_mask(alive: torch.Tensor | None) -> torch.Tensor | None:
+    if alive is None:
+        return None
+    if alive.dtype == torch.bool:
+        return ~alive
+    return alive <= 1e-4
+
+
 class HorizonConditionedQueries(nn.Module):
     def __init__(self, num_queries: int, dim: int):
         super().__init__()
@@ -155,14 +169,24 @@ class WorldTargetReadout(nn.Module):
         speculative_alive: torch.Tensor | None = None,
     ) -> torch.Tensor:
         static_tokens = flatten_hw(static_grid)
-        dynamic_mask = None if dynamic_alive is None else ~dynamic_alive
-        speculative_mask = None if speculative_alive is None else ~speculative_alive
+        dynamic_weights = _alive_weights(dynamic_alive, dynamic_slots)
+        speculative_weights = _alive_weights(speculative_alive, speculative_slots)
+        if dynamic_weights is not None:
+            dynamic_slots = dynamic_slots * dynamic_weights.unsqueeze(-1)
+        if speculative_weights is not None:
+            speculative_slots = speculative_slots * speculative_weights.unsqueeze(-1)
         return self.norm(
             torch.cat(
                 [
                     self.static_pool(static_tokens),
-                    self.dynamic_pool(dynamic_slots, key_padding_mask=dynamic_mask),
-                    self.speculative_pool(speculative_slots, key_padding_mask=speculative_mask),
+                    self.dynamic_pool(
+                        dynamic_slots,
+                        key_padding_mask=_alive_padding_mask(dynamic_alive),
+                    ),
+                    self.speculative_pool(
+                        speculative_slots,
+                        key_padding_mask=_alive_padding_mask(speculative_alive),
+                    ),
                     self.lane_pool(lane_slots),
                     self.map_pool(map_elem_slots),
                     self.route_pool(route_tokens),

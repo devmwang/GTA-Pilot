@@ -28,11 +28,34 @@ def _resolve_metadata_paths(
     metadata_paths: list[str | Path] | None = None,
     split_file: str | Path | None = None,
 ) -> list[Path]:
+    def _resolve_entry(
+        raw_path: str | Path,
+        *,
+        split_parent: Path | None = None,
+    ) -> Path:
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path.resolve()
+        candidates: list[Path] = []
+        if split_parent is not None:
+            candidates.append(split_parent / path)
+        candidates.append(recordings_root / path)
+        candidates.append(path)
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return candidates[0].resolve()
+
     if metadata_paths is not None:
-        return [Path(path) for path in metadata_paths]
+        return [_resolve_entry(path) for path in metadata_paths]
     if split_file is not None:
-        lines = Path(split_file).read_text(encoding="utf-8").splitlines()
-        return [Path(line.strip()) for line in lines if line.strip()]
+        split_path = Path(split_file).resolve()
+        lines = split_path.read_text(encoding="utf-8").splitlines()
+        return [
+            _resolve_entry(line.strip(), split_parent=split_path.parent)
+            for line in lines
+            if line.strip()
+        ]
     return sorted(recordings_root.glob("capture_*_metadata.json"))
 
 

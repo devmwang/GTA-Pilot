@@ -51,10 +51,20 @@ class WorldMemory(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
+        self.alive_gate_temperature = 0.25
 
     @staticmethod
     def _expand_alive(slots: torch.Tensor, alive: torch.Tensor) -> torch.Tensor:
         return alive.to(dtype=slots.dtype, device=slots.device).unsqueeze(-1)
+
+    @staticmethod
+    def _straight_through_gate(
+        prob: torch.Tensor,
+        *,
+        threshold: float,
+    ) -> torch.Tensor:
+        hard = (prob >= threshold).to(dtype=prob.dtype)
+        return hard + prob - prob.detach()
 
     def forward(
         self,
@@ -226,34 +236,91 @@ class WorldMemory(nn.Module):
 
         dt_dynamic = step_dt_s.expand(-1, n_dyn)
         dt_speculative = step_dt_s.expand(-1, n_spec)
-        dynamic_refreshed = dynamic_refresh >= 0.5
-        speculative_refreshed = speculative_refresh >= 0.55
+        actor_memory_survival_s = float(self.cfg.world.actor_memory_survival_s)
+        stale_dynamic_age = state.dynamic_slot_age_s + dt_dynamic
+        stale_speculative_age = state.speculative_slot_age_s + dt_speculative
+        prev_dynamic_alive = state.dynamic_slot_alive.to(
+            dtype=updated_dynamic.dtype,
+            device=updated_dynamic.device,
+        ).clamp_(0.0, 1.0)
+        prev_speculative_alive = state.speculative_slot_alive.to(
+            dtype=updated_speculative.dtype,
+            device=updated_speculative.device,
+        ).clamp_(0.0, 1.0)
+        if self.training:
+            dynamic_refresh_gate = self._straight_through_gate(
+                dynamic_refresh,
+                threshold=0.5,
+            )
+            speculative_refresh_gate = self._straight_through_gate(
+                speculative_refresh,
+                threshold=0.55,
+            )
+            dynamic_age_s = stale_dynamic_age * (1.0 - dynamic_refresh_gate)
+            speculative_age_s = stale_speculative_age * (1.0 - speculative_refresh_gate)
+            dynamic_survival_prob = torch.sigmoid(
+                (actor_memory_survival_s - dynamic_age_s)
+                / self.alive_gate_temperature
+            )
+            speculative_survival_prob = torch.sigmoid(
+                (actor_memory_survival_s - speculative_age_s)
+                / self.alive_gate_temperature
+            )
+            dynamic_survival_gate = self._straight_through_gate(
+                dynamic_survival_prob,
+                threshold=0.5,
+            )
+            speculative_survival_gate = self._straight_through_gate(
+                speculative_survival_prob,
+                threshold=0.5,
+            )
+            dynamic_alive = torch.maximum(
+                prev_dynamic_alive,
+                dynamic_refresh_gate,
+            ) * dynamic_survival_gate
+            speculative_alive = torch.maximum(
+                prev_speculative_alive,
+                speculative_refresh_gate,
+            ) * speculative_survival_gate
+        else:
+            dynamic_refreshed = dynamic_refresh >= 0.5
+            speculative_refreshed = speculative_refresh >= 0.55
+            dynamic_age_s = torch.where(
+                dynamic_refreshed,
+                torch.zeros_like(state.dynamic_slot_age_s),
+                stale_dynamic_age,
+            )
+            speculative_age_s = torch.where(
+                speculative_refreshed,
+                torch.zeros_like(state.speculative_slot_age_s),
+                stale_speculative_age,
+            )
+            dynamic_alive = (
+                (
+                    prev_dynamic_alive >= 0.5
+                )
+                | dynamic_refreshed
+            ).to(updated_dynamic.dtype) * (
+                dynamic_age_s <= actor_memory_survival_s
+            ).to(updated_dynamic.dtype)
+            speculative_alive = (
+                (
+                    prev_speculative_alive >= 0.5
+                )
+                | speculative_refreshed
+            ).to(updated_speculative.dtype) * (
+                speculative_age_s <= actor_memory_survival_s
+            ).to(updated_speculative.dtype)
 
+        dynamic_alive = dynamic_alive.clamp_(0.0, 1.0)
+        speculative_alive = speculative_alive.clamp_(0.0, 1.0)
         dynamic_age_s = torch.where(
-            dynamic_refreshed,
-            torch.zeros_like(state.dynamic_slot_age_s),
-            state.dynamic_slot_age_s + dt_dynamic,
-        )
-        speculative_age_s = torch.where(
-            speculative_refreshed,
-            torch.zeros_like(state.speculative_slot_age_s),
-            state.speculative_slot_age_s + dt_speculative,
-        )
-
-        dynamic_alive = (state.dynamic_slot_alive | dynamic_refreshed) & (
-            dynamic_age_s <= self.cfg.world.actor_memory_survival_s
-        )
-        speculative_alive = (state.speculative_slot_alive | speculative_refreshed) & (
-            speculative_age_s <= self.cfg.world.actor_memory_survival_s
-        )
-
-        dynamic_age_s = torch.where(
-            dynamic_alive,
+            dynamic_alive > 1e-4,
             dynamic_age_s,
             torch.zeros_like(dynamic_age_s),
         )
         speculative_age_s = torch.where(
-            speculative_alive,
+            speculative_alive > 1e-4,
             speculative_age_s,
             torch.zeros_like(speculative_age_s),
         )

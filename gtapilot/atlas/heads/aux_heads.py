@@ -11,7 +11,7 @@ from ..utils import LearnedQueryPool
 
 
 def _masked_slot_mean(slots: torch.Tensor, alive: torch.Tensor) -> torch.Tensor:
-    weights = alive.to(dtype=slots.dtype, device=slots.device).unsqueeze(-1)
+    weights = alive.to(dtype=slots.dtype, device=slots.device).clamp(0.0, 1.0).unsqueeze(-1)
     denom = weights.sum(dim=1).clamp(min=1.0)
     return (slots * weights).sum(dim=1) / denom
 
@@ -220,20 +220,30 @@ class ActorHead(nn.Module):
         self.spec_future_head = nn.Linear(d_model, cfg.actor.future_steps * 2)
 
     def forward(self, world: AtlasWorldMemoryView) -> dict[str, torch.Tensor]:
+        dynamic_mask = (
+            ~world.dynamic_slot_alive
+            if world.dynamic_slot_alive.dtype == torch.bool
+            else world.dynamic_slot_alive <= 1e-4
+        )
+        speculative_mask = (
+            ~world.speculative_slot_alive
+            if world.speculative_slot_alive.dtype == torch.bool
+            else world.speculative_slot_alive <= 1e-4
+        )
         track_query = self.track_pool(
             world.dynamic_slots,
-            key_padding_mask=~world.dynamic_slot_alive,
+            key_padding_mask=dynamic_mask,
         )
         spec_query = self.spec_pool(
             world.speculative_slots,
-            key_padding_mask=~world.speculative_slot_alive,
+            key_padding_mask=speculative_mask,
         )
-        track_query = track_query * world.dynamic_slot_alive.any(dim=1, keepdim=True).to(
-            track_query.dtype
-        ).unsqueeze(-1)
-        spec_query = spec_query * world.speculative_slot_alive.any(
+        track_query = track_query * world.dynamic_slot_alive.to(track_query.dtype).amax(
             dim=1, keepdim=True
-        ).to(spec_query.dtype).unsqueeze(-1)
+        ).unsqueeze(-1)
+        spec_query = spec_query * world.speculative_slot_alive.to(spec_query.dtype).amax(
+            dim=1, keepdim=True
+        ).unsqueeze(-1)
         batch, queries, _ = track_query.shape
         spec_queries = spec_query.shape[1]
         return {

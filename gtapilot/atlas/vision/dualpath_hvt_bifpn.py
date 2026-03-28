@@ -59,11 +59,12 @@ class DualPathHVTBiFPN(nn.Module):
         fn,
         *args: torch.Tensor,
     ):
+        if not any(isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args):
+            return fn(*args)
         return checkpoint(
             fn,
             *args,
-            use_reentrant=False,
-            determinism_check="none",
+            use_reentrant=True,
         )
 
     def _run_context_path(
@@ -128,8 +129,10 @@ class DualPathHVTBiFPN(nn.Module):
                 self._run_context_path,
                 stem_4x,
             )
-            f8, f16, f32, f64 = self._checkpoint(
-                self._run_neck,
+            # The BiFPN neck hits a CUDA AMP checkpoint/backward bug in practice.
+            # Keep checkpointing on the larger stem/detail/context paths and run
+            # the neck normally to preserve GPU trainability.
+            f8, f16, f32, f64 = self._run_neck(
                 detail_8x,
                 ctx_8x,
                 ctx_16x,

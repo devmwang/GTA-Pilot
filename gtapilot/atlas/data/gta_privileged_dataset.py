@@ -92,6 +92,15 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
         )
         grid_h = int(manifest.grid_height_8x)
         grid_w = int(manifest.grid_width_8x)
+        if (
+            grid_h != int(self.cfg.geometry.grid_h_8x)
+            or grid_w != int(self.cfg.geometry.grid_w_8x)
+        ):
+            raise ValueError(
+                f"Privileged grid shape mismatch for {sample.clip_id}: "
+                f"manifest=({grid_h}, {grid_w}) "
+                f"model=({self.cfg.geometry.grid_h_8x}, {self.cfg.geometry.grid_w_8x})"
+            )
         expected_lags = len(manifest.track_lag_indices)
         expected_shapes = {
             "pose_delta_local": (len(frames), 3),

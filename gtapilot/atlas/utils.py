@@ -319,7 +319,7 @@ def warp_bev(
     assert_rank(grid, 4, "static_grid")
     b, c, h, w = grid.shape
     theta = pose_to_affine(pose_delta, h, w, cell_x_m, cell_y_m)
-    affine_grid = F.affine_grid(theta, size=grid.shape, align_corners=False)
+    affine_grid = F.affine_grid(theta, size=list(grid.shape), align_corners=False)
     return F.grid_sample(grid, affine_grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
 

@@ -421,7 +421,10 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
     def _build_indices(self) -> list[AtlasTemporalClipIndex]:
         cached = load_cached_index(self.index_cache_dir, self._cache_key_payload())
         if cached is not None:
-            return [AtlasTemporalClipIndex(**sample_payload) for sample_payload in cached]
+            return [
+                AtlasTemporalClipIndex.from_dict(sample_payload)
+                for sample_payload in cached
+            ]
 
         samples: list[AtlasTemporalClipIndex] = []
         for metadata_path in self.metadata_paths:

@@ -230,6 +230,11 @@ def main(
             )
 
             if action is not None:
+                action_source = (
+                    "unknown"
+                    if action_message is None
+                    else action_message.envelope.source
+                )
                 _draw_text(
                     frame,
                     "Action "
@@ -242,7 +247,7 @@ def main(
                 pilot_mode = "POLICY" if action.pilot_active >= 0.5 else "MANUAL"
                 _draw_text(
                     frame,
-                    f"Pilot: {pilot_mode} action_source={action_message.envelope.source}",
+                    f"Pilot: {pilot_mode} action_source={action_source}",
                     160,
                     color=(255, 255, 0),
                 )

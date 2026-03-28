@@ -12,6 +12,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
+from ..model import Atlas
 from ..data import (
     AtlasBlackboxClipDataset,
     AtlasPrivilegedClipDataset,
@@ -43,7 +44,7 @@ from .train_config import DataConfig, TrainerConfig
 class StageTrainModule(nn.Module):
     def __init__(
         self,
-        atlas: nn.Module,
+        atlas: Atlas,
         *,
         stage1a_heads: Stage1APretrainHeads | None = None,
         stage1c_heads: Stage1CPretrainHeads | None = None,
@@ -149,12 +150,12 @@ def _build_dataset(
 
 
 def _build_loader(
-    dataset,
+    dataset: AtlasBlackboxClipDataset | AtlasPrivilegedClipDataset,
     data_cfg: DataConfig,
     *,
     shuffle: bool,
     seed: int,
-) -> DataLoader:
+) -> DataLoader[dict[str, Any]]:
     stage1_gpu_loader = (
         isinstance(dataset, (AtlasBlackboxClipDataset, AtlasPrivilegedClipDataset))
         and float(dataset.model_hz) in {24.0, 36.0}
@@ -183,7 +184,7 @@ def _build_loader(
         loader_kwargs["drop_last"] = shuffle
     if data_cfg.num_workers > 0 and data_cfg.prefetch_factor is not None:
         loader_kwargs["prefetch_factor"] = data_cfg.prefetch_factor
-    return DataLoader(**loader_kwargs)
+    return DataLoader(dataset=dataset, **loader_kwargs)
 
 
 def _split_batch(value: Any, start: int, end: int) -> Any:
@@ -234,7 +235,7 @@ def _build_horizons(values: list[float], device: torch.device) -> torch.Tensor:
 
 
 def _forward_stage_model(
-    atlas: nn.Module,
+    atlas: Atlas,
     stage: str,
     *,
     privileged: dict[str, Any] | None = None,
@@ -545,7 +546,7 @@ def _stage1a_forward_loss(
         summary_src, dt_summary = _summary_insert_sequence(
             student["seq"]["frame_summary"],
             batch["dt_recent"],
-            module.atlas.cfg.temporal.summary_stride_steps,
+            int(module.atlas.cfg.temporal.summary_stride_steps),
         )
         preds = module.stage1a_heads(
             cam_src=student["seq"]["cam_now"],
@@ -572,7 +573,7 @@ def _stage1a_forward_loss(
         teacher_summary_src, _ = _summary_insert_sequence(
             teacher["seq"]["frame_summary"],
             batch["dt_recent"],
-            module.atlas.cfg.temporal.summary_stride_steps,
+            int(module.atlas.cfg.temporal.summary_stride_steps),
         )
         targets = build_stage1a_targets(
             teacher_cam_seq=teacher["seq"]["cam_now"].detach(),
@@ -625,7 +626,7 @@ def _stage1b_forward_loss(
         retain_summary_src, dt_summary = _summary_insert_sequence(
             outputs["seq"]["frame_summary"],
             batch["dt_recent"],
-            module.atlas.cfg.temporal.summary_stride_steps,
+            int(module.atlas.cfg.temporal.summary_stride_steps),
         )
         with _autocast_context(device, amp_enabled):
             retain_preds = module.stage1a_heads(
@@ -653,7 +654,7 @@ def _stage1b_forward_loss(
             teacher_summary_src, _ = _summary_insert_sequence(
                 teacher["seq"]["frame_summary"],
                 batch["dt_recent"],
-                module.atlas.cfg.temporal.summary_stride_steps,
+                int(module.atlas.cfg.temporal.summary_stride_steps),
             )
             retain_targets = build_stage1a_targets(
                 teacher_cam_seq=teacher["seq"]["cam_now"].detach(),
@@ -710,7 +711,7 @@ def _stage1c_burn_in_batch(
 
 
 def _stage1c_burn_in_state(
-    atlas: nn.Module,
+    atlas: Atlas,
     burn_in_batch: dict[str, Any] | None,
     data_cfg: DataConfig,
     device: torch.device,
@@ -861,7 +862,9 @@ def _stage1c_forward_loss(
     if "pose_delta_recent" in batch:
         targets["pose_delta_recent"] = batch["pose_delta_recent"]
         targets["kinematics_recent"] = batch["kinematics_recent"]
-        targets["pose_valid_recent"] = batch.get("pose_valid_recent")
+        pose_valid_recent = batch.get("pose_valid_recent")
+        if isinstance(pose_valid_recent, torch.Tensor):
+            targets["pose_valid_recent"] = pose_valid_recent
     loss_inputs = {
         "world_projector_pred": world_pred,
         "static_grid_seq": canonical["static_grid_seq"],

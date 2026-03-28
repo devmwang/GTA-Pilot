@@ -34,3 +34,6 @@ torch = [
 torchvision = [
   { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+
+[tool.ty.src]
+exclude = ["gpt-pro/", "gtapilot/external/json/tools/"]

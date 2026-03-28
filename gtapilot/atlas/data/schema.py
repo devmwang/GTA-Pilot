@@ -142,6 +142,26 @@ class AtlasTemporalClipIndex:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "AtlasTemporalClipIndex":
+        return cls(
+            clip_id=str(payload["clip_id"]),
+            metadata_path=str(payload["metadata_path"]),
+            video_path=str(payload["video_path"]),
+            anchor_timestamp_ns=int(payload["anchor_timestamp_ns"]),
+            target_frame_index=int(payload["target_frame_index"]),
+            recent_frame_indices=[int(value) for value in payload["recent_frame_indices"]],
+            older_frame_indices=[int(value) for value in payload["older_frame_indices"]],
+            mid_frame_indices=[int(value) for value in payload["mid_frame_indices"]],
+            action_entry_indices=[int(value) for value in payload["action_entry_indices"]],
+            action_source=str(payload["action_source"]),
+            nominal_fps=float(payload["nominal_fps"]),
+            frame_source=str(payload["frame_source"]),
+            privileged_dir=(
+                None if payload.get("privileged_dir") is None else str(payload["privileged_dir"])
+            ),
+        )
+
     @property
     def metadata_file(self) -> Path:
         return Path(self.metadata_path)

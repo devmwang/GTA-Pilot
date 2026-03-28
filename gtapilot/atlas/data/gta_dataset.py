@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import bisect
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -11,11 +11,27 @@ from torch.utils.data import Dataset
 
 from ..config import AtlasConfig
 from .index_cache import load_cached_index, save_cached_index
-from .schema import AtlasTemporalClipIndex, BlackboxActionRecord, BlackboxFrameRecord
+from .schema import AtlasTemporalClipIndex
 from .video_decode import decode_rgb_frame_union
 
 RAW_ACTION_SOURCE = "raw_action_stream"
 LEGACY_FRAME_ACTION_SOURCE = "legacy_frame_aligned"
+
+
+@dataclass(slots=True)
+class _ClipTimeline:
+    clip_id: str
+    metadata_path: Path
+    video_path: Path
+    privileged_dir: Path | None
+    nominal_fps: float
+    frame_source: str
+    frame_timestamps_ns: np.ndarray
+    frame_ids: np.ndarray
+    video_frame_indices: np.ndarray
+    frame_action_vectors: np.ndarray | None
+    action_timestamps_ns: np.ndarray | None
+    action_vectors: np.ndarray | None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -130,50 +146,31 @@ def _selected_dt_tensor(
 
 
 def _select_latest_indices(
-    source_timestamps_ns: list[int],
-    desired_timestamps_ns: list[int],
-) -> list[int] | None:
-    selected: list[int] = []
-    for desired_ts in desired_timestamps_ns:
-        source_index = bisect.bisect_right(
-            source_timestamps_ns,
-            desired_ts,
-            0,
-            len(source_timestamps_ns),
-        ) - 1
-        if source_index < 0:
-            return None
-        selected.append(source_index)
-    return selected
+    source_timestamps_ns: Sequence[int] | np.ndarray,
+    desired_timestamps_ns: Sequence[int] | np.ndarray,
+) -> np.ndarray | None:
+    desired = np.asarray(desired_timestamps_ns, dtype=np.int64)
+    if desired.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    source = np.asarray(source_timestamps_ns, dtype=np.int64)
+    indices = np.searchsorted(source, desired, side="right") - 1
+    if np.any(indices < 0):
+        return None
+    return indices.astype(np.int64, copy=False)
 
 
 def _frame_action_vectors(
-    frames: list[BlackboxFrameRecord],
-    indices: list[int],
+    action_vectors: np.ndarray,
+    indices: Sequence[int] | np.ndarray,
 ) -> torch.Tensor:
-    return torch.tensor(
-        np.stack([frames[source_index].action_vector for source_index in indices]),
-        dtype=torch.float32,
-    )
+    return torch.from_numpy(np.asarray(action_vectors[np.asarray(indices, dtype=np.int64)])).float()
 
 
 def _stream_action_vectors(
-    actions: list[BlackboxActionRecord],
-    indices: list[int],
+    action_vectors: np.ndarray,
+    indices: Sequence[int] | np.ndarray,
 ) -> torch.Tensor:
-    return torch.tensor(
-        np.stack([actions[source_index].action_vector for source_index in indices]),
-        dtype=torch.float32,
-    )
-
-
-def _effective_action_timestamps_ns(actions: list[BlackboxActionRecord]) -> list[int]:
-    return [
-        action.message_timestamp_ns
-        if action.message_timestamp_ns > 0
-        else action.publish_timestamp_ns
-        for action in actions
-    ]
+    return torch.from_numpy(np.asarray(action_vectors[np.asarray(indices, dtype=np.int64)])).float()
 
 
 class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
@@ -225,15 +222,13 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             metadata_paths=metadata_paths,
             split_file=split_file,
         )
-        self._manifest_cache: dict[Path, dict[str, Any]] = {}
-        self._frame_cache: dict[Path, list[BlackboxFrameRecord]] = {}
-        self._action_cache: dict[Path, list[BlackboxActionRecord]] = {}
+        self._clip_cache: dict[Path, _ClipTimeline] = {}
         self.samples = self._build_indices()
 
     def _cache_key_payload(self) -> dict[str, Any]:
         payload = {
             "metadata": [_metadata_stat_payload(path) for path in self.metadata_paths],
-            "cache_schema": "atlas_stage1_time_grid_v2",
+            "cache_schema": "atlas_stage1_time_grid_v3_anchor_only",
             "recent_steps": self.recent_steps,
             "older_steps": self.older_steps,
             "mid_steps": self.mid_steps,
@@ -257,68 +252,144 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             ]
         return payload
 
-    def _load_manifest(self, metadata_path: Path) -> dict[str, Any]:
-        if metadata_path not in self._manifest_cache:
-            self._manifest_cache[metadata_path] = _read_json(metadata_path)
-        return self._manifest_cache[metadata_path]
+    def _load_clip_timeline(self, metadata_path: Path) -> _ClipTimeline:
+        metadata_path = metadata_path.resolve()
+        timeline = self._clip_cache.get(metadata_path)
+        if timeline is not None:
+            return timeline
 
-    def _load_frames(self, metadata_path: Path) -> list[BlackboxFrameRecord]:
-        if metadata_path not in self._frame_cache:
-            manifest = self._load_manifest(metadata_path)
-            self._frame_cache[metadata_path] = [
-                BlackboxFrameRecord.from_dict(frame_payload)
-                for frame_payload in manifest.get("frames", [])
-            ]
-        return self._frame_cache[metadata_path]
+        manifest = _read_json(metadata_path)
+        frame_payloads = manifest.get("frames", [])
+        frame_count = len(frame_payloads)
+        clip_id = metadata_path.stem.replace("_metadata", "")
+        video_path = metadata_path.with_name(str(manifest["video_file_name"])).resolve()
+        privileged_dir = metadata_path.with_name(f"{clip_id}_privileged").resolve()
+        privileged_path = privileged_dir if (privileged_dir / "manifest.json").exists() else None
 
-    def _load_actions(self, metadata_path: Path) -> list[BlackboxActionRecord]:
-        if metadata_path not in self._action_cache:
-            manifest = self._load_manifest(metadata_path)
-            records: list[BlackboxActionRecord] = []
-            for action_payload in manifest.get("actions", []):
-                record = BlackboxActionRecord.from_dict(action_payload)
-                if record.message_timestamp_ns > 0 or record.publish_timestamp_ns > 0:
-                    records.append(record)
-            records.sort(
-                key=lambda action: action.message_timestamp_ns
-                if action.message_timestamp_ns > 0
-                else action.publish_timestamp_ns
+        frame_timestamps_ns = np.fromiter(
+            (int(frame_payload["capture_timestamp_ns"]) for frame_payload in frame_payloads),
+            dtype=np.int64,
+            count=frame_count,
+        )
+        frame_ids = np.fromiter(
+            (int(frame_payload.get("frame_id", -1)) for frame_payload in frame_payloads),
+            dtype=np.int64,
+            count=frame_count,
+        )
+        video_frame_indices = np.fromiter(
+            (int(frame_payload["video_frame_index"]) for frame_payload in frame_payloads),
+            dtype=np.int64,
+            count=frame_count,
+        )
+        frame_source = (
+            str(frame_payloads[0].get("frame_source", ""))
+            if frame_payloads
+            else ""
+        )
+        nominal_fps = float(manifest.get("video_nominal_fps", 0.0) or 0.0)
+        if nominal_fps <= 0.0 and frame_payloads:
+            nominal_fps = float(
+                (frame_payloads[0].get("frame_metadata") or {}).get("nominal_fps", 60.0)
             )
-            self._action_cache[metadata_path] = records
-        return self._action_cache[metadata_path]
+        if nominal_fps <= 0.0:
+            nominal_fps = 60.0
+
+        action_payloads = manifest.get("actions", [])
+        action_timestamps_ns: np.ndarray | None = None
+        action_vectors: np.ndarray | None = None
+        if action_payloads:
+            raw_action_timestamps: list[int] = []
+            raw_action_vectors: list[list[float]] = []
+            for action_payload in action_payloads:
+                envelope = action_payload.get("envelope") or {}
+                timestamp_ns = int(
+                    envelope.get("message_timestamp_ns", 0)
+                    or envelope.get("publish_timestamp_ns", 0)
+                    or 0
+                )
+                if timestamp_ns <= 0:
+                    continue
+                vector_payload = action_payload.get("action_vector")
+                if vector_payload is None:
+                    raw_payload = action_payload.get("payload") or {}
+                    vector_payload = [
+                        raw_payload.get("steer", 0.0),
+                        raw_payload.get("throttle", 0.0),
+                        raw_payload.get("brake", 0.0),
+                        raw_payload.get("handbrake", 0.0),
+                        raw_payload.get("reverse", 0.0),
+                        raw_payload.get("pilot_active", 0.0),
+                    ]
+                raw_action_timestamps.append(timestamp_ns)
+                raw_action_vectors.append([float(value) for value in vector_payload])
+            if raw_action_timestamps:
+                action_timestamps_ns = np.asarray(raw_action_timestamps, dtype=np.int64)
+                action_vectors = np.asarray(raw_action_vectors, dtype=np.float32)
+                order = np.argsort(action_timestamps_ns, kind="stable")
+                action_timestamps_ns = action_timestamps_ns[order]
+                action_vectors = action_vectors[order]
+
+        frame_action_vectors: np.ndarray | None = None
+        if action_vectors is None:
+            frame_action_vectors = np.asarray(
+                [frame_payload["action_vector"] for frame_payload in frame_payloads],
+                dtype=np.float32,
+            )
+
+        timeline = _ClipTimeline(
+            clip_id=clip_id,
+            metadata_path=metadata_path,
+            video_path=video_path,
+            privileged_dir=privileged_path,
+            nominal_fps=nominal_fps,
+            frame_source=frame_source,
+            frame_timestamps_ns=frame_timestamps_ns,
+            frame_ids=frame_ids,
+            video_frame_indices=video_frame_indices,
+            frame_action_vectors=frame_action_vectors,
+            action_timestamps_ns=action_timestamps_ns,
+            action_vectors=action_vectors,
+        )
+        self._clip_cache[metadata_path] = timeline
+        return timeline
 
     def _action_source_for_manifest(self, metadata_path: Path) -> str:
-        if self._load_actions(metadata_path):
+        if self._load_clip_timeline(metadata_path).action_timestamps_ns is not None:
             return RAW_ACTION_SOURCE
         return LEGACY_FRAME_ACTION_SOURCE
 
     def _sample_indices_for_clip(
         self,
         *,
-        metadata_path: Path,
-        frames: list[BlackboxFrameRecord],
-        actions: list[BlackboxActionRecord],
-        nominal_fps: float,
+        timeline: _ClipTimeline,
     ) -> list[AtlasTemporalClipIndex]:
-        clip_id = metadata_path.stem.replace("_metadata", "")
-        manifest = self._load_manifest(metadata_path)
-        video_path = metadata_path.with_name(str(manifest["video_file_name"]))
-        frame_timestamps_ns = [frame.capture_timestamp_ns for frame in frames]
+        frame_timestamps_ns = timeline.frame_timestamps_ns
         model_step_ns = _interval_ns(self.model_hz)
         mid_step_ns = _interval_ns(self.mid_hz)
-        grid_origin_ns = frame_timestamps_ns[0]
-        last_anchor_step = max(0, (frame_timestamps_ns[-1] - grid_origin_ns) // model_step_ns)
-        privileged_dir = metadata_path.with_name(f"{clip_id}_privileged")
-        privileged_dir_str = str(privileged_dir) if (privileged_dir / "manifest.json").exists() else None
+        grid_origin_ns = int(frame_timestamps_ns[0])
+        last_anchor_step = max(
+            0,
+            int((int(frame_timestamps_ns[-1]) - grid_origin_ns) // model_step_ns),
+        )
+        privileged_dir_str = (
+            None if timeline.privileged_dir is None else str(timeline.privileged_dir)
+        )
         if self.require_privileged and privileged_dir_str is None:
             return []
         samples: list[AtlasTemporalClipIndex] = []
+        action_timestamps_ns = (
+            timeline.action_timestamps_ns
+            if timeline.action_timestamps_ns is not None
+            else timeline.frame_timestamps_ns
+        )
+        action_source = (
+            RAW_ACTION_SOURCE
+            if timeline.action_timestamps_ns is not None
+            else LEGACY_FRAME_ACTION_SOURCE
+        )
 
         for anchor_step in range(0, int(last_anchor_step) + 1, self.anchor_stride_steps):
             anchor_timestamp_ns = grid_origin_ns + anchor_step * model_step_ns
-            target_frame_index = bisect.bisect_right(frame_timestamps_ns, anchor_timestamp_ns) - 1
-            if target_frame_index < 0:
-                continue
 
             recent_timestamps_ns = [
                 anchor_timestamp_ns - (self.recent_steps - 1 - offset) * model_step_ns
@@ -356,25 +427,15 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             if mid_frame_indices is None:
                 continue
 
-            if actions:
-                action_timestamps_ns = _effective_action_timestamps_ns(actions)
-                action_entry_indices = _select_latest_indices(
-                    action_timestamps_ns,
-                    action_grid_timestamps_ns,
-                )
-                action_source = RAW_ACTION_SOURCE
-            else:
-                action_timestamps_ns = frame_timestamps_ns
-                action_entry_indices = _select_latest_indices(
-                    action_timestamps_ns,
-                    action_grid_timestamps_ns,
-                )
-                action_source = LEGACY_FRAME_ACTION_SOURCE
+            action_entry_indices = _select_latest_indices(
+                action_timestamps_ns,
+                action_grid_timestamps_ns,
+            )
             if action_entry_indices is None:
                 continue
             if action_source == RAW_ACTION_SOURCE:
                 selected_action_timestamps_ns = [
-                    action_timestamps_ns[action_index]
+                    int(action_timestamps_ns[action_index])
                     for action_index in action_entry_indices
                 ]
                 stale_limit_ns = max(model_step_ns * 3, 100_000_000)
@@ -390,18 +451,13 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
 
             samples.append(
                 AtlasTemporalClipIndex(
-                    clip_id=clip_id,
-                    metadata_path=str(metadata_path),
-                    video_path=str(video_path),
+                    clip_id=timeline.clip_id,
+                    metadata_path=str(timeline.metadata_path),
+                    video_path=str(timeline.video_path),
                     anchor_timestamp_ns=int(anchor_timestamp_ns),
-                    target_frame_index=int(target_frame_index),
-                    recent_frame_indices=recent_frame_indices,
-                    older_frame_indices=older_frame_indices,
-                    mid_frame_indices=mid_frame_indices,
-                    action_entry_indices=action_entry_indices,
                     action_source=action_source,
-                    nominal_fps=nominal_fps,
-                    frame_source=frames[target_frame_index].frame_source,
+                    nominal_fps=timeline.nominal_fps,
+                    frame_source=timeline.frame_source,
                     privileged_dir=privileged_dir_str,
                 )
             )
@@ -428,21 +484,12 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
 
         samples: list[AtlasTemporalClipIndex] = []
         for metadata_path in self.metadata_paths:
-            frames = self._load_frames(metadata_path)
-            if not frames:
+            timeline = self._load_clip_timeline(metadata_path)
+            if timeline.frame_timestamps_ns.size == 0:
                 continue
-
-            manifest = self._load_manifest(metadata_path)
-            nominal_fps = float(manifest.get("video_nominal_fps", 0.0) or 0.0)
-            if nominal_fps <= 0.0:
-                nominal_fps = float(frames[0].frame_metadata.get("nominal_fps", 60.0))
-            actions = self._load_actions(metadata_path)
             samples.extend(
                 self._sample_indices_for_clip(
-                    metadata_path=metadata_path,
-                    frames=frames,
-                    actions=actions,
-                    nominal_fps=nominal_fps,
+                    timeline=timeline,
                 )
             )
 
@@ -456,48 +503,130 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _resolve_sample_indices(
+        self,
+        sample: AtlasTemporalClipIndex,
+        timeline: _ClipTimeline,
+    ) -> dict[str, np.ndarray | int]:
+        frame_timestamps_ns = timeline.frame_timestamps_ns
+        model_step_ns = _interval_ns(self.model_hz)
+        mid_step_ns = _interval_ns(self.mid_hz)
+        anchor_timestamp_ns = int(sample.anchor_timestamp_ns)
+
+        recent_timestamps_ns = np.asarray(
+            [
+                anchor_timestamp_ns - (self.recent_steps - 1 - offset) * model_step_ns
+                for offset in range(self.recent_steps)
+            ],
+            dtype=np.int64,
+        )
+        older_timestamps_ns = np.asarray(
+            [
+                anchor_timestamp_ns
+                - (self.recent_steps + self.older_steps - 1 - offset) * model_step_ns
+                for offset in range(self.older_steps)
+            ],
+            dtype=np.int64,
+        )
+        mid_timestamps_ns = np.asarray(
+            [
+                anchor_timestamp_ns
+                - (self.recent_steps + self.older_steps - 1) * model_step_ns
+                - (self.mid_steps - offset) * mid_step_ns
+                for offset in range(self.mid_steps)
+            ],
+            dtype=np.int64,
+        )
+        action_grid_timestamps_ns = np.asarray(
+            [
+                anchor_timestamp_ns - (self.action_steps - 1 - offset) * model_step_ns
+                for offset in range(self.action_steps)
+            ],
+            dtype=np.int64,
+        )
+
+        target_frame_index = int(
+            np.searchsorted(frame_timestamps_ns, anchor_timestamp_ns, side="right") - 1
+        )
+        if target_frame_index < 0:
+            raise IndexError(f"Invalid Atlas sample anchor for clip {sample.clip_id}.")
+
+        recent_frame_indices = _select_latest_indices(frame_timestamps_ns, recent_timestamps_ns)
+        older_frame_indices = _select_latest_indices(frame_timestamps_ns, older_timestamps_ns)
+        mid_frame_indices = _select_latest_indices(frame_timestamps_ns, mid_timestamps_ns)
+        if sample.action_source == RAW_ACTION_SOURCE:
+            if timeline.action_timestamps_ns is None:
+                raise IndexError(f"Raw action stream missing for clip {sample.clip_id}.")
+            action_timestamps_ns: Sequence[int] | np.ndarray = timeline.action_timestamps_ns
+        else:
+            action_timestamps_ns = timeline.frame_timestamps_ns
+        action_entry_indices = _select_latest_indices(action_timestamps_ns, action_grid_timestamps_ns)
+        if (
+            recent_frame_indices is None
+            or older_frame_indices is None
+            or mid_frame_indices is None
+            or action_entry_indices is None
+        ):
+            raise IndexError(f"Atlas sample became invalid for clip {sample.clip_id}.")
+
+        return {
+            "target_frame_index": target_frame_index,
+            "recent_frame_indices": recent_frame_indices,
+            "older_frame_indices": older_frame_indices,
+            "mid_frame_indices": mid_frame_indices,
+            "action_entry_indices": action_entry_indices,
+        }
+
     def _load_rgb_frames(
         self,
-        frames: list[BlackboxFrameRecord],
         video_path: Path,
-        recent_indices: list[int],
-        older_indices: list[int],
-        mid_indices: list[int],
+        video_frame_indices: np.ndarray,
+        recent_indices: Sequence[int] | np.ndarray,
+        older_indices: Sequence[int] | np.ndarray,
+        mid_indices: Sequence[int] | np.ndarray,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        recent_idx = np.asarray(recent_indices, dtype=np.int64)
+        older_idx = np.asarray(older_indices, dtype=np.int64)
+        mid_idx = np.asarray(mid_indices, dtype=np.int64)
         decoded = decode_rgb_frame_union(
             video_path,
             sorted(
                 {
-                    max(0, int(frames[source_index].video_frame_index) - 1)
-                    for source_index in recent_indices + older_indices + mid_indices
+                    max(0, int(video_frame_indices[source_index]) - 1)
+                    for source_index in np.concatenate((recent_idx, older_idx, mid_idx))
                 }
             ),
         )
 
-        def _stack(indices: list[int]) -> torch.Tensor:
+        def _stack(indices: np.ndarray) -> torch.Tensor:
             return torch.stack(
                 [
-                    decoded[max(0, int(frames[source_index].video_frame_index) - 1)]
+                    decoded[max(0, int(video_frame_indices[source_index]) - 1)]
                     for source_index in indices
                 ],
                 dim=0,
             )
 
-        return _stack(recent_indices), _stack(older_indices), _stack(mid_indices)
+        return _stack(recent_idx), _stack(older_idx), _stack(mid_idx)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.samples[index]
-        frames = self._load_frames(sample.metadata_file)
-        actions = self._load_actions(sample.metadata_file)
-        frame_timestamps_ns = [frame.capture_timestamp_ns for frame in frames]
+        timeline = self._load_clip_timeline(sample.metadata_file)
+        selection = self._resolve_sample_indices(sample, timeline)
+        recent_frame_indices = np.asarray(selection["recent_frame_indices"], dtype=np.int64)
+        older_frame_indices = np.asarray(selection["older_frame_indices"], dtype=np.int64)
+        mid_frame_indices = np.asarray(selection["mid_frame_indices"], dtype=np.int64)
+        action_entry_indices = np.asarray(selection["action_entry_indices"], dtype=np.int64)
+        target_frame_index = int(selection["target_frame_index"])
+        frame_timestamps_ns = timeline.frame_timestamps_ns
         model_period_s = 1.0 / max(1.0, float(self.model_hz))
         mid_period_s = 1.0 / max(1.0, float(self.mid_hz))
         rgb_recent, rgb_older, rgb_mid = self._load_rgb_frames(
-            frames,
-            sample.video_file,
-            sample.recent_frame_indices,
-            sample.older_frame_indices,
-            sample.mid_frame_indices,
+            timeline.video_path,
+            timeline.video_frame_indices,
+            recent_frame_indices,
+            older_frame_indices,
+            mid_frame_indices,
         )
 
         batch = {
@@ -506,27 +635,27 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             "video_path": sample.video_path,
             "privileged_dir": sample.privileged_dir,
             "anchor_timestamp_ns": sample.anchor_timestamp_ns,
-            "target_frame_index": sample.target_frame_index,
+            "target_frame_index": target_frame_index,
             "frame_source": sample.frame_source,
             "action_source": sample.action_source,
             "rgb_recent": rgb_recent,
             "dt_recent": _selected_dt_tensor(
                 frame_timestamps_ns,
-                sample.recent_frame_indices,
+                recent_frame_indices,
                 default_dt_s=model_period_s,
-                prev_index=sample.older_frame_indices[-1] if sample.older_frame_indices else None,
+                prev_index=int(older_frame_indices[-1]) if older_frame_indices.size > 0 else None,
             ),
             "rgb_older": rgb_older,
             "dt_older": _selected_dt_tensor(
                 frame_timestamps_ns,
-                sample.older_frame_indices,
+                older_frame_indices,
                 default_dt_s=model_period_s,
-                prev_index=sample.mid_frame_indices[-1] if sample.mid_frame_indices else None,
+                prev_index=int(mid_frame_indices[-1]) if mid_frame_indices.size > 0 else None,
             ),
             "rgb_mid": rgb_mid,
             "dt_mid": _selected_dt_tensor(
                 frame_timestamps_ns,
-                sample.mid_frame_indices,
+                mid_frame_indices,
                 default_dt_s=mid_period_s,
             ),
             "route_polyline": None,
@@ -534,18 +663,32 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             "reasoner_tok": None,
         }
         if sample.action_source == RAW_ACTION_SOURCE:
-            action_timestamps_ns = _effective_action_timestamps_ns(actions)
-            batch["actions_hist"] = _stream_action_vectors(actions, sample.action_entry_indices)
+            if timeline.action_timestamps_ns is None or timeline.action_vectors is None:
+                raise FileNotFoundError(
+                    f"Raw action stream missing for clip {sample.clip_id}: {sample.metadata_path}"
+                )
+            action_timestamps_ns = timeline.action_timestamps_ns
+            batch["actions_hist"] = _stream_action_vectors(
+                timeline.action_vectors,
+                action_entry_indices,
+            )
             batch["dt_hist"] = _selected_dt_tensor(
                 action_timestamps_ns,
-                sample.action_entry_indices,
+                action_entry_indices,
                 default_dt_s=model_period_s,
             )
         else:
-            batch["actions_hist"] = _frame_action_vectors(frames, sample.action_entry_indices)
+            if timeline.frame_action_vectors is None:
+                raise FileNotFoundError(
+                    f"Legacy frame-aligned actions missing for clip {sample.clip_id}: {sample.metadata_path}"
+                )
+            batch["actions_hist"] = _frame_action_vectors(
+                timeline.frame_action_vectors,
+                action_entry_indices,
+            )
             batch["dt_hist"] = _selected_dt_tensor(
                 frame_timestamps_ns,
-                sample.action_entry_indices,
+                action_entry_indices,
                 default_dt_s=model_period_s,
             )
         return batch

@@ -187,6 +187,53 @@ def _build_loader(
     return DataLoader(dataset=dataset, **loader_kwargs)
 
 
+def _estimate_stage1_host_ram_gb(stage: str, atlas_cfg, data_cfg: DataConfig) -> float:
+    if stage not in {"stage1a", "stage1b", "stage1c"}:
+        return 0.0
+    bytes_per_frame = (
+        int(atlas_cfg.image.padded_height)
+        * int(atlas_cfg.image.padded_width)
+        * 3
+    )
+    rgb_frames_per_sample = (
+        int(data_cfg.recent_steps or atlas_cfg.temporal.recent_full_frames)
+        + int(data_cfg.older_steps or atlas_cfg.temporal.older_compressed_frames)
+        + int(data_cfg.mid_steps or atlas_cfg.temporal.mid_summary_frames)
+    )
+    batch_size = max(1, int(data_cfg.batch_size))
+    num_workers = max(0, int(data_cfg.num_workers))
+    prefetch_factor = (
+        max(1, int(data_cfg.prefetch_factor or 2))
+        if num_workers > 0
+        else 1
+    )
+
+    # Conservative host-memory model:
+    # - one full uint8 three-tier sample per batch item
+    # - roughly 3x sample expansion to cover __getitem__ tensors, collate copies,
+    #   and short-lived overlap between decode/cache and batch assembly
+    # - one prefetched batch per worker slot
+    # - one worker-local decoder cache per process, plus a fixed safety margin for
+    #   timelines, sample indices, optimizer state on host, and Python overhead
+    sample_working_bytes = bytes_per_frame * rgb_frames_per_sample * batch_size * 3.0
+    resident_batch_bytes = sample_working_bytes * (1 + num_workers * prefetch_factor)
+    decoder_cache_bytes = bytes_per_frame * 256 * 2 * max(1, num_workers)
+    fixed_overhead_bytes = 4 * 1024**3
+    total_bytes = resident_batch_bytes + decoder_cache_bytes + fixed_overhead_bytes
+    return float(total_bytes) / float(1024**3)
+
+
+def _enforce_stage1_host_ram_budget(stage: str, atlas_cfg, data_cfg: DataConfig) -> None:
+    estimated_gb = _estimate_stage1_host_ram_gb(stage, atlas_cfg, data_cfg)
+    if estimated_gb <= 64.0:
+        return
+    raise RuntimeError(
+        f"{stage} host-RAM estimate is {estimated_gb:.1f} GiB, which exceeds the 64 GiB "
+        "single-process budget. Reduce batch_size, num_workers, or prefetch_factor before "
+        "starting training."
+    )
+
+
 def _split_batch(value: Any, start: int, end: int) -> Any:
     if isinstance(value, torch.Tensor):
         if value.ndim == 0:
@@ -1034,6 +1081,7 @@ def run_training_stage(
                 "Current Stage 1C runtime uses the recent clip length as the TBPTT window. "
                 f"Set tbptt_steps={recent_steps} for this model configuration."
             )
+    _enforce_stage1_host_ram_budget(stage, atlas_cfg, trainer_cfg.train)
     trainer_cfg.save_json(output_dir / "trainer_config.json")
     module.to(device)
 
@@ -1054,6 +1102,7 @@ def run_training_stage(
     val_loader = None
     validation_requested = trainer_cfg.validate_first or trainer_cfg.logging.val_every_steps > 0
     if validation_requested:
+        _enforce_stage1_host_ram_budget(stage, atlas_cfg, trainer_cfg.val)
         if not _has_explicit_source(trainer_cfg.val):
             raise RuntimeError(
                 "Validation was requested, but val.metadata_paths or val.split_file is not configured."

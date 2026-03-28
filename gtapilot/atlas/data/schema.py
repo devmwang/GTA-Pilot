@@ -129,11 +129,6 @@ class AtlasTemporalClipIndex:
     metadata_path: str
     video_path: str
     anchor_timestamp_ns: int
-    target_frame_index: int
-    recent_frame_indices: list[int]
-    older_frame_indices: list[int]
-    mid_frame_indices: list[int]
-    action_entry_indices: list[int]
     action_source: str
     nominal_fps: float
     frame_source: str
@@ -149,11 +144,6 @@ class AtlasTemporalClipIndex:
             metadata_path=str(payload["metadata_path"]),
             video_path=str(payload["video_path"]),
             anchor_timestamp_ns=int(payload["anchor_timestamp_ns"]),
-            target_frame_index=int(payload["target_frame_index"]),
-            recent_frame_indices=[int(value) for value in payload["recent_frame_indices"]],
-            older_frame_indices=[int(value) for value in payload["older_frame_indices"]],
-            mid_frame_indices=[int(value) for value in payload["mid_frame_indices"]],
-            action_entry_indices=[int(value) for value in payload["action_entry_indices"]],
             action_source=str(payload["action_source"]),
             nominal_fps=float(payload["nominal_fps"]),
             frame_source=str(payload["frame_source"]),

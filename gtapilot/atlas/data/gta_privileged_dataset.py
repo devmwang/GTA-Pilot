@@ -60,11 +60,12 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
         return self._privileged_array_cache[privileged_dir]
 
     def _validate_privileged_alignment(self, sample, manifest, arrays: dict[str, np.ndarray]) -> None:
-        frames = self._load_frames(sample.metadata_file)
-        if manifest.frame_count != len(frames):
+        timeline = self._load_clip_timeline(sample.metadata_file)
+        frame_count = int(timeline.frame_timestamps_ns.shape[0])
+        if manifest.frame_count != frame_count:
             raise ValueError(
                 f"Privileged frame_count mismatch for {sample.clip_id}: "
-                f"manifest={manifest.frame_count} source={len(frames)}"
+                f"manifest={manifest.frame_count} source={frame_count}"
             )
         if manifest.source_metadata_file is not None:
             if Path(manifest.source_metadata_file).resolve() != sample.metadata_file.resolve():
@@ -85,11 +86,8 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
                 f"Privileged lag indices mismatch for {sample.clip_id}: "
                 f"{manifest.track_lag_indices} != {list(self.cfg.geometry.track_lag_indices)}"
             )
-        source_frame_ids = np.asarray([frame.frame_id for frame in frames], dtype=np.int64)
-        source_timestamps = np.asarray(
-            [frame.capture_timestamp_ns for frame in frames],
-            dtype=np.int64,
-        )
+        source_frame_ids = np.asarray(timeline.frame_ids, dtype=np.int64)
+        source_timestamps = np.asarray(timeline.frame_timestamps_ns, dtype=np.int64)
         grid_h = int(manifest.grid_height_8x)
         grid_w = int(manifest.grid_width_8x)
         if (
@@ -103,14 +101,14 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
             )
         expected_lags = len(manifest.track_lag_indices)
         expected_shapes = {
-            "pose_delta_local": (len(frames), 3),
-            "kinematics": (len(frames), 4),
-            "ego_valid": (len(frames),),
-            "depth_8x_m": (len(frames), grid_h, grid_w),
-            "depth_valid_8x": (len(frames), grid_h, grid_w),
-            "dynamic_mask_8x": (len(frames), grid_h, grid_w),
-            "track_target_sparse": (len(frames), expected_lags, 2, grid_h, grid_w),
-            "track_valid_sparse": (len(frames), expected_lags, grid_h, grid_w),
+            "pose_delta_local": (frame_count, 3),
+            "kinematics": (frame_count, 4),
+            "ego_valid": (frame_count,),
+            "depth_8x_m": (frame_count, grid_h, grid_w),
+            "depth_valid_8x": (frame_count, grid_h, grid_w),
+            "dynamic_mask_8x": (frame_count, grid_h, grid_w),
+            "track_target_sparse": (frame_count, expected_lags, 2, grid_h, grid_w),
+            "track_valid_sparse": (frame_count, expected_lags, grid_h, grid_w),
             "track_lag_indices": (expected_lags,),
         }
         for key, expected_shape in expected_shapes.items():
@@ -133,7 +131,7 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
                 raise ValueError(
                     f"Privileged frame ids are not strictly increasing for {sample.clip_id}."
                 )
-            if frame_ids.shape[0] != len(frames) or not np.array_equal(frame_ids, source_frame_ids):
+            if frame_ids.shape[0] != frame_count or not np.array_equal(frame_ids, source_frame_ids):
                 raise ValueError(f"Privileged frame-id alignment mismatch for {sample.clip_id}.")
         if "capture_timestamps_ns" in arrays:
             capture_timestamps_ns = np.asarray(arrays["capture_timestamps_ns"], dtype=np.int64)
@@ -141,7 +139,7 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
                 raise ValueError(
                     f"Privileged capture timestamps are not strictly increasing for {sample.clip_id}."
                 )
-            if capture_timestamps_ns.shape[0] != len(frames) or not np.array_equal(
+            if capture_timestamps_ns.shape[0] != frame_count or not np.array_equal(
                 capture_timestamps_ns,
                 source_timestamps,
             ):
@@ -149,11 +147,8 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
                     f"Privileged capture-timestamp alignment mismatch for {sample.clip_id}."
                 )
         if "video_frame_indices" in arrays:
-            source_video_frame_indices = np.asarray(
-                [frame.video_frame_index for frame in frames],
-                dtype=np.int64,
-            )
-            if arrays["video_frame_indices"].shape[0] != len(frames) or not np.array_equal(
+            source_video_frame_indices = np.asarray(timeline.video_frame_indices, dtype=np.int64)
+            if arrays["video_frame_indices"].shape[0] != frame_count or not np.array_equal(
                 np.asarray(arrays["video_frame_indices"], dtype=np.int64),
                 source_video_frame_indices,
             ):
@@ -172,10 +167,10 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
         ):
             if key not in arrays:
                 raise ValueError(f"Privileged array '{key}' missing for {sample.clip_id}.")
-            if int(np.asarray(arrays[key]).shape[0]) != len(frames):
+            if int(np.asarray(arrays[key]).shape[0]) != frame_count:
                 raise ValueError(
                     f"Privileged array '{key}' length mismatch for {sample.clip_id}: "
-                    f"{np.asarray(arrays[key]).shape[0]} != {len(frames)}"
+                    f"{np.asarray(arrays[key]).shape[0]} != {frame_count}"
                 )
         if "track_lag_indices" not in arrays:
             raise ValueError(f"Privileged array 'track_lag_indices' missing for {sample.clip_id}.")
@@ -192,9 +187,11 @@ class AtlasPrivilegedClipDataset(AtlasBlackboxClipDataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         batch = super().__getitem__(index)
         sample = self.samples[index]
+        timeline = self._load_clip_timeline(sample.metadata_file)
+        selection = self._resolve_sample_indices(sample, timeline)
         privileged_dir = self._privileged_dir_for_sample(sample)
         arrays = self._load_privileged_arrays(sample)
-        recent_idx = sample.recent_frame_indices
+        recent_idx = np.asarray(selection["recent_frame_indices"], dtype=np.int64)
         depth_target = torch.from_numpy(np.asarray(arrays["depth_8x_m"][recent_idx])).float().unsqueeze(1)
         depth_valid = torch.from_numpy(np.asarray(arrays["depth_valid_8x"][recent_idx])).bool()
         dynamic_mask = torch.from_numpy(np.asarray(arrays["dynamic_mask_8x"][recent_idx])).bool()

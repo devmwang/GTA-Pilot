@@ -19,6 +19,8 @@ from gtapilot.ipc.settings_registry import (
 )
 
 SETTINGS_REFRESH_INTERVAL_SECONDS = 0.5
+ACTION_ALIGNMENT_HISTORY_SIZE = 32
+ACTION_ALIGNMENT_FUTURE_TOLERANCE_NS = 25_000_000
 WINDOW_NAME = "GTA Pilot Visualization"
 
 
@@ -150,6 +152,29 @@ def _controller_summary_overlay(action) -> str | None:
     )
 
 
+def _aligned_action_message(
+    action_subscriber: ChannelSubscriber,
+    frame_timestamp_ns: int,
+):
+    action_message = action_subscriber.get_latest(
+        before_timestamp_ns=frame_timestamp_ns
+    )
+    if action_message is not None:
+        return action_message
+
+    latest_action_message = action_subscriber.get_latest()
+    if latest_action_message is None:
+        return None
+
+    timestamp_delta_ns = (
+        int(latest_action_message.envelope.message_timestamp_ns)
+        - int(frame_timestamp_ns)
+    )
+    if 0 <= timestamp_delta_ns <= ACTION_ALIGNMENT_FUTURE_TOLERANCE_NS:
+        return latest_action_message
+    return None
+
+
 def main(
     settings_host: str = "127.0.0.1",
     settings_updates_port: str = SETTINGS_UPDATES_PORT,
@@ -157,7 +182,10 @@ def main(
 ):
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     vision_subscriber = ChannelSubscriber(VISION_FRAMES_CHANNEL, latest_only=True)
-    action_subscriber = ChannelSubscriber(INPUT_ACTIONS_CHANNEL, latest_only=True)
+    action_subscriber = ChannelSubscriber(
+        INPUT_ACTIONS_CHANNEL,
+        buffer_size=ACTION_ALIGNMENT_HISTORY_SIZE,
+    )
     settings_client = SettingsClient(
         source_name="visualization",
         host=settings_host,
@@ -196,8 +224,9 @@ def main(
                     pass
                 last_settings_refresh = now
 
-            action_message = action_subscriber.get_latest(
-                before_timestamp_ns=frame_capture_timestamp_ns(packet)
+            action_message = _aligned_action_message(
+                action_subscriber,
+                frame_capture_timestamp_ns(packet),
             )
             action = None if action_message is None else action_message.payload
             blackbox_enabled = bool(settings_client.get("blackbox.enabled", False))

@@ -84,25 +84,17 @@ def _enumerate_monitors() -> list[MonitorBounds]:
 
 def _pick_visualization_monitor(
     monitors: list[MonitorBounds],
-    capture_display_id: int | None,
 ) -> MonitorBounds | None:
     if len(monitors) <= 1:
         return None
-    if capture_display_id is not None and 0 <= capture_display_id < len(monitors):
-        for index, monitor in enumerate(monitors):
-            if index != capture_display_id:
-                return monitor
     for monitor in monitors:
         if not monitor.is_primary:
             return monitor
     return monitors[1]
 
 
-def _position_visualization_window(capture_display_id: int | None) -> None:
-    target_monitor = _pick_visualization_monitor(
-        _enumerate_monitors(),
-        capture_display_id,
-    )
+def _position_visualization_window() -> None:
+    target_monitor = _pick_visualization_monitor(_enumerate_monitors())
     if target_monitor is None:
         return
     cv2.moveWindow(
@@ -162,7 +154,6 @@ def main(
     settings_host: str = "127.0.0.1",
     settings_updates_port: str = SETTINGS_UPDATES_PORT,
     settings_rpc_port: str = SETTINGS_RPC_PORT,
-    capture_display_id: int | None = None,
 ):
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     vision_subscriber = ChannelSubscriber(VISION_FRAMES_CHANNEL, latest_only=True)
@@ -220,15 +211,30 @@ def main(
                 packet.envelope.metadata.get("nominal_fps", 0.0) or 0.0
             )
             is_repeat = bool(packet.envelope.metadata.get("is_repeat", False))
+            capture_mode = str(
+                packet.envelope.metadata.get("capture_mode", "unknown")
+            )
+            target_window_title = str(
+                packet.envelope.metadata.get("target_window_title", "")
+            )
 
             _draw_text(frame, f"FPS: {fps:.2f} nominal={frame_nominal_fps:.2f}", 40)
             _draw_text(
                 frame,
                 f"Frame {packet.envelope.metadata.get('frame_id', '?')} "
                 f"capture={packet.envelope.metadata.get('capture_frame_id', '?')} "
-                f"source={packet.envelope.source} repeat={1 if is_repeat else 0}",
+                f"mode={capture_mode} repeat={1 if is_repeat else 0}",
                 80,
             )
+            if target_window_title:
+                _draw_text(
+                    frame,
+                    f"Target: {target_window_title}",
+                    120,
+                )
+                action_base_y = 160
+            else:
+                action_base_y = 120
 
             if action is not None:
                 action_source = (
@@ -242,20 +248,20 @@ def main(
                     f"steer={action.steer:+.1f} throttle={action.throttle:.1f} "
                     f"brake={action.brake:.1f} handbrake={action.handbrake:.1f} "
                     f"reverse={action.reverse:.1f}",
-                    120,
+                    action_base_y,
                     color=(255, 255, 0),
                 )
                 pilot_mode = "POLICY" if action.pilot_active >= 0.5 else "MANUAL"
                 _draw_text(
                     frame,
                     f"Pilot: {pilot_mode} action_source={action_source}",
-                    160,
+                    action_base_y + 40,
                     color=(255, 255, 0),
                 )
                 _draw_text(
                     frame,
                     _input_device_overlay(action),
-                    200,
+                    action_base_y + 80,
                     color=(255, 255, 0),
                 )
                 controller_summary = _controller_summary_overlay(action)
@@ -263,9 +269,14 @@ def main(
                     _draw_text(
                         frame,
                         controller_summary,
-                        240,
+                        action_base_y + 120,
                         color=(255, 255, 0),
                     )
+                    blackbox_y = action_base_y + 160
+                else:
+                    blackbox_y = action_base_y + 120
+            else:
+                blackbox_y = action_base_y
 
             capture_text, capture_color = _capture_overlay(
                 blackbox_enabled,
@@ -275,12 +286,12 @@ def main(
             _draw_text(
                 frame,
                 capture_text,
-                280 if action is not None else 200,
+                blackbox_y,
                 color=capture_color,
             )
 
             if not window_positioned:
-                _position_visualization_window(capture_display_id)
+                _position_visualization_window()
                 window_positioned = True
 
             cv2.imshow(WINDOW_NAME, frame)

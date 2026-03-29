@@ -30,7 +30,7 @@ sources only:
 Processes currently in the live graph:
 
 - settings runtime service
-- native DX11 display capture or Python video override
+- native GTA window capture or Python video override
 - generalized manual input capture
 - visualization
 - optional blackbox recorder
@@ -68,10 +68,12 @@ What it does **not** do yet:
 
 Current practical assumptions:
 
-- Windows for the native DX11 desktop capture path
+- Windows for the native GTA window capture path
 - Python `3.13`
 - `uv` for environment management
 - `ffmpeg` on `PATH` if `BLACKBOX_ENABLED = True`
+- GTA V running in borderless or windowed mode with a title containing
+  `Grand Theft Auto V`
 
 Install the project:
 
@@ -81,11 +83,11 @@ uv pip install -e .
 ```
 
 If you only want to exercise the pipeline with a prerecorded clip instead of
-live desktop capture, `--video-override` is the easiest path.
+live GTA window capture, `--video-override` is the easiest path.
 
-## Build The Native DX11 Capture Module
+## Build The Native GTA Window Capture Module
 
-The live capture path depends on the native DX11 desktop duplication binary:
+The live capture path depends on the native GTA window capture binary:
 
 ```text
 bin/DisplayCaptureDX11.exe
@@ -143,7 +145,7 @@ capture module.
 
 ## How To Use It
 
-### 1. Live desktop capture
+### 1. Live GTA window capture
 
 Run the coordinator:
 
@@ -159,18 +161,14 @@ By default the coordinator starts:
 - `Visualization`
 - `Blackbox` only if enabled in config
 
-If you need a different monitor:
-
-```bash
-uv run ./gtapilot/main.py --display-id 0
-```
-
 The live capture path uses the native DX11 executable in
 `bin/DisplayCaptureDX11.exe` by default.
 
-The live desktop capture process publishes a fixed 60 Hz `vision.frames`
-stream. When the desktop duplication API has no fresh frame for a given
-deadline, it republishes the latest RGB frame with `is_repeat = true`.
+The live capture process targets the GTA V window by title using Windows
+Graphics Capture and publishes a fixed 60 Hz `vision.frames` stream. If the
+runtime cannot find the GTA window at startup, or if the window later becomes
+invalid or minimized, the capture worker exits fatally and the coordinator
+shuts down the full system.
 
 ### 2. Video override
 
@@ -180,7 +178,7 @@ To test the pipeline without GTA running, feed it a local video file:
 uv run ./gtapilot/main.py --video-override path/to/video.mp4
 ```
 
-This replaces live desktop capture with OpenCV video decode while keeping the
+This replaces live GTA window capture with OpenCV video decode while keeping the
 rest of the runtime the same.
 
 The override path also publishes a fixed 60 Hz `vision.frames` stream. Lower
@@ -212,6 +210,9 @@ metadata includes:
 - `publish_timestamp_ns`
 - `source`
 - `is_repeat`
+- `capture_mode`
+- `target_window_title`
+- `target_window_hwnd`
 - `pipeline_stats` for native live-capture overload telemetry
 - `w`
 - `h`
@@ -301,7 +302,7 @@ and visualization processes read the latest value from the shared settings
 service.
 
 When multiple monitors are available, the visualization window is moved to a
-monitor other than the captured display by default.
+non-primary monitor by default when possible.
 
 Recordings are written to:
 
@@ -498,7 +499,7 @@ project.
 ## Notes And Limitations
 
 - The runtime is currently a capture/recording system, not an end-to-end autonomy stack.
-- The DX11 desktop capture path is the main live capture path; Python video override is mainly for testing.
+- The native GTA window capture path is the main live capture path; Python video override is mainly for testing.
 - The action stream reflects human input intent, not authoritative in-game vehicle state.
 - Blackbox pre-roll is in-memory only; if the process dies before recording is toggled on, that buffered data is lost.
 - Privileged labels and GTA-native state extraction will come later through a separate ScriptHook-based pipeline.

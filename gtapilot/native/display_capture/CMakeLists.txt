@@ -31,6 +31,8 @@ target_link_libraries(${TARGET_NAME}
         d3d11
         dxgi
         dxguid
+        runtimeobject
+        windowsapp
         winmm
         ${_extra_win_sock_libs}
 )

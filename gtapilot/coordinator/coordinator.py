@@ -11,7 +11,7 @@ from gtapilot.coordinator.process import BaseProcess, PythonProcess, ExecutableP
 
 
 def build_processes(
-    video_override: Optional[str] = None, display_id: Optional[int] = None
+    video_override: Optional[str] = None,
 ) -> List[BaseProcess]:
     procs: List[BaseProcess] = [
         PythonProcess(
@@ -28,9 +28,6 @@ def build_processes(
             )
         )
     else:
-        exe_args: list[str] = []
-        if display_id is not None:
-            exe_args = ["--display-id", str(display_id)]
         procs.append(
             ExecutableProcess(
                 "DisplayCaptureDX11",
@@ -41,7 +38,6 @@ def build_processes(
                         / "DisplayCaptureDX11.exe"
                     )
                 ),
-                args=exe_args,
             )
         )
 
@@ -57,7 +53,6 @@ def build_processes(
         PythonProcess(
             "Visualization",
             "gtapilot.visualization.visualization",
-            {"capture_display_id": display_id},
         )
     )
 
@@ -66,7 +61,7 @@ def build_processes(
     return procs
 
 
-def main(video_override: Optional[str] = None, display_id: Optional[int] = None):
+def main(video_override: Optional[str] = None):
     """Coordinator entrypoint (supervisor model).
 
     Starts all subsystem processes and monitors them. Any of these conditions
@@ -77,7 +72,7 @@ def main(video_override: Optional[str] = None, display_id: Optional[int] = None)
     Remaining processes are forcefully terminated (terminate + join timeout).
     """
 
-    processes = build_processes(video_override=video_override, display_id=display_id)
+    processes = build_processes(video_override=video_override)
 
     print("[Coordinator] Launching processes: " + ", ".join(p.name for p in processes))
 

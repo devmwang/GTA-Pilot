@@ -5,7 +5,7 @@ Audience: coding agents working inside this repository.
 Goal (current codebase): maintain and extend the Atlas-oriented runtime and data
 collection stack:
 
-display capture OR video override -> generic channel IPC -> visualization / blackbox
+GTA window capture OR video override -> generic channel IPC -> visualization / blackbox
 generalized manual input capture -> generic channel IPC -> visualization / blackbox
 
 The current runtime only records and consumes inference-time sources:
@@ -26,7 +26,7 @@ present them as already implemented.
 - Atlas scaffolding exists under `gtapilot/atlas`.
 - PyTorch and torchvision are now project dependencies.
 - Runtime stack is still multi-process and ZeroMQ-based.
-- Live capture is primarily the native Windows DX11 executable in `bin/`.
+- Live capture is primarily the native Windows WGC/D3D11 executable in `bin/`.
 - Python video override remains for offline testing, but live capture is the
   native DX11 path.
 
@@ -45,9 +45,6 @@ uv run ./gtapilot/main.py
 
 # Video override instead of live capture
 uv run ./gtapilot/main.py --video-override path/to/video.mp4
-
-# Select display index explicitly
-uv run ./gtapilot/main.py --display-id 0
 ```
 
 Shutdown triggers:
@@ -72,8 +69,10 @@ Current worker set:
 
 2. `DisplayCaptureDX11`
    Native executable `bin/DisplayCaptureDX11.exe`
-   Live desktop capture on Windows, publishes a fixed 60 Hz RGB stream to the
-   `vision.frames` channel.
+   Live GTA window capture on Windows via Windows Graphics Capture. Targets the
+   top-level GTA V window by title, publishes a fixed 60 Hz RGB stream to
+   `vision.frames`, and exits fatally if the target window cannot be found,
+   becomes invalid, or is minimized.
 
 3. `DisplayOverride`
    `gtapilot.display_capture.display_override.main`
@@ -155,6 +154,9 @@ Vision payload contract:
   - `nominal_fps`
   - `capture_timestamp_ns`
   - `is_repeat`
+  - `capture_mode`
+  - `target_window_title`
+  - `target_window_hwnd`
   - optional `pipeline_stats` for native overload telemetry
 
 Action payload contract:

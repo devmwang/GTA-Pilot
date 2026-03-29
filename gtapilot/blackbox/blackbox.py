@@ -37,7 +37,7 @@ from gtapilot.ipc.types import (
 )
 
 DEFAULT_OUTPUT_DIR = Path("blackbox-recordings")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 PREROLL_JPEG_QUALITY = 85
 SETTINGS_REFRESH_INTERVAL_SECONDS = 0.5
 VIDEO_CODEC = "libx264"
@@ -55,6 +55,10 @@ RECORDER_ACTION_RCVHWM = 128
 POLL_TIMEOUT_MS = 100
 VISION_DRAIN_BATCH_LIMIT = 4
 ACTION_DRAIN_BATCH_LIMIT = 128
+PREROLL_FRAME_BUFFER_HEADROOM = 8
+PREROLL_ACTION_BUFFER_HEADROOM = 32
+INGEST_MODE_INACTIVE = "inactive"
+INGEST_MODE_ACTIVE = "active"
 
 T = TypeVar("T")
 
@@ -112,6 +116,13 @@ class FrameWriteTask:
     aligned_action: AlignedActionData
     subscriber_received_timestamp_ns: int
     subscriber_queue_latency_ns: int
+
+
+@dataclass(slots=True)
+class RawSocketMessage:
+    envelope: ChannelEnvelope
+    payload_bytes: bytes
+    subscriber_received_timestamp_ns: int
 
 
 def _build_session_paths(output_dir: Path) -> BlackboxSessionPaths:
@@ -332,6 +343,43 @@ def _percentile_ns(values: list[int], percentile: float) -> int:
     return int(round(lower + (upper - lower) * blend))
 
 
+def _timing_summary_ns(values: list[int]) -> dict[str, int]:
+    if not values:
+        return {"count": 0, "p50": 0, "p95": 0, "max": 0}
+    normalized = [max(0, int(value)) for value in values]
+    return {
+        "count": int(len(normalized)),
+        "p50": _percentile_ns(normalized, 50.0),
+        "p95": _percentile_ns(normalized, 95.0),
+        "max": max(normalized),
+    }
+
+
+def _preroll_frame_capacity(preroll_seconds: float) -> int:
+    return max(
+        1,
+        int(round(max(0.0, float(preroll_seconds)) * 60.0))
+        + PREROLL_FRAME_BUFFER_HEADROOM,
+    )
+
+
+def _preroll_action_capacity(preroll_seconds: float) -> int:
+    return max(
+        1,
+        int(round(max(0.0, float(preroll_seconds)) * 60.0))
+        + PREROLL_ACTION_BUFFER_HEADROOM,
+    )
+
+
+def _frame_timestamp_ns_from_envelope(envelope: ChannelEnvelope) -> int:
+    return int(
+        envelope.metadata.get(
+            "capture_timestamp_ns",
+            envelope.message_timestamp_ns,
+        )
+    )
+
+
 def _build_sub_socket(
     context: zmq.Context,
     spec: ChannelSpec,
@@ -406,6 +454,54 @@ def _frame_gap_stats(frame_payloads: list[dict[str, Any]]) -> dict[str, int]:
         "published_gap_total": int(published_gap_total),
         "capture_gap_count": int(capture_gap_count),
         "capture_gap_total": int(capture_gap_total),
+    }
+
+
+def _native_capture_timing_summary(
+    frame_payloads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    latest_pipeline_stats: dict[str, Any] = {}
+    sample_capture_frame_id: int | None = None
+    frame_arrival_wait_ns: list[int] = []
+    gpu_readback_ns: list[int] = []
+    cpu_convert_ns: list[int] = []
+    publish_deadline_lag_ns: list[int] = []
+
+    for frame_payload in frame_payloads:
+        pipeline_stats = (frame_payload.get("frame_metadata") or {}).get("pipeline_stats")
+        if not isinstance(pipeline_stats, dict):
+            continue
+        latest_pipeline_stats = dict(pipeline_stats)
+        current_sample_capture_frame_id = int(
+            pipeline_stats.get(
+                "sample_capture_frame_id",
+                frame_payload.get("capture_frame_id", frame_payload.get("frame_id", -1)),
+            )
+        )
+        if (
+            sample_capture_frame_id is not None
+            and current_sample_capture_frame_id == sample_capture_frame_id
+        ):
+            continue
+        sample_capture_frame_id = current_sample_capture_frame_id
+
+        for bucket, key in (
+            (frame_arrival_wait_ns, "frame_arrival_wait_ns"),
+            (gpu_readback_ns, "gpu_readback_ns"),
+            (cpu_convert_ns, "cpu_convert_ns"),
+            (publish_deadline_lag_ns, "publish_deadline_lag_ns"),
+        ):
+            value = pipeline_stats.get(key)
+            if value is not None:
+                bucket.append(int(value))
+
+    return {
+        "sample_count": int(len(frame_arrival_wait_ns)),
+        "frame_arrival_wait_ns": _timing_summary_ns(frame_arrival_wait_ns),
+        "gpu_readback_ns": _timing_summary_ns(gpu_readback_ns),
+        "cpu_convert_ns": _timing_summary_ns(cpu_convert_ns),
+        "publish_deadline_lag_ns": _timing_summary_ns(publish_deadline_lag_ns),
+        "latest_pipeline_stats": latest_pipeline_stats,
     }
 
 
@@ -830,6 +926,12 @@ class BlackboxRecorder:
         self._session_drop_events: list[dict[str, Any]] = []
         self._session_native_overload_active = False
         self._session_created_timestamp_ns = 0
+        self._vision_frames_decoded_total = 0
+        self._vision_frames_decoded_while_inactive = 0
+        self._session_vision_frames_decoded_baseline = 0
+        self._session_vision_frames_decoded_while_inactive_baseline = 0
+        self._last_session_performance_stats: dict[str, Any] = {}
+        self._current_ingest_mode = INGEST_MODE_ACTIVE
 
         initial_recording_setting = self._refresh_runtime_settings()
         if initial_recording_setting is not None:
@@ -838,6 +940,7 @@ class BlackboxRecorder:
             self.recording_setting_updated_timestamp_ns = int(
                 initial_recording_setting.updated_timestamp_ns
             )
+        self._current_ingest_mode = self._ingest_mode_for(self.recording_enabled)
 
     def _session_active(self) -> bool:
         return (
@@ -845,6 +948,16 @@ class BlackboxRecorder:
             and self.paths is not None
             and self.session_config is not None
         )
+
+    def _ingest_mode_for(self, recording_enabled: bool) -> str:
+        if bool(recording_enabled) or self.preroll_ns > 0:
+            return INGEST_MODE_ACTIVE
+        return INGEST_MODE_INACTIVE
+
+    def _clear_preroll_buffers(self) -> None:
+        self.preroll_frames.clear()
+        self.preroll_actions.clear()
+        self.preroll_transport_events.clear()
 
     def _refresh_runtime_settings(self) -> SettingValue | None:
         now = time.monotonic()
@@ -881,6 +994,10 @@ class BlackboxRecorder:
     def _handle_transport_event(self, event: ChannelTransportEvent) -> None:
         if not self._session_active():
             self.preroll_transport_events.append(event)
+            while len(self.preroll_transport_events) > _preroll_action_capacity(
+                self.preroll_seconds
+            ):
+                self.preroll_transport_events.popleft()
             return
         self._session_drop_events.append(event.to_dict())
 
@@ -911,13 +1028,13 @@ class BlackboxRecorder:
             )
         self._session_native_overload_active = overload_active
 
-    def _recv_message(
+    def _recv_raw_message(
         self,
         socket: zmq.Socket,
         *,
         spec: ChannelSpec,
         transport_tracker: ChannelTransportTracker,
-    ) -> ChannelMessage[Any] | None:
+    ) -> RawSocketMessage | None:
         try:
             topic, envelope_bytes, payload_bytes = socket.recv_multipart(flags=zmq.NOBLOCK)
         except zmq.Again:
@@ -933,25 +1050,42 @@ class BlackboxRecorder:
             timestamp_ns=subscriber_received_timestamp_ns,
         )
         transport_tracker.dispatch_pending_callbacks()
-        return ChannelMessage(
+        return RawSocketMessage(
             envelope=envelope,
-            payload=spec.codec.decode(payload_bytes, envelope),
+            payload_bytes=payload_bytes,
             subscriber_received_timestamp_ns=subscriber_received_timestamp_ns,
         )
 
-    def _drain_messages(
+    def _decode_raw_message(
+        self,
+        raw_message: RawSocketMessage,
+        *,
+        spec: ChannelSpec,
+    ) -> ChannelMessage[Any]:
+        decoded_message = ChannelMessage(
+            envelope=raw_message.envelope,
+            payload=spec.codec.decode(raw_message.payload_bytes, raw_message.envelope),
+            subscriber_received_timestamp_ns=raw_message.subscriber_received_timestamp_ns,
+        )
+        if spec.name == self.vision_channel.name:
+            self._vision_frames_decoded_total += 1
+            if self._current_ingest_mode == INGEST_MODE_INACTIVE:
+                self._vision_frames_decoded_while_inactive += 1
+        return decoded_message
+
+    def _drain_raw_messages(
         self,
         socket: zmq.Socket,
         *,
         spec: ChannelSpec,
         transport_tracker: ChannelTransportTracker,
         max_messages: int | None = None,
-    ) -> list[ChannelMessage[Any]]:
-        messages: list[ChannelMessage[Any]] = []
+    ) -> list[RawSocketMessage]:
+        messages: list[RawSocketMessage] = []
         while True:
             if max_messages is not None and len(messages) >= max_messages:
                 break
-            message = self._recv_message(
+            message = self._recv_raw_message(
                 socket,
                 spec=spec,
                 transport_tracker=transport_tracker,
@@ -961,11 +1095,27 @@ class BlackboxRecorder:
             messages.append(message)
         return messages
 
+    def _discard_socket_backlog(
+        self,
+        socket: zmq.Socket,
+        *,
+        spec: ChannelSpec,
+        transport_tracker: ChannelTransportTracker,
+    ) -> None:
+        while True:
+            if (
+                self._recv_raw_message(
+                    socket,
+                    spec=spec,
+                    transport_tracker=transport_tracker,
+                )
+                is None
+            ):
+                break
+
     def _prune_preroll(self, reference_timestamp_ns: int) -> None:
         if self.preroll_ns <= 0:
-            self.preroll_frames.clear()
-            self.preroll_actions.clear()
-            self.preroll_transport_events.clear()
+            self._clear_preroll_buffers()
             return
 
         cutoff_timestamp_ns = reference_timestamp_ns - self.preroll_ns
@@ -1018,6 +1168,8 @@ class BlackboxRecorder:
                 ),
             )
         )
+        while len(self.preroll_frames) > _preroll_frame_capacity(self.preroll_seconds):
+            self.preroll_frames.popleft()
 
     def _frame_task_from_message(
         self,
@@ -1104,6 +1256,12 @@ class BlackboxRecorder:
         self._session_drop_events = []
         self._session_native_overload_active = False
         self._session_created_timestamp_ns = time.time_ns()
+        self._session_vision_frames_decoded_baseline = int(
+            self._vision_frames_decoded_total
+        )
+        self._session_vision_frames_decoded_while_inactive_baseline = int(
+            self._vision_frames_decoded_while_inactive
+        )
         self._session_transport_baselines = {
             "vision": self.vision_transport_tracker.snapshot(),
             "actions": self.action_transport_tracker.snapshot(),
@@ -1148,7 +1306,10 @@ class BlackboxRecorder:
         )
         fresh_capture_frame_count = 0
         last_capture_frame_id: int | None = None
-        native_pipeline_summary: dict[str, Any] = {}
+        native_capture_performance = _native_capture_timing_summary(frame_payloads)
+        native_pipeline_summary = dict(
+            native_capture_performance.get("latest_pipeline_stats", {})
+        )
         for frame_payload in frame_payloads:
             capture_frame_id = int(
                 frame_payload.get("capture_frame_id", frame_payload.get("frame_id", -1))
@@ -1156,9 +1317,6 @@ class BlackboxRecorder:
             if last_capture_frame_id is None or capture_frame_id != last_capture_frame_id:
                 fresh_capture_frame_count += 1
                 last_capture_frame_id = capture_frame_id
-            pipeline_stats = (frame_payload.get("frame_metadata") or {}).get("pipeline_stats")
-            if isinstance(pipeline_stats, dict):
-                native_pipeline_summary = dict(pipeline_stats)
 
         integrity_degraded = bool(drop_events)
         integrity_degraded = integrity_degraded or bool(
@@ -1170,6 +1328,43 @@ class BlackboxRecorder:
             or writer_stats["action_queue_dropped_entries"]
             or native_pipeline_summary.get("missed_publish_deadlines", 0)
         )
+
+        performance_stats = {
+            "native_capture": native_capture_performance,
+            "blackbox_ingest": {
+                "session_mode": INGEST_MODE_ACTIVE,
+                "vision_frames_decoded_total": max(
+                    0,
+                    int(self._vision_frames_decoded_total)
+                    - int(self._session_vision_frames_decoded_baseline),
+                ),
+                "vision_frames_decoded_while_inactive": int(
+                    max(
+                        0,
+                        int(self._vision_frames_decoded_while_inactive)
+                        - int(
+                            self._session_vision_frames_decoded_while_inactive_baseline
+                        ),
+                    )
+                ),
+            },
+            "writer": {
+                "writer_lag_ns": dict(writer_stats.get("writer_lag_ns", {})),
+                "frame_queue_max_depth": int(
+                    writer_stats.get("frame_queue_max_depth", 0)
+                ),
+                "frame_queue_dropped_frames": int(
+                    writer_stats.get("frame_queue_dropped_frames", 0)
+                ),
+                "action_queue_max_depth": int(
+                    writer_stats.get("action_queue_max_depth", 0)
+                ),
+                "action_queue_dropped_entries": int(
+                    writer_stats.get("action_queue_dropped_entries", 0)
+                ),
+            },
+        }
+        self._last_session_performance_stats = performance_stats
 
         return {
             "schema_version": SCHEMA_VERSION,
@@ -1200,6 +1395,7 @@ class BlackboxRecorder:
                 **gap_stats,
                 "native_pipeline": native_pipeline_summary,
             },
+            "performance_stats": performance_stats,
             "transport_stats": transport_stats,
             "writer_stats": writer_stats,
             "drop_events": drop_events,
@@ -1243,6 +1439,12 @@ class BlackboxRecorder:
             self._session_drop_events = []
             self._session_native_overload_active = False
             self._session_created_timestamp_ns = 0
+            self._session_vision_frames_decoded_baseline = int(
+                self._vision_frames_decoded_total
+            )
+            self._session_vision_frames_decoded_while_inactive_baseline = int(
+                self._vision_frames_decoded_while_inactive
+            )
 
     def _roll_session_if_needed(self, frame_message: ChannelMessage[np.ndarray]) -> None:
         frame_config = _frame_config_from_message(frame_message)
@@ -1278,6 +1480,10 @@ class BlackboxRecorder:
             self._enqueue_action_message(action_message)
         else:
             self.preroll_actions.append(action_message)
+            while len(self.preroll_actions) > _preroll_action_capacity(
+                self.preroll_seconds
+            ):
+                self.preroll_actions.popleft()
         self.latest_action_message = action_message
 
     def _handle_frame_message(
@@ -1322,6 +1528,26 @@ class BlackboxRecorder:
 
         self._prune_preroll(frame_timestamp_ns)
         return next_action_cursor
+
+    def _enter_inactive_ingest(self) -> None:
+        if self._session_active():
+            self.stop_session()
+        self.latest_action_message = None
+        self._clear_preroll_buffers()
+
+    def _enter_active_ingest(self) -> None:
+        self.latest_action_message = None
+        self._clear_preroll_buffers()
+        self._discard_socket_backlog(
+            self.action_socket,
+            spec=self.action_channel,
+            transport_tracker=self.action_transport_tracker,
+        )
+        self._discard_socket_backlog(
+            self.vision_socket,
+            spec=self.vision_channel,
+            transport_tracker=self.vision_transport_tracker,
+        )
 
     def close(self) -> None:
         stop_error: Exception | None = None
@@ -1370,15 +1596,39 @@ class BlackboxRecorder:
                         recording_setting.updated_timestamp_ns
                     )
 
+                next_ingest_mode = self._ingest_mode_for(current_recording_enabled)
+                if next_ingest_mode != self._current_ingest_mode:
+                    if next_ingest_mode == INGEST_MODE_ACTIVE:
+                        self._enter_active_ingest()
+                    else:
+                        self._enter_inactive_ingest()
+                    self._current_ingest_mode = next_ingest_mode
+
+                if self._current_ingest_mode == INGEST_MODE_INACTIVE:
+                    self.recording_enabled = current_recording_enabled
+                    self.recording_setting_revision = current_recording_revision
+                    self.recording_setting_updated_timestamp_ns = (
+                        current_recording_updated_timestamp_ns
+                    )
+                    time.sleep(POLL_TIMEOUT_MS / 1000.0)
+                    continue
+
                 events = dict(self.poller.poll(POLL_TIMEOUT_MS))
                 drained_action_messages: list[ChannelMessage] = []
                 if events.get(self.action_socket) == zmq.POLLIN:
-                    drained_action_messages = self._drain_messages(
+                    raw_action_messages = self._drain_raw_messages(
                         self.action_socket,
                         spec=self.action_channel,
                         transport_tracker=self.action_transport_tracker,
                         max_messages=ACTION_DRAIN_BATCH_LIMIT,
                     )
+                    drained_action_messages = [
+                        self._decode_raw_message(
+                            raw_action_message,
+                            spec=self.action_channel,
+                        )
+                        for raw_action_message in raw_action_messages
+                    ]
                     for action_message in drained_action_messages:
                         self._handle_action_message(
                             action_message,
@@ -1391,13 +1641,35 @@ class BlackboxRecorder:
 
                 if events.get(self.vision_socket) == zmq.POLLIN:
                     action_cursor = 0
-                    drained_frame_messages = self._drain_messages(
+                    drained_frame_messages = self._drain_raw_messages(
                         self.vision_socket,
                         spec=self.vision_channel,
                         transport_tracker=self.vision_transport_tracker,
                         max_messages=VISION_DRAIN_BATCH_LIMIT,
                     )
-                    for frame_message in drained_frame_messages:
+                    for raw_frame_message in drained_frame_messages:
+                        frame_timestamp_ns = _frame_timestamp_ns_from_envelope(
+                            raw_frame_message.envelope
+                        )
+                        recording_enabled_for_frame = self._recording_enabled_at(
+                            frame_timestamp_ns,
+                            current_recording_enabled=current_recording_enabled,
+                            current_revision=current_recording_revision,
+                            current_updated_timestamp_ns=current_recording_updated_timestamp_ns,
+                            previous_recording_enabled=previous_recording_enabled,
+                            previous_revision=previous_recording_revision,
+                        )
+                        should_decode_frame = (
+                            recording_enabled_for_frame or self.preroll_ns > 0
+                        )
+                        if not should_decode_frame:
+                            if self._session_active():
+                                self.stop_session()
+                            continue
+                        frame_message = self._decode_raw_message(
+                            raw_frame_message,
+                            spec=self.vision_channel,
+                        )
                         action_cursor = self._handle_frame_message(
                             frame_message,
                             drained_action_messages,

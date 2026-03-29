@@ -204,8 +204,10 @@ class ChannelSubscriber:
             spec.default_latest_only if latest_only is None else latest_only
         )
         resolved_buffer_size = spec.default_buffer_size if buffer_size is None else buffer_size
+        resolved_rcvhwm = spec.default_rcvhwm if rcvhwm is None else rcvhwm
         if resolved_latest_only:
             resolved_buffer_size = 1
+            resolved_rcvhwm = 1
         if resolved_buffer_size <= 0:
             raise ValueError("buffer_size must be positive.")
 
@@ -214,7 +216,7 @@ class ChannelSubscriber:
         self.socket = self.context.socket(zmq.SUB)
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.setsockopt(zmq.RCVTIMEO, socket_timeout_ms)
-        self.socket.setsockopt(zmq.RCVHWM, rcvhwm or spec.default_rcvhwm)
+        self.socket.setsockopt(zmq.RCVHWM, int(resolved_rcvhwm))
         self.connect_addr = f"tcp://{host}:{spec.port}"
         self.socket.connect(self.connect_addr)
         self.socket.subscribe(spec.topic)

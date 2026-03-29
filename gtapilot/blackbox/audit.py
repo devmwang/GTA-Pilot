@@ -32,6 +32,15 @@ def _delta_ms(values_ns: list[int]) -> dict[str, float]:
     }
 
 
+def _timing_bucket_to_ms(bucket: dict[str, Any] | None) -> dict[str, float]:
+    payload = dict(bucket or {})
+    return {
+        "p50_ms": float(payload.get("p50", 0)) / 1_000_000.0,
+        "p95_ms": float(payload.get("p95", 0)) / 1_000_000.0,
+        "max_ms": float(payload.get("max", 0)) / 1_000_000.0,
+    }
+
+
 def _sequence_gap_summary(values: list[int]) -> dict[str, int]:
     gap_count = 0
     gap_total = 0
@@ -67,6 +76,54 @@ def _format_float(value: float) -> str:
 
 def _load_manifest(metadata_path: Path) -> dict[str, Any]:
     return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def _native_capture_timing_summary(
+    frames: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    sample_capture_frame_id: int | None = None
+    frame_arrival_wait_ns: list[int] = []
+    gpu_readback_ns: list[int] = []
+    cpu_convert_ns: list[int] = []
+    publish_deadline_lag_ns: list[int] = []
+
+    for frame in frames:
+        pipeline_stats = (frame.get("frame_metadata") or {}).get("pipeline_stats")
+        if not isinstance(pipeline_stats, dict):
+            continue
+
+        publish_deadline_lag_value = pipeline_stats.get("publish_deadline_lag_ns")
+        if publish_deadline_lag_value is not None:
+            publish_deadline_lag_ns.append(int(publish_deadline_lag_value))
+
+        current_sample_capture_frame_id = int(
+            pipeline_stats.get(
+                "sample_capture_frame_id",
+                frame.get("capture_frame_id", frame.get("frame_id", -1)),
+            )
+        )
+        if (
+            sample_capture_frame_id is not None
+            and current_sample_capture_frame_id == sample_capture_frame_id
+        ):
+            continue
+        sample_capture_frame_id = current_sample_capture_frame_id
+
+        for bucket, key in (
+            (frame_arrival_wait_ns, "frame_arrival_wait_ns"),
+            (gpu_readback_ns, "gpu_readback_ns"),
+            (cpu_convert_ns, "cpu_convert_ns"),
+        ):
+            value = pipeline_stats.get(key)
+            if value is not None:
+                bucket.append(int(value))
+
+    return {
+        "frame_arrival_wait_ms": _delta_ms(frame_arrival_wait_ns),
+        "gpu_readback_ms": _delta_ms(gpu_readback_ns),
+        "cpu_convert_ms": _delta_ms(cpu_convert_ns),
+        "publish_deadline_lag_ms": _delta_ms(publish_deadline_lag_ns),
+    }
 
 
 def main() -> None:
@@ -131,12 +188,31 @@ def main() -> None:
     transport_stats = dict(manifest.get("transport_stats", {}))
     writer_stats = dict(manifest.get("writer_stats", {}))
     native_pipeline = dict((manifest.get("session_stats") or {}).get("native_pipeline", {}))
+    performance_stats = dict(manifest.get("performance_stats", {}))
+    native_capture_perf = dict(performance_stats.get("native_capture", {}))
+    blackbox_ingest_perf = dict(performance_stats.get("blackbox_ingest", {}))
 
     published_gap_summary = _sequence_gap_summary(frame_ids)
     fresh_gap_summary = _fresh_capture_gap_summary(capture_frame_ids)
     published_dt = _delta_ms(published_dt_ns)
     fresh_dt = _delta_ms(fresh_dt_ns)
     writer_lag = _delta_ms(writer_lag_ns)
+    native_timing_summary = _native_capture_timing_summary(frames)
+    if native_capture_perf:
+        native_timing_summary = {
+            "frame_arrival_wait_ms": _timing_bucket_to_ms(
+                native_capture_perf.get("frame_arrival_wait_ns")
+            ),
+            "gpu_readback_ms": _timing_bucket_to_ms(
+                native_capture_perf.get("gpu_readback_ns")
+            ),
+            "cpu_convert_ms": _timing_bucket_to_ms(
+                native_capture_perf.get("cpu_convert_ns")
+            ),
+            "publish_deadline_lag_ms": _timing_bucket_to_ms(
+                native_capture_perf.get("publish_deadline_lag_ns")
+            ),
+        }
 
     print(f"metadata_path={metadata_path}")
     print(f"schema_version={manifest.get('schema_version')}")
@@ -178,6 +254,30 @@ def main() -> None:
         f"max={_format_float(writer_lag['max_ms'])}"
     )
     print(
+        "native_frame_arrival_wait_ms="
+        f"p50={_format_float(native_timing_summary['frame_arrival_wait_ms']['p50_ms'])} "
+        f"p95={_format_float(native_timing_summary['frame_arrival_wait_ms']['p95_ms'])} "
+        f"max={_format_float(native_timing_summary['frame_arrival_wait_ms']['max_ms'])}"
+    )
+    print(
+        "native_gpu_readback_ms="
+        f"p50={_format_float(native_timing_summary['gpu_readback_ms']['p50_ms'])} "
+        f"p95={_format_float(native_timing_summary['gpu_readback_ms']['p95_ms'])} "
+        f"max={_format_float(native_timing_summary['gpu_readback_ms']['max_ms'])}"
+    )
+    print(
+        "native_cpu_convert_ms="
+        f"p50={_format_float(native_timing_summary['cpu_convert_ms']['p50_ms'])} "
+        f"p95={_format_float(native_timing_summary['cpu_convert_ms']['p95_ms'])} "
+        f"max={_format_float(native_timing_summary['cpu_convert_ms']['max_ms'])}"
+    )
+    print(
+        "publish_deadline_lag_ms="
+        f"p50={_format_float(native_timing_summary['publish_deadline_lag_ms']['p50_ms'])} "
+        f"p95={_format_float(native_timing_summary['publish_deadline_lag_ms']['p95_ms'])} "
+        f"max={_format_float(native_timing_summary['publish_deadline_lag_ms']['max_ms'])}"
+    )
+    print(
         "vision_transport="
         + json.dumps(transport_stats.get("vision", {}), sort_keys=True)
     )
@@ -192,6 +292,10 @@ def main() -> None:
     print(
         "native_pipeline="
         + json.dumps(native_pipeline, sort_keys=True)
+    )
+    print(
+        "blackbox_ingest="
+        + json.dumps(blackbox_ingest_perf, sort_keys=True)
     )
     print(f"drop_event_count={len(manifest.get('drop_events', []))}")
 

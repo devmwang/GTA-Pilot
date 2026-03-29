@@ -296,6 +296,11 @@ Once the runtime is up:
 Blackbox no longer records full sessions by default. It starts idle and only
 creates output files when recording is toggled on.
 
+When `blackbox.recording_enabled = false` and `BLACKBOX_PREROLL_SECONDS = 0.0`,
+blackbox now enters an inactive ingest mode and does not decode or copy live
+vision frames. If preroll is enabled, idle blackbox still buffers bounded
+pre-roll data in memory.
+
 The hotkey does not go through a one-off control stream anymore. The input
 process flips the runtime setting `blackbox.recording_enabled`, and the blackbox
 and visualization processes read the latest value from the shared settings
@@ -323,15 +328,17 @@ streamed into ffmpeg as raw `bgr24` and encoded as H.264 in an MKV container.
 Current runtime producers publish 60 Hz vision streams, so new live and video
 override blackbox clips are authored with `video_nominal_fps = 60.0`.
 The JSON manifest is still the authoritative source for frame timing and action
-alignment. The current manifest schema version is `6`. Recording now uses
+alignment. The current manifest schema version is `7`. Recording now uses
 append-only temporary frame/action journals during capture and synthesizes the
 final `capture_<timestamp>_metadata.json` once when the session stops.
 
-Schema `6` manifests contain:
+Schema `7` manifests contain:
 
 - session-level metadata
 - session video settings
 - session integrity status plus structured drop/overflow events
+- performance stats for native capture timing, blackbox ingest mode, idle
+  vision-decode counters, and writer lag
 - transport stats for `vision.frames` and `input.actions`
 - writer queue / writer-lag stats
 - frame envelope and frame metadata
@@ -502,4 +509,5 @@ project.
 - The native GTA window capture path is the main live capture path; Python video override is mainly for testing.
 - The action stream reflects human input intent, not authoritative in-game vehicle state.
 - Blackbox pre-roll is in-memory only; if the process dies before recording is toggled on, that buffered data is lost.
+- With zero preroll, idle blackbox should be effectively non-participating for vision-frame processing.
 - Privileged labels and GTA-native state extraction will come later through a separate ScriptHook-based pipeline.

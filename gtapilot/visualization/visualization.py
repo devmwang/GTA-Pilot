@@ -26,6 +26,7 @@ WINDOW_NAME = "GTA Pilot Visualization"
 
 @dataclass(slots=True, frozen=True)
 class MonitorBounds:
+    handle: int
     left: int
     top: int
     right: int
@@ -71,6 +72,7 @@ def _enumerate_monitors() -> list[MonitorBounds]:
             return 1
         monitors.append(
             MonitorBounds(
+                handle=int(ctypes.cast(hmonitor, ctypes.c_void_p).value or 0),
                 left=int(monitor_info.rcWork.left),
                 top=int(monitor_info.rcWork.top),
                 right=int(monitor_info.rcWork.right),
@@ -84,19 +86,69 @@ def _enumerate_monitors() -> list[MonitorBounds]:
     return monitors
 
 
+def _primary_monitor(monitors: list[MonitorBounds]) -> MonitorBounds | None:
+    for monitor in monitors:
+        if monitor.is_primary:
+            return monitor
+    return monitors[0] if monitors else None
+
+
+def _parse_hwnd(raw_hwnd: object) -> int | None:
+    if raw_hwnd is None:
+        return None
+    if isinstance(raw_hwnd, int):
+        return raw_hwnd if raw_hwnd > 0 else None
+    hwnd_text = str(raw_hwnd).strip()
+    if not hwnd_text:
+        return None
+    try:
+        return int(hwnd_text, 16) if hwnd_text.lower().startswith("0x") else int(hwnd_text)
+    except ValueError:
+        return None
+
+
+def _monitor_handle_for_window(window_handle: int | None) -> int | None:
+    if window_handle is None or not hasattr(ctypes, "windll"):  # pragma: no cover
+        return None
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    user32.MonitorFromWindow.restype = ctypes.c_void_p
+    monitor_handle = user32.MonitorFromWindow(
+        ctypes.c_void_p(window_handle),
+        ctypes.c_uint(2),  # MONITOR_DEFAULTTONEAREST
+    )
+    return int(monitor_handle or 0) or None
+
+
 def _pick_visualization_monitor(
     monitors: list[MonitorBounds],
+    *,
+    target_window_hwnd: object | None = None,
 ) -> MonitorBounds | None:
+    primary_monitor = _primary_monitor(monitors)
     if len(monitors) <= 1:
-        return None
-    for monitor in monitors:
-        if not monitor.is_primary:
-            return monitor
-    return monitors[1]
+        return primary_monitor
+
+    game_monitor_handle = _monitor_handle_for_window(_parse_hwnd(target_window_hwnd))
+    if game_monitor_handle is not None:
+        alternate_monitors = [
+            monitor for monitor in monitors if monitor.handle != game_monitor_handle
+        ]
+        if alternate_monitors:
+            for monitor in alternate_monitors:
+                if monitor.is_primary:
+                    return monitor
+            return alternate_monitors[0]
+
+    return primary_monitor
 
 
-def _position_visualization_window() -> None:
-    target_monitor = _pick_visualization_monitor(_enumerate_monitors())
+def _position_visualization_window(*, target_window_hwnd: object | None = None) -> None:
+    target_monitor = _pick_visualization_monitor(
+        _enumerate_monitors(),
+        target_window_hwnd=target_window_hwnd,
+    )
     if target_monitor is None:
         return
     cv2.moveWindow(
@@ -198,7 +250,7 @@ def main(
     frame_count = 0
     fps_start_time = time.time()
     last_settings_refresh = 0.0
-    window_positioned = False
+    positioned_for_target_window_hwnd: str | None = None
 
     try:
         while True:
@@ -245,6 +297,9 @@ def main(
             )
             target_window_title = str(
                 packet.envelope.metadata.get("target_window_title", "")
+            )
+            target_window_hwnd = str(
+                packet.envelope.metadata.get("target_window_hwnd", "")
             )
 
             _draw_text(frame, f"FPS: {fps:.2f} nominal={frame_nominal_fps:.2f}", 40)
@@ -319,9 +374,9 @@ def main(
                 color=capture_color,
             )
 
-            if not window_positioned:
-                _position_visualization_window()
-                window_positioned = True
+            if target_window_hwnd != positioned_for_target_window_hwnd:
+                _position_visualization_window(target_window_hwnd=target_window_hwnd)
+                positioned_for_target_window_hwnd = target_window_hwnd
 
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1)

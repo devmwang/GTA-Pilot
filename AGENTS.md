@@ -242,13 +242,15 @@ Outputs under `blackbox-recordings/`:
 - `capture_<timestamp>_video.mkv`
 - `capture_<timestamp>_metadata.json`
 
-Current manifest schema version: `6`
+Current manifest schema version: `7`
 
 The manifest records:
 
 - session metadata
 - session video settings
 - session integrity and drop-event summaries
+- performance stats for native capture timing, blackbox ingest mode, idle
+  vision-decode counters, and writer lag
 - transport stats for `vision.frames` and `input.actions`
 - writer queue / latency stats
 - per-frame metadata and video frame index
@@ -268,7 +270,9 @@ Behavior notes:
 - runtime recording is controlled by the `blackbox.recording_enabled` setting
 - keyboard hotkey `F8` currently flips that setting via the input-capture
   process
-- while idle, blackbox keeps a bounded in-memory pre-roll buffer
+- while idle, blackbox keeps a bounded in-memory pre-roll buffer only if
+  `blackbox.preroll_seconds > 0`; otherwise it should stay inactive for
+  vision-frame ingest and decoding
 - each start/stop cycle produces a separate `capture_<timestamp>_*` pair
 - frames are encoded into H.264 video in an MKV container via `ffmpeg`
 - active recording uses append-only temporary frame/action journals and writes the
@@ -286,7 +290,8 @@ Behavior notes:
 - any transport gap, subscriber overflow, writer overflow, or native capture
   overload marks the session integrity status as `degraded`
 - use `python -m gtapilot.blackbox.audit --metadata-path ...` to summarize
-  cadence, repeat rate, transport gaps, writer lag, and native overload stats
+  cadence, repeat rate, transport gaps, writer lag, native overload stats, and
+  native timing summaries
 
 Do not silently change the manifest format. If it must evolve, bump
 `schema_version`.

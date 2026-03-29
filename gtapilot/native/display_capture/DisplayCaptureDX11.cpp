@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -339,50 +340,51 @@ static WGD::IDirect3DDevice create_winrt_device_from_d3d11(
     return inspectable.as<WGD::IDirect3DDevice>();
 }
 
-struct StagingBuffer {
+struct ReadbackSlot {
     ComPtr<ID3D11Texture2D> staging;
     UINT width = 0;
     UINT height = 0;
-};
-
-static void ensure_staging_texture(ID3D11Device *device, UINT width,
-                                   UINT height, StagingBuffer &buffer) {
-    if (buffer.staging && buffer.width == width && buffer.height == height) {
-        return;
-    }
-
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = CAP_FMT;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    desc.BindFlags = 0;
-    desc.MiscFlags = 0;
-
-    buffer.staging.Reset();
-    hrx(device->CreateTexture2D(&desc, nullptr, buffer.staging.GetAddressOf()),
-        "Create staging texture");
-    buffer.width = width;
-    buffer.height = height;
-}
-
-struct RawFrame {
     std::vector<uint8_t> bgra;
     uint64_t captureTimestampNs = 0;
     uint64_t captureFrameId = 0;
-    int width = 0;
-    int height = 0;
+    uint64_t frameArrivalWaitNs = 0;
+    uint64_t gpuReadbackNs = 0;
 };
 
-struct ConvertedFrame {
+struct ConvertedSlot {
     std::vector<uint8_t> rgb;
     uint64_t captureTimestampNs = 0;
     uint64_t captureFrameId = 0;
+    uint64_t frameArrivalWaitNs = 0;
+    uint64_t gpuReadbackNs = 0;
+    uint64_t cpuConvertNs = 0;
 };
+
+static void ensure_readback_slot(ID3D11Device *device, UINT width, UINT height,
+                                 ReadbackSlot &slot) {
+    if (!slot.staging || slot.width != width || slot.height != height) {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = CAP_FMT;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.BindFlags = 0;
+        desc.MiscFlags = 0;
+
+        slot.staging.Reset();
+        hrx(device->CreateTexture2D(&desc, nullptr,
+                                    slot.staging.GetAddressOf()),
+            "Create cropped staging texture");
+        slot.width = width;
+        slot.height = height;
+    }
+    slot.bgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) *
+                     4U);
+}
 
 struct PipelineTelemetry {
     std::atomic<uint64_t> freshFramesAcquired{0};
@@ -390,20 +392,43 @@ struct PipelineTelemetry {
     std::atomic<uint64_t> repeatedOutputsPublished{0};
     std::atomic<uint64_t> freshFramesSkippedByPublisher{0};
     std::atomic<uint64_t> acquisitionDropCount{0};
+    std::atomic<uint64_t> droppedStagingSlots{0};
+    std::atomic<uint64_t> droppedConvertedSlots{0};
     std::atomic<uint64_t> missedPublishDeadlines{0};
     std::atomic<uint64_t> overloadWindows{0};
     std::atomic<uint64_t> overloadStreak{0};
+    std::atomic<uint64_t> sampleCaptureFrameId{0};
+    std::atomic<uint64_t> lastFrameArrivalWaitNs{0};
+    std::atomic<uint64_t> maxFrameArrivalWaitNs{0};
+    std::atomic<uint64_t> lastGpuReadbackNs{0};
+    std::atomic<uint64_t> maxGpuReadbackNs{0};
+    std::atomic<uint64_t> lastCpuConvertNs{0};
+    std::atomic<uint64_t> maxCpuConvertNs{0};
+    std::atomic<uint64_t> lastPublishDeadlineLagNs{0};
+    std::atomic<uint64_t> maxPublishDeadlineLagNs{0};
     std::atomic<int> conversionBacklogDepth{0};
     std::atomic<int> maxConversionBacklogDepth{0};
 };
 
 struct SharedPipelineState {
     std::mutex mutex;
-    std::condition_variable readyAvailable;
-    std::deque<RawFrame> rawFrames;
-    std::shared_ptr<ConvertedFrame> latestCompletedFrame;
+    std::condition_variable rawReadyAvailable;
+    std::array<ReadbackSlot, STAGING_RING_SIZE> rawSlots;
+    std::array<ConvertedSlot, STAGING_RING_SIZE> convertedSlots;
+    std::deque<int> freeRawSlots;
+    std::deque<int> readyRawSlots;
+    std::deque<int> freeConvertedSlots;
+    std::deque<int> readyConvertedSlots;
+    int publishedConvertedSlot = -1;
     std::atomic<bool> running{true};
 };
+
+static void initialize_slot_queues(SharedPipelineState &state) {
+    for (int i = 0; i < STAGING_RING_SIZE; ++i) {
+        state.freeRawSlots.push_back(i);
+        state.freeConvertedSlots.push_back(i);
+    }
+}
 
 static void update_max_atomic(std::atomic<int> &target, int value) {
     int current = target.load();
@@ -412,10 +437,22 @@ static void update_max_atomic(std::atomic<int> &target, int value) {
     }
 }
 
+static void update_max_atomic_u64(std::atomic<uint64_t> &target,
+                                  uint64_t value) {
+    uint64_t current = target.load();
+    while (value > current &&
+           !target.compare_exchange_weak(current, value)) {
+    }
+}
+
 static void convertBGRA_to_RGB_resized(const uint8_t *bgra, int srcW, int srcH,
                                        int srcPitch, int outW, int outH,
                                        std::vector<uint8_t> &outRGB) {
-    outRGB.resize(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3U);
+    const size_t requiredSize =
+        static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3U;
+    if (outRGB.size() != requiredSize) {
+        outRGB.resize(requiredSize);
+    }
     for (int y = 0; y < outH; ++y) {
         int sy = y * srcH / outH;
         const uint8_t *srow = bgra + sy * srcPitch;
@@ -443,8 +480,30 @@ static json pipeline_stats_json(const PipelineTelemetry &telemetry,
          telemetry.freshFramesSkippedByPublisher.load()},
         {"acquisition_drop_count",
          telemetry.acquisitionDropCount.load()},
+        {"dropped_staging_slots",
+         telemetry.droppedStagingSlots.load()},
+        {"dropped_converted_slots",
+         telemetry.droppedConvertedSlots.load()},
         {"missed_publish_deadlines",
          telemetry.missedPublishDeadlines.load()},
+        {"sample_capture_frame_id",
+         telemetry.sampleCaptureFrameId.load()},
+        {"frame_arrival_wait_ns",
+         telemetry.lastFrameArrivalWaitNs.load()},
+        {"max_frame_arrival_wait_ns",
+         telemetry.maxFrameArrivalWaitNs.load()},
+        {"gpu_readback_ns",
+         telemetry.lastGpuReadbackNs.load()},
+        {"max_gpu_readback_ns",
+         telemetry.maxGpuReadbackNs.load()},
+        {"cpu_convert_ns",
+         telemetry.lastCpuConvertNs.load()},
+        {"max_cpu_convert_ns",
+         telemetry.maxCpuConvertNs.load()},
+        {"publish_deadline_lag_ns",
+         telemetry.lastPublishDeadlineLagNs.load()},
+        {"max_publish_deadline_lag_ns",
+         telemetry.maxPublishDeadlineLagNs.load()},
         {"conversion_backlog_depth",
          telemetry.conversionBacklogDepth.load()},
         {"max_conversion_backlog_depth",
@@ -455,7 +514,7 @@ static json pipeline_stats_json(const PipelineTelemetry &telemetry,
 }
 
 static void publish_frame(zmq::socket_t &pubRAW,
-                          const std::shared_ptr<ConvertedFrame> &frame,
+                          const ConvertedSlot &frame,
                           uint64_t publishFrameId, bool isRepeat, int rawW,
                           int rawH, const PipelineTelemetry &telemetry,
                           bool overloadActive,
@@ -466,7 +525,7 @@ static void publish_frame(zmq::socket_t &pubRAW,
         {"channel", VISION_CHANNEL},
         {"encoding", "raw_rgb_v1"},
         {"sequence_id", publishFrameId},
-        {"message_timestamp_ns", frame->captureTimestampNs},
+        {"message_timestamp_ns", frame.captureTimestampNs},
         {"publish_timestamp_ns", publishTimestampNs},
         {"source", FRAME_SOURCE},
         {"metadata",
@@ -475,9 +534,9 @@ static void publish_frame(zmq::socket_t &pubRAW,
           {"channels", 3},
           {"dtype", "uint8"},
           {"frame_id", publishFrameId},
-          {"capture_frame_id", frame->captureFrameId},
+          {"capture_frame_id", frame.captureFrameId},
           {"nominal_fps", 60.0},
-          {"capture_timestamp_ns", frame->captureTimestampNs},
+          {"capture_timestamp_ns", frame.captureTimestampNs},
           {"is_repeat", isRepeat},
           {"capture_mode", CAPTURE_MODE},
           {"target_window_title", utf8_from_wide(targetWindow.title)},
@@ -489,7 +548,7 @@ static void publish_frame(zmq::socket_t &pubRAW,
     zmq::message_t topicPayload(FRAMES_CPU_TOPIC, strlen(FRAMES_CPU_TOPIC));
     zmq::message_t envelopePayload(envelopeBytes.data(),
                                    envelopeBytes.size());
-    zmq::message_t framePayload(frame->rgb.data(), frame->rgb.size());
+    zmq::message_t framePayload(frame.rgb.data(), frame.rgb.size());
     pubRAW.send(topicPayload, zmq::send_flags::sndmore);
     pubRAW.send(envelopePayload, zmq::send_flags::sndmore);
     pubRAW.send(framePayload, zmq::send_flags::none);
@@ -618,9 +677,8 @@ class WindowCaptureSession {
         }
     }
 
-    void copy_client_frame_to_bgra(
-        WGC::Direct3D11CaptureFrame const &frame, std::vector<uint8_t> &bgraOut,
-        int &outWidth, int &outHeight) {
+    void copy_client_frame_to_bgra(WGC::Direct3D11CaptureFrame const &frame,
+                                   ReadbackSlot &slot) {
         auto frameSurface =
             get_dxgi_interface_from_object<ID3D11Texture2D>(frame.Surface());
 
@@ -638,36 +696,48 @@ class WindowCaptureSession {
                 "Failed to resolve the Grand Theft Auto V client area.");
         }
 
-        ensure_staging_texture(_device.Get(), desc.Width, desc.Height,
-                               _stagingBuffer);
-        _context->CopyResource(_stagingBuffer.staging.Get(), frameSurface.get());
-
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        hrx(_context->Map(_stagingBuffer.staging.Get(), 0, D3D11_MAP_READ, 0,
-                          &mapped),
-            "Map staging");
-
-        const int cropWidth = clientBox.right - clientBox.left;
-        const int cropHeight = clientBox.bottom - clientBox.top;
-        if (cropWidth <= 0 || cropHeight <= 0) {
-            _context->Unmap(_stagingBuffer.staging.Get(), 0);
+        const UINT cropWidth =
+            static_cast<UINT>(clientBox.right - clientBox.left);
+        const UINT cropHeight =
+            static_cast<UINT>(clientBox.bottom - clientBox.top);
+        if (cropWidth == 0 || cropHeight == 0) {
             throw std::runtime_error(
                 "Grand Theft Auto V client area resolved to an empty region.");
         }
 
-        bgraOut.resize(static_cast<size_t>(cropWidth) *
-                       static_cast<size_t>(cropHeight) * 4U);
+        ensure_readback_slot(_device.Get(), cropWidth, cropHeight, slot);
+
+        D3D11_BOX srcBox{};
+        srcBox.left = static_cast<UINT>(clientBox.left);
+        srcBox.top = static_cast<UINT>(clientBox.top);
+        srcBox.right = static_cast<UINT>(clientBox.right);
+        srcBox.bottom = static_cast<UINT>(clientBox.bottom);
+        srcBox.front = 0;
+        srcBox.back = 1;
+
+        const auto readbackStart = std::chrono::steady_clock::now();
+        _context->CopySubresourceRegion(slot.staging.Get(), 0, 0, 0, 0,
+                                        frameSurface.get(), 0, &srcBox);
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hrx(_context->Map(slot.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped),
+            "Map staging");
         const auto *src = reinterpret_cast<const uint8_t *>(mapped.pData);
-        for (int y = 0; y < cropHeight; ++y) {
+        for (UINT y = 0; y < cropHeight; ++y) {
             const auto *srcRow =
-                src + static_cast<size_t>(clientBox.top + y) * mapped.RowPitch +
-                static_cast<size_t>(clientBox.left) * 4U;
+                src + static_cast<size_t>(y) * mapped.RowPitch;
             std::memcpy(
-                &bgraOut[static_cast<size_t>(y) * static_cast<size_t>(cropWidth) *
-                         4U],
+                &slot.bgra[static_cast<size_t>(y) *
+                           static_cast<size_t>(cropWidth) * 4U],
                 srcRow, static_cast<size_t>(cropWidth) * 4U);
         }
-        _context->Unmap(_stagingBuffer.staging.Get(), 0);
+        _context->Unmap(slot.staging.Get(), 0);
+        slot.gpuReadbackNs =
+            static_cast<uint64_t>(std::chrono::duration_cast<
+                                      std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() -
+                                      readbackStart)
+                                      .count());
 
         const auto frameSize = frame.ContentSize();
         if (frameSize.Width != _lastSize.Width ||
@@ -679,9 +749,8 @@ class WindowCaptureSession {
                 FRAME_POOL_BUFFER_COUNT, frameSize);
             _lastSize = frameSize;
         }
-
-        outWidth = cropWidth;
-        outHeight = cropHeight;
+        slot.width = cropWidth;
+        slot.height = cropHeight;
     }
 
     bool target_still_valid() const {
@@ -710,7 +779,6 @@ class WindowCaptureSession {
         _winrtDevice = nullptr;
         _context.Reset();
         _device.Reset();
-        _stagingBuffer.staging.Reset();
         if (_frameArrivedEvent != nullptr) {
             CloseHandle(_frameArrivedEvent);
             _frameArrivedEvent = nullptr;
@@ -728,7 +796,6 @@ class WindowCaptureSession {
     WGC::GraphicsCaptureItem::Closed_revoker _closedRevoker;
     WGC::Direct3D11CaptureFramePool::FrameArrived_revoker _frameArrivedRevoker;
     winrt::Windows::Graphics::SizeInt32 _lastSize{};
-    StagingBuffer _stagingBuffer;
     HANDLE _frameArrivedEvent = nullptr;
     std::atomic<bool> _active{false};
 };
@@ -736,7 +803,6 @@ class WindowCaptureSession {
 int main(int argc, char **argv) {
     try {
         ScopedTimerResolution timerResolution(1);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -773,6 +839,15 @@ int main(int argc, char **argv) {
         uint64_t publishFrameId = 1;
 
         SharedPipelineState state;
+        initialize_slot_queues(state);
+        for (auto &slot : state.rawSlots) {
+            slot.bgra.reserve(static_cast<size_t>(rawW) *
+                              static_cast<size_t>(rawH) * 4U);
+        }
+        for (auto &slot : state.convertedSlots) {
+            slot.rgb.resize(static_cast<size_t>(rawW) * static_cast<size_t>(rawH) *
+                            3U);
+        }
         PipelineTelemetry telemetry;
         std::exception_ptr workerError;
         std::mutex workerErrorMutex;
@@ -782,7 +857,7 @@ int main(int argc, char **argv) {
                 workerError = error;
             }
             state.running.store(false);
-            state.readyAvailable.notify_all();
+            state.rawReadyAvailable.notify_all();
         };
 
         std::thread acquisitionThread([&]() {
@@ -791,41 +866,65 @@ int main(int argc, char **argv) {
                 capture.initialize();
 
                 uint64_t captureFrameId = 0;
-                std::vector<uint8_t> bgra;
                 while (state.running.load()) {
                     if (!capture.target_still_valid()) {
                         throw std::runtime_error(
                             "Grand Theft Auto V window was lost or minimized.");
                     }
 
+                    const auto waitStart = std::chrono::steady_clock::now();
                     auto frame = capture.wait_for_latest_frame(CAP_FRAME_TIMEOUT_MS);
+                    const uint64_t frameArrivalWaitNs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - waitStart)
+                            .count());
                     if (!frame) {
                         continue;
                     }
 
-                    RawFrame rawFrame;
-                    capture.copy_client_frame_to_bgra(frame, bgra, rawFrame.width,
-                                                      rawFrame.height);
-                    rawFrame.bgra = std::move(bgra);
-                    rawFrame.captureTimestampNs = unix_time_ns();
-                    rawFrame.captureFrameId = ++captureFrameId;
+                    int rawSlotIndex = -1;
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        if (!state.freeRawSlots.empty()) {
+                            rawSlotIndex = state.freeRawSlots.front();
+                            state.freeRawSlots.pop_front();
+                        } else if (!state.readyRawSlots.empty()) {
+                            rawSlotIndex = state.readyRawSlots.front();
+                            state.readyRawSlots.pop_front();
+                            telemetry.acquisitionDropCount.fetch_add(1);
+                            telemetry.droppedStagingSlots.fetch_add(1);
+                        } else {
+                            telemetry.acquisitionDropCount.fetch_add(1);
+                            telemetry.droppedStagingSlots.fetch_add(1);
+                            continue;
+                        }
+                    }
+
+                    auto &rawSlot = state.rawSlots[rawSlotIndex];
+                    capture.copy_client_frame_to_bgra(frame, rawSlot);
+                    rawSlot.captureTimestampNs = unix_time_ns();
+                    rawSlot.captureFrameId = ++captureFrameId;
+                    rawSlot.frameArrivalWaitNs = frameArrivalWaitNs;
                     telemetry.freshFramesAcquired.store(captureFrameId);
+                    telemetry.sampleCaptureFrameId.store(captureFrameId);
+                    telemetry.lastFrameArrivalWaitNs.store(frameArrivalWaitNs);
+                    update_max_atomic_u64(telemetry.maxFrameArrivalWaitNs,
+                                          frameArrivalWaitNs);
+                    telemetry.lastGpuReadbackNs.store(rawSlot.gpuReadbackNs);
+                    update_max_atomic_u64(telemetry.maxGpuReadbackNs,
+                                          rawSlot.gpuReadbackNs);
 
                     {
                         std::lock_guard<std::mutex> lock(state.mutex);
-                        if (state.rawFrames.size() >= STAGING_RING_SIZE) {
-                            state.rawFrames.pop_front();
-                            telemetry.acquisitionDropCount.fetch_add(1);
-                        }
-                        state.rawFrames.push_back(std::move(rawFrame));
+                        state.readyRawSlots.push_back(rawSlotIndex);
                         const int backlogDepth =
-                            static_cast<int>(state.rawFrames.size());
+                            static_cast<int>(state.readyRawSlots.size());
                         telemetry.conversionBacklogDepth.store(backlogDepth);
                         update_max_atomic(
                             telemetry.maxConversionBacklogDepth,
                             backlogDepth);
                     }
-                    state.readyAvailable.notify_one();
+                    state.rawReadyAvailable.notify_one();
                 }
             } catch (...) {
                 setWorkerError(std::current_exception());
@@ -835,34 +934,69 @@ int main(int argc, char **argv) {
         std::thread conversionThread([&]() {
             try {
                 while (state.running.load()) {
-                    RawFrame rawFrame;
+                    int rawSlotIndex = -1;
                     {
                         std::unique_lock<std::mutex> lock(state.mutex);
-                        state.readyAvailable.wait(lock, [&]() {
+                        state.rawReadyAvailable.wait(lock, [&]() {
                             return !state.running.load() ||
-                                   !state.rawFrames.empty();
+                                   !state.readyRawSlots.empty();
                         });
-                        if (!state.running.load() && state.rawFrames.empty()) {
+                        if (!state.running.load() && state.readyRawSlots.empty()) {
                             break;
                         }
-                        rawFrame = std::move(state.rawFrames.front());
-                        state.rawFrames.pop_front();
+                        rawSlotIndex = state.readyRawSlots.front();
+                        state.readyRawSlots.pop_front();
                         telemetry.conversionBacklogDepth.store(
-                            static_cast<int>(state.rawFrames.size()));
+                            static_cast<int>(state.readyRawSlots.size()));
                     }
 
-                    auto convertedFrame = std::make_shared<ConvertedFrame>();
-                    convertedFrame->captureTimestampNs =
-                        rawFrame.captureTimestampNs;
-                    convertedFrame->captureFrameId = rawFrame.captureFrameId;
+                    int convertedSlotIndex = -1;
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        if (!state.freeConvertedSlots.empty()) {
+                            convertedSlotIndex = state.freeConvertedSlots.front();
+                            state.freeConvertedSlots.pop_front();
+                        } else if (!state.readyConvertedSlots.empty()) {
+                            convertedSlotIndex = state.readyConvertedSlots.front();
+                            state.readyConvertedSlots.pop_front();
+                            telemetry.droppedConvertedSlots.fetch_add(1);
+                        }
+                    }
+
+                    auto &rawSlot = state.rawSlots[rawSlotIndex];
+                    if (convertedSlotIndex < 0) {
+                        telemetry.droppedConvertedSlots.fetch_add(1);
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        state.freeRawSlots.push_back(rawSlotIndex);
+                        continue;
+                    }
+
+                    auto &convertedSlot = state.convertedSlots[convertedSlotIndex];
+                    const auto convertStart = std::chrono::steady_clock::now();
                     convertBGRA_to_RGB_resized(
-                        rawFrame.bgra.data(), rawFrame.width, rawFrame.height,
-                        rawFrame.width * 4, rawW, rawH, convertedFrame->rgb);
+                        rawSlot.bgra.data(), static_cast<int>(rawSlot.width),
+                        static_cast<int>(rawSlot.height),
+                        static_cast<int>(rawSlot.width) * 4, rawW, rawH,
+                        convertedSlot.rgb);
+                    const uint64_t cpuConvertNs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - convertStart)
+                            .count());
+                    convertedSlot.captureTimestampNs = rawSlot.captureTimestampNs;
+                    convertedSlot.captureFrameId = rawSlot.captureFrameId;
+                    convertedSlot.frameArrivalWaitNs = rawSlot.frameArrivalWaitNs;
+                    convertedSlot.gpuReadbackNs = rawSlot.gpuReadbackNs;
+                    convertedSlot.cpuConvertNs = cpuConvertNs;
                     telemetry.convertedFramesCompleted.fetch_add(1);
+                    telemetry.sampleCaptureFrameId.store(rawSlot.captureFrameId);
+                    telemetry.lastCpuConvertNs.store(cpuConvertNs);
+                    update_max_atomic_u64(telemetry.maxCpuConvertNs,
+                                          cpuConvertNs);
 
                     {
                         std::lock_guard<std::mutex> lock(state.mutex);
-                        state.latestCompletedFrame = convertedFrame;
+                        state.freeRawSlots.push_back(rawSlotIndex);
+                        state.readyConvertedSlots.push_back(convertedSlotIndex);
                     }
                 }
             } catch (...) {
@@ -870,7 +1004,7 @@ int main(int argc, char **argv) {
             }
         });
 
-        std::shared_ptr<ConvertedFrame> lastPublishedFrame;
+        uint64_t lastPublishedCaptureFrameId = 0;
         auto nextDeadline = std::chrono::steady_clock::now();
         std::exception_ptr loopError;
 
@@ -878,13 +1012,19 @@ int main(int argc, char **argv) {
             while (state.running.load()) {
                 std::this_thread::sleep_until(nextDeadline);
                 const auto publishStart = std::chrono::steady_clock::now();
-                const auto deadlineLagNs =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        publishStart - nextDeadline)
-                        .count();
+                uint64_t deadlineLagNs = 0;
+                if (publishStart > nextDeadline) {
+                    deadlineLagNs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            publishStart - nextDeadline)
+                            .count());
+                }
+                telemetry.lastPublishDeadlineLagNs.store(deadlineLagNs);
+                update_max_atomic_u64(telemetry.maxPublishDeadlineLagNs,
+                                      deadlineLagNs);
                 const bool missedDeadline =
                     deadlineLagNs >
-                    static_cast<int64_t>(MISSED_DEADLINE_THRESHOLD_NS);
+                    MISSED_DEADLINE_THRESHOLD_NS;
                 if (missedDeadline) {
                     telemetry.missedPublishDeadlines.fetch_add(1);
                 }
@@ -897,10 +1037,32 @@ int main(int argc, char **argv) {
                     }
                 }
 
-                std::shared_ptr<ConvertedFrame> newestFrame;
+                int frameSlotIndex = -1;
+                bool isRepeat = false;
                 {
                     std::lock_guard<std::mutex> lock(state.mutex);
-                    newestFrame = state.latestCompletedFrame;
+                    if (!state.readyConvertedSlots.empty()) {
+                        while (state.readyConvertedSlots.size() > 1) {
+                            const int staleSlotIndex =
+                                state.readyConvertedSlots.front();
+                            state.readyConvertedSlots.pop_front();
+                            state.freeConvertedSlots.push_back(staleSlotIndex);
+                        }
+                        frameSlotIndex = state.readyConvertedSlots.front();
+                        state.readyConvertedSlots.pop_front();
+
+                        const int previousPublishedSlot =
+                            state.publishedConvertedSlot;
+                        state.publishedConvertedSlot = frameSlotIndex;
+                        if (previousPublishedSlot != -1 &&
+                            previousPublishedSlot != frameSlotIndex) {
+                            state.freeConvertedSlots.push_back(
+                                previousPublishedSlot);
+                        }
+                    } else if (state.publishedConvertedSlot != -1) {
+                        frameSlotIndex = state.publishedConvertedSlot;
+                        isRepeat = true;
+                    }
                 }
 
                 const bool overloaded =
@@ -918,28 +1080,23 @@ int main(int argc, char **argv) {
                 const bool overloadActive =
                     overloaded && overloadStreak > 0;
 
-                std::shared_ptr<ConvertedFrame> frameToPublish;
-                bool isRepeat = false;
-                if (newestFrame &&
-                    (!lastPublishedFrame ||
-                     newestFrame->captureFrameId !=
-                         lastPublishedFrame->captureFrameId)) {
-                    if (lastPublishedFrame &&
-                        newestFrame->captureFrameId >
-                            lastPublishedFrame->captureFrameId + 1) {
-                        telemetry.freshFramesSkippedByPublisher.fetch_add(
-                            newestFrame->captureFrameId -
-                            lastPublishedFrame->captureFrameId - 1);
+                if (frameSlotIndex >= 0) {
+                    const auto &frameToPublish =
+                        state.convertedSlots[frameSlotIndex];
+                    if (!isRepeat) {
+                        if (lastPublishedCaptureFrameId != 0 &&
+                            frameToPublish.captureFrameId >
+                                lastPublishedCaptureFrameId + 1) {
+                            telemetry.freshFramesSkippedByPublisher.fetch_add(
+                                frameToPublish.captureFrameId -
+                                lastPublishedCaptureFrameId - 1);
+                        }
+                        lastPublishedCaptureFrameId =
+                            frameToPublish.captureFrameId;
+                    } else {
+                        telemetry.repeatedOutputsPublished.fetch_add(1);
                     }
-                    frameToPublish = newestFrame;
-                    lastPublishedFrame = newestFrame;
-                } else if (lastPublishedFrame) {
-                    frameToPublish = lastPublishedFrame;
-                    isRepeat = true;
-                    telemetry.repeatedOutputsPublished.fetch_add(1);
-                }
 
-                if (frameToPublish) {
                     publish_frame(pubRAW, frameToPublish, publishFrameId,
                                   isRepeat, rawW, rawH, telemetry,
                                   overloadActive, targetMatch.candidate);
@@ -957,7 +1114,7 @@ int main(int argc, char **argv) {
         }
 
         state.running.store(false);
-        state.readyAvailable.notify_all();
+        state.rawReadyAvailable.notify_all();
         if (acquisitionThread.joinable()) {
             acquisitionThread.join();
         }

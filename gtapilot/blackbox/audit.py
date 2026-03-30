@@ -220,6 +220,14 @@ def main() -> None:
         f"session_integrity_status="
         f"{(manifest.get('session_integrity') or {}).get('status', 'unknown')}"
     )
+    print(
+        "session_integrity_ignored_drop_event_count="
+        f"{int((manifest.get('session_integrity') or {}).get('ignored_drop_event_count', 0))}"
+    )
+    print(
+        "session_integrity_edge_grace_window_seconds="
+        f"{float((manifest.get('session_integrity') or {}).get('edge_grace_window_seconds', 0.0)):.1f}"
+    )
     print(f"frame_count={len(frames)}")
     print(f"action_count={len(manifest.get('actions', []))}")
     print(f"repeat_frame_count={repeat_frame_count}")
@@ -298,6 +306,7 @@ def main() -> None:
         + json.dumps(blackbox_ingest_perf, sort_keys=True)
     )
     print(f"drop_event_count={len(manifest.get('drop_events', []))}")
+    print(f"ignored_drop_event_count={len(manifest.get('ignored_drop_events', []))}")
 
 
 if __name__ == "__main__":

@@ -7,13 +7,14 @@ Reads frames from a provided video file and publishes them through the generic
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import cv2
 import numpy as np
 
 from gtapilot.ipc.channel import ChannelPublisher
-from gtapilot.ipc.channels import VISION_FRAMES_CHANNEL
+from gtapilot.ipc.channels import VISION_FRAMES_CHANNEL, VISION_PREVIEW_CHANNEL
 from gtapilot.timing import HighResolutionTimer, advance_fixed_deadline, sleep_until
 
 OUTPUT_FPS = 60.0
@@ -21,6 +22,22 @@ OUTPUT_FRAME_INTERVAL = 1.0 / OUTPUT_FPS
 DEFAULT_SOURCE_FPS = 30.0
 FPS_SANITY_LIMIT = 1000.0
 OUTPUT_SIZE = (1920, 1080)
+PREVIEW_SIZE = (1280, 720)
+FRAME_NOMINAL_FPS = OUTPUT_FPS
+DEFAULT_PREVIEW_MAX_FPS = 30.0
+
+
+def _preview_max_fps() -> float:
+    raw_value = os.environ.get("GTAPILOT_PREVIEW_MAX_FPS", "").strip()
+    if not raw_value:
+        return DEFAULT_PREVIEW_MAX_FPS
+    try:
+        preview_fps = float(raw_value)
+    except ValueError:
+        return DEFAULT_PREVIEW_MAX_FPS
+    if preview_fps <= 0.0:
+        return 0.0
+    return min(preview_fps, FRAME_NOMINAL_FPS)
 
 
 def _normalize_source_fps(value: float) -> float:
@@ -122,6 +139,10 @@ def main(video_path: str):
         VISION_FRAMES_CHANNEL,
         source_name="display_override",
     )
+    preview_publisher = ChannelPublisher(
+        VISION_PREVIEW_CHANNEL,
+        source_name="display_override_preview",
+    )
     video_source = LoopingVideoSource(video_path)
     frame_id = 1
     print(
@@ -130,6 +151,13 @@ def main(video_path: str):
     )
 
     next_frame_time = time.perf_counter()
+    preview_max_fps = _preview_max_fps()
+    preview_interval_ns = (
+        int(round(1_000_000_000.0 / preview_max_fps))
+        if preview_max_fps > 0.0
+        else None
+    )
+    last_preview_capture_timestamp_ns = 0
     try:
         with HighResolutionTimer(1):
             while True:
@@ -147,10 +175,36 @@ def main(video_path: str):
                         "frame_id": frame_id,
                         "capture_frame_id": capture_frame_id,
                         "capture_timestamp_ns": capture_timestamp_ns,
-                        "nominal_fps": OUTPUT_FPS,
+                        "nominal_fps": FRAME_NOMINAL_FPS,
                         "is_repeat": is_repeat,
+                        "capture_mode": "video_override",
                     },
                 )
+                if preview_interval_ns is not None and (
+                    last_preview_capture_timestamp_ns == 0
+                    or capture_timestamp_ns
+                    >= last_preview_capture_timestamp_ns + preview_interval_ns
+                ):
+                    preview_frame_rgb = cv2.resize(
+                        frame_rgb,
+                        PREVIEW_SIZE,
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    preview_publisher.publish(
+                        preview_frame_rgb,
+                        timestamp_ns=capture_timestamp_ns,
+                        metadata={
+                            "frame_id": frame_id,
+                            "capture_frame_id": capture_frame_id,
+                            "capture_timestamp_ns": capture_timestamp_ns,
+                            "nominal_fps": preview_max_fps,
+                            "source_nominal_fps": FRAME_NOMINAL_FPS,
+                            "is_repeat": is_repeat,
+                            "capture_mode": "video_override",
+                            "preview_source": "vision.frames",
+                        },
+                    )
+                    last_preview_capture_timestamp_ns = capture_timestamp_ns
                 frame_id += 1
                 next_frame_time = advance_fixed_deadline(
                     next_frame_time,
@@ -162,4 +216,5 @@ def main(video_path: str):
         except Exception:
             pass
         publisher.close()
+        preview_publisher.close()
         print("DisplayOverride: shutdown complete.")

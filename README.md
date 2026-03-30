@@ -52,11 +52,16 @@ or ScriptHook-based label extraction pipeline.
 
 What it does today:
 
-- capture front RGB frames at a 60 Hz runtime cadence
+- capture front RGB frames with a 60 Hz target cadence
 - capture current keyboard and Xbox controller inputs as Atlas-format action packets at 60 Hz
 - expose mutable runtime settings through a central settings service
-- visualize the live stream with action overlays
+- visualize a decimated preview stream with action overlays
 - optionally record frame/action sessions to disk for later training
+
+Blackbox session integrity uses a startup/shutdown grace window: frame/action
+drop events within the first or last `5` seconds of the recorded session
+timeline are ignored for degradation and stored separately as
+`ignored_drop_events`.
 
 What it does **not** do yet:
 
@@ -165,10 +170,11 @@ The live capture path uses the native DX11 executable in
 `bin/DisplayCaptureDX11.exe` by default.
 
 The live capture process targets the GTA V window by title using Windows
-Graphics Capture and publishes a fixed 60 Hz `vision.frames` stream. If the
-runtime cannot find the GTA window at startup, or if the window later becomes
-invalid or minimized, the capture worker exits fatally and the coordinator
-shuts down the full system.
+Graphics Capture and publishes each fresh `vision.frames` frame once with a
+60 Hz target cadence, plus a decimated `1280x720` `vision.preview` stream at
+`30 Hz` for visualization. If the runtime cannot find the GTA window at
+startup, or if the window later becomes invalid or minimized, the capture
+worker exits fatally and the coordinator shuts down the full system.
 
 ### 2. Video override
 
@@ -181,9 +187,10 @@ uv run ./gtapilot/main.py --video-override path/to/video.mp4
 This replaces live GTA window capture with OpenCV video decode while keeping the
 rest of the runtime the same.
 
-The override path also publishes a fixed 60 Hz `vision.frames` stream. Lower
-FPS source files duplicate frames with `is_repeat = true`, and higher FPS
-source files are decimated to the 60 Hz output cadence.
+The override path publishes a fixed 60 Hz `vision.frames` stream plus a
+decimated `1280x720` `vision.preview` stream at `30 Hz`. Lower FPS source
+files duplicate frames with `is_repeat = true`, and higher FPS source files are
+decimated to the 60 Hz output cadence.
 
 ### 3. Stop the system
 
@@ -200,8 +207,8 @@ The coordinator then terminates the remaining processes.
 
 ### Vision stream
 
-The `vision.frames` channel carries raw RGB frames plus metadata. Current frame
-metadata includes:
+The `vision.frames` channel carries shared-memory-backed RGB frames plus
+metadata. Current frame metadata includes:
 
 - `frame_id`
 - `capture_frame_id`
@@ -213,7 +220,12 @@ metadata includes:
 - `capture_mode`
 - `target_window_title`
 - `target_window_hwnd`
-- `pipeline_stats` for native live-capture overload telemetry
+- `shm_name`
+- `slot_bytes`
+- `slot_index`
+- `slot_generation`
+- `frame_bytes`
+- sampled `pipeline_stats` for native live-capture overload telemetry
 - `w`
 - `h`
 - `channels`
@@ -328,11 +340,11 @@ streamed into ffmpeg as raw `bgr24` and encoded as H.264 in an MKV container.
 Current runtime producers publish 60 Hz vision streams, so new live and video
 override blackbox clips are authored with `video_nominal_fps = 60.0`.
 The JSON manifest is still the authoritative source for frame timing and action
-alignment. The current manifest schema version is `7`. Recording now uses
+alignment. The current manifest schema version is `1`. Recording now uses
 append-only temporary frame/action journals during capture and synthesizes the
 final `capture_<timestamp>_metadata.json` once when the session stops.
 
-Schema `7` manifests contain:
+Schema `1` manifests contain:
 
 - session-level metadata
 - session video settings

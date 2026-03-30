@@ -75,6 +75,11 @@ class ChannelPublisher:
             print(f"ChannelPublisher[{self.spec.name}] send error: {error}")
 
     def close(self) -> None:
+        if hasattr(self.spec.codec, "close"):
+            try:
+                self.spec.codec.close()
+            except Exception:
+                pass
         if hasattr(self, "socket") and not self.socket.closed:
             self.socket.close()
         if hasattr(self, "context") and not self.context.closed:
@@ -346,6 +351,8 @@ class ChannelSubscriber:
             self._receive_thread.join(timeout=2.0)
 
         try:
+            if hasattr(self.spec.codec, "close"):
+                self.spec.codec.close()
             if hasattr(self, "socket") and not self.socket.closed:
                 self.socket.close()
             if hasattr(self, "context") and not self.context.closed:

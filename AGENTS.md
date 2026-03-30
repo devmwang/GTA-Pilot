@@ -70,14 +70,17 @@ Current worker set:
 2. `DisplayCaptureDX11`
    Native executable `bin/DisplayCaptureDX11.exe`
    Live GTA window capture on Windows via Windows Graphics Capture. Targets the
-   top-level GTA V window by title, publishes a fixed 60 Hz RGB stream to
-   `vision.frames`, and exits fatally if the target window cannot be found,
-   becomes invalid, or is minimized.
+   top-level GTA V window by title, publishes each fresh RGB frame once to
+   `vision.frames` with a 60 Hz target cadence, publishes a decimated
+   `1280x720` preview stream to `vision.preview` at `30 Hz` by default, and
+   exits fatally if the target window cannot be found, becomes invalid, or is
+   minimized.
 
 3. `DisplayOverride`
    `gtapilot.display_capture.display_override.main`
    Uses a video file instead of live capture and publishes a fixed 60 Hz RGB
-   stream to the `vision.frames` channel.
+   stream to `vision.frames` plus a decimated `1280x720` preview stream to
+   `vision.preview` at `30 Hz` by default.
 
 4. `ActionCapture`
    `gtapilot.input_capture.input_capture.main`
@@ -87,7 +90,7 @@ Current worker set:
 
 5. `Visualization`
    `gtapilot.visualization.visualization.main`
-   Displays the latest frame with FPS and action overlays.
+   Displays the latest preview frame with FPS and action overlays.
 
 6. `Blackbox`
    `gtapilot.blackbox.blackbox.main`
@@ -115,11 +118,17 @@ Pattern:
 
 Current active channel specs:
 
+- `VISION_PREVIEW_CHANNEL`
+  - name: `vision.preview`
+  - port: `55551`
+  - topic: `b"preview"`
+  - codec: `SharedMemoryFrameCodec("vision.preview", slot_count=4)`
+  - latest-only preview stream for visualization, default buffer/HWM `1/1/1`
 - `VISION_FRAMES_CHANNEL`
   - name: `vision.frames`
   - port: `55550`
   - topic: `b"frames"`
-  - codec: `RawRGBFrameCodec`
+  - codec: `SharedMemoryFrameCodec("vision.frames", slot_count=8)`
   - default buffer size / HWM tuned for 60 Hz runtime collection:
     buffer `16`, send `8`, receive `8`
 - `INPUT_ACTIONS_CHANNEL`
@@ -141,9 +150,9 @@ Shared envelope contract (version `1`):
 
 Vision payload contract:
 
-- raw RGB `uint8`
+- shared-memory-backed RGB `uint8`
 - shape `(H, W, 3)`
-- encoding `raw_rgb_v1`
+- encoding `shm_rgb_v1`
 - metadata fields:
   - `w`
   - `h`
@@ -157,7 +166,12 @@ Vision payload contract:
   - `capture_mode`
   - `target_window_title`
   - `target_window_hwnd`
-  - optional `pipeline_stats` for native overload telemetry
+  - `shm_name`
+  - `slot_bytes`
+  - `slot_index`
+  - `slot_generation`
+  - `frame_bytes`
+  - optional sampled `pipeline_stats` for native overload telemetry
 
 Action payload contract:
 
@@ -242,13 +256,14 @@ Outputs under `blackbox-recordings/`:
 - `capture_<timestamp>_video.mkv`
 - `capture_<timestamp>_metadata.json`
 
-Current manifest schema version: `7`
+Current manifest schema version: `1`
 
 The manifest records:
 
 - session metadata
 - session video settings
 - session integrity and drop-event summaries
+- session-integrity grace-window summaries plus ignored startup/shutdown drop events
 - performance stats for native capture timing, blackbox ingest mode, idle
   vision-decode counters, and writer lag
 - transport stats for `vision.frames` and `input.actions`
@@ -284,11 +299,18 @@ Behavior notes:
   not guess it
 - current live capture and video override producers publish `nominal_fps=60.0`
   for the runtime collection path
-- `frame_id` advances for every published 60 Hz output; `capture_frame_id`
-  advances only for fresh captured frames, so repeats keep the same
-  `capture_frame_id`
+- live native capture publishes each fresh frame once, so `frame_id` advances
+  only on fresh published frames and `is_repeat` remains `false`
+- `capture_frame_id` advances for fresh captured frames; if live capture
+  overload drops a fresh frame before publish, `capture_frame_id` can jump
+  forward relative to `frame_id`
+- video override remains a fixed 60 Hz publisher and may still duplicate frames,
+  so `is_repeat = true` is still meaningful on override clips
 - any transport gap, subscriber overflow, writer overflow, or native capture
   overload marks the session integrity status as `degraded`
+- startup/shutdown grace: frame/action drop events within the first or last
+  `5` seconds of the recorded session timeline are excluded from integrity
+  degradation and are written to `ignored_drop_events` instead
 - use `python -m gtapilot.blackbox.audit --metadata-path ...` to summarize
   cadence, repeat rate, transport gaps, writer lag, native overload stats, and
   native timing summaries

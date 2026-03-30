@@ -4,7 +4,7 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any
 
-from gtapilot.ipc.codecs import JsonDataclassCodec, RawRGBFrameCodec
+from gtapilot.ipc.codecs import JsonDataclassCodec, SharedMemoryFrameCodec
 from gtapilot.ipc.types import ChannelMessage, ChannelSpec
 
 ACTION_KEYS = (
@@ -151,11 +151,23 @@ def frame_capture_timestamp_ns(frame_message: ChannelMessage[Any]) -> int:
     )
 
 
+VISION_PREVIEW_CHANNEL = ChannelSpec(
+    name="vision.preview",
+    port="55551",
+    topic=b"preview",
+    codec=SharedMemoryFrameCodec("vision.preview", slot_count=4),
+    default_buffer_size=1,
+    default_latest_only=True,
+    default_sndhwm=1,
+    default_rcvhwm=1,
+)
+
+
 VISION_FRAMES_CHANNEL = ChannelSpec(
     name="vision.frames",
     port="55550",
     topic=b"frames",
-    codec=RawRGBFrameCodec(),
+    codec=SharedMemoryFrameCodec("vision.frames", slot_count=8),
     default_buffer_size=16,
     default_latest_only=False,
     default_sndhwm=8,

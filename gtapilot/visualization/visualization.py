@@ -9,7 +9,7 @@ import cv2
 from gtapilot.ipc.channel import ChannelSubscriber
 from gtapilot.ipc.channels import (
     INPUT_ACTIONS_CHANNEL,
-    VISION_FRAMES_CHANNEL,
+    VISION_PREVIEW_CHANNEL,
     frame_capture_timestamp_ns,
 )
 from gtapilot.ipc.settings_client import SettingsClient
@@ -22,6 +22,11 @@ SETTINGS_REFRESH_INTERVAL_SECONDS = 0.5
 ACTION_ALIGNMENT_HISTORY_SIZE = 32
 ACTION_ALIGNMENT_FUTURE_TOLERANCE_NS = 25_000_000
 WINDOW_NAME = "GTA Pilot Visualization"
+OVERLAY_LEFT = 8
+OVERLAY_TOP = 18
+OVERLAY_LINE_STEP = 24
+OVERLAY_FONT_SCALE = 0.5
+OVERLAY_THICKNESS = 1
 
 
 @dataclass(slots=True, frozen=True)
@@ -162,11 +167,11 @@ def _draw_text(frame, text: str, y: int, color=(0, 255, 0)):
     cv2.putText(
         frame,
         text,
-        (20, y),
+        (OVERLAY_LEFT, y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
+        OVERLAY_FONT_SCALE,
         color,
-        2,
+        OVERLAY_THICKNESS,
         cv2.LINE_AA,
     )
 
@@ -233,7 +238,7 @@ def main(
     settings_rpc_port: str = SETTINGS_RPC_PORT,
 ):
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    vision_subscriber = ChannelSubscriber(VISION_FRAMES_CHANNEL, latest_only=True)
+    vision_subscriber = ChannelSubscriber(VISION_PREVIEW_CHANNEL, latest_only=True)
     action_subscriber = ChannelSubscriber(
         INPUT_ACTIONS_CHANNEL,
         buffer_size=ACTION_ALIGNMENT_HISTORY_SIZE,
@@ -259,8 +264,6 @@ def main(
                 continue
 
             frame = packet.payload
-            if frame.shape[0] != 1080 or frame.shape[1] != 1920:
-                frame = cv2.resize(frame, (1920, 1080), interpolation=cv2.INTER_LINEAR)
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             frame_count += 1
@@ -288,8 +291,15 @@ def main(
             record_hotkey = str(
                 settings_client.get("blackbox.record_hotkey", "F8")
             )
-            frame_nominal_fps = float(
+            preview_nominal_fps = float(
                 packet.envelope.metadata.get("nominal_fps", 0.0) or 0.0
+            )
+            source_nominal_fps = float(
+                packet.envelope.metadata.get(
+                    "source_nominal_fps",
+                    preview_nominal_fps,
+                )
+                or 0.0
             )
             is_repeat = bool(packet.envelope.metadata.get("is_repeat", False))
             capture_mode = str(
@@ -302,23 +312,30 @@ def main(
                 packet.envelope.metadata.get("target_window_hwnd", "")
             )
 
-            _draw_text(frame, f"FPS: {fps:.2f} nominal={frame_nominal_fps:.2f}", 40)
+            line_y = OVERLAY_TOP
+            _draw_text(
+                frame,
+                f"Preview FPS: {fps:.2f} preview={preview_nominal_fps:.2f} source={source_nominal_fps:.2f}",
+                line_y,
+            )
+            line_y += OVERLAY_LINE_STEP
             _draw_text(
                 frame,
                 f"Frame {packet.envelope.metadata.get('frame_id', '?')} "
                 f"capture={packet.envelope.metadata.get('capture_frame_id', '?')} "
                 f"mode={capture_mode} repeat={1 if is_repeat else 0}",
-                80,
+                line_y,
             )
+            line_y += OVERLAY_LINE_STEP
             if target_window_title:
                 _draw_text(
                     frame,
                     f"Target: {target_window_title}",
-                    120,
+                    line_y,
                 )
-                action_base_y = 160
-            else:
-                action_base_y = 120
+                line_y += OVERLAY_LINE_STEP
+
+            action_base_y = line_y
 
             if action is not None:
                 action_source = (
@@ -335,30 +352,34 @@ def main(
                     action_base_y,
                     color=(255, 255, 0),
                 )
+                action_base_y += OVERLAY_LINE_STEP
                 pilot_mode = "POLICY" if action.pilot_active >= 0.5 else "MANUAL"
                 _draw_text(
                     frame,
                     f"Pilot: {pilot_mode} action_source={action_source}",
-                    action_base_y + 40,
+                    action_base_y,
                     color=(255, 255, 0),
                 )
+                action_base_y += OVERLAY_LINE_STEP
                 _draw_text(
                     frame,
                     _input_device_overlay(action),
-                    action_base_y + 80,
+                    action_base_y,
                     color=(255, 255, 0),
                 )
+                action_base_y += OVERLAY_LINE_STEP
                 controller_summary = _controller_summary_overlay(action)
                 if controller_summary is not None:
                     _draw_text(
                         frame,
                         controller_summary,
-                        action_base_y + 120,
+                        action_base_y,
                         color=(255, 255, 0),
                     )
-                    blackbox_y = action_base_y + 160
+                    action_base_y += OVERLAY_LINE_STEP
+                    blackbox_y = action_base_y
                 else:
-                    blackbox_y = action_base_y + 120
+                    blackbox_y = action_base_y
             else:
                 blackbox_y = action_base_y
 

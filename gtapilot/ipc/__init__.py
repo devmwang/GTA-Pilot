@@ -2,9 +2,15 @@ from gtapilot.ipc.channel import ChannelPublisher, ChannelSubscriber
 from gtapilot.ipc.channels import (
     INPUT_ACTIONS_CHANNEL,
     VISION_FRAMES_CHANNEL,
+    VISION_PREVIEW_CHANNEL,
     ActionPacket,
 )
-from gtapilot.ipc.codecs import ChannelCodec, JsonDataclassCodec, RawRGBFrameCodec
+from gtapilot.ipc.codecs import (
+    ChannelCodec,
+    JsonDataclassCodec,
+    RawRGBFrameCodec,
+    SharedMemoryFrameCodec,
+)
 from gtapilot.ipc.settings_client import SettingsClient
 from gtapilot.ipc.settings_registry import (
     SETTINGS_RPC_PORT,
@@ -32,6 +38,7 @@ __all__ = [
     "INPUT_ACTIONS_CHANNEL",
     "JsonDataclassCodec",
     "RawRGBFrameCodec",
+    "SharedMemoryFrameCodec",
     "SettingSpec",
     "SettingValue",
     "SettingsClient",
@@ -42,5 +49,6 @@ __all__ = [
     "SETTINGS_UPDATES_PORT",
     "SETTINGS_UPDATES_TOPIC",
     "VISION_FRAMES_CHANNEL",
+    "VISION_PREVIEW_CHANNEL",
     "build_settings_registry",
 ]

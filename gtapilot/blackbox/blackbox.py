@@ -37,7 +37,7 @@ from gtapilot.ipc.types import (
 )
 
 DEFAULT_OUTPUT_DIR = Path("blackbox-recordings")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 1
 PREROLL_JPEG_QUALITY = 85
 SETTINGS_REFRESH_INTERVAL_SECONDS = 0.5
 VIDEO_CODEC = "libx264"
@@ -59,6 +59,8 @@ PREROLL_FRAME_BUFFER_HEADROOM = 8
 PREROLL_ACTION_BUFFER_HEADROOM = 32
 INGEST_MODE_INACTIVE = "inactive"
 INGEST_MODE_ACTIVE = "active"
+INTEGRITY_EDGE_GRACE_SECONDS = 5.0
+INTEGRITY_EDGE_GRACE_NS = int(INTEGRITY_EDGE_GRACE_SECONDS * 1_000_000_000)
 
 T = TypeVar("T")
 
@@ -304,12 +306,8 @@ def _frame_entry_from_task(
     }
 
 
-def _frame_bgr_from_rgb(frame_rgb: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-
 def _encode_preroll_jpeg(frame_rgb: np.ndarray) -> bytes | None:
-    frame_bgr = _frame_bgr_from_rgb(frame_rgb)
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     success, buffer = cv2.imencode(
         ".jpg",
         frame_bgr,
@@ -457,6 +455,93 @@ def _frame_gap_stats(frame_payloads: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _session_data_window_ns(
+    *,
+    frame_payloads: list[dict[str, Any]],
+    action_payloads: list[dict[str, Any]],
+    created_timestamp_ns: int,
+) -> tuple[int, int]:
+    timestamps_ns: list[int] = []
+    for frame_payload in frame_payloads:
+        timestamp_ns = int(
+            frame_payload.get(
+                "capture_timestamp_ns",
+                frame_payload.get("publish_timestamp_ns", 0),
+            )
+            or 0
+        )
+        if timestamp_ns > 0:
+            timestamps_ns.append(timestamp_ns)
+
+    for action_payload in action_payloads:
+        envelope = dict(action_payload.get("envelope") or {})
+        timestamp_ns = int(
+            envelope.get(
+                "message_timestamp_ns",
+                action_payload.get("subscriber_received_timestamp_ns", 0),
+            )
+            or 0
+        )
+        if timestamp_ns > 0:
+            timestamps_ns.append(timestamp_ns)
+
+    if not timestamps_ns:
+        fallback_timestamp_ns = max(0, int(created_timestamp_ns))
+        return fallback_timestamp_ns, fallback_timestamp_ns
+
+    return min(timestamps_ns), max(timestamps_ns)
+
+
+def _is_grace_filterable_drop_event(event: dict[str, Any]) -> bool:
+    kind = str(event.get("kind", ""))
+    channel = str(event.get("channel", ""))
+    if kind in {"writer_frame_queue_overflow", "writer_action_queue_overflow"}:
+        return True
+    if kind == "native_overload":
+        return True
+    if kind in {"sequence_gap", "local_overflow"} and channel in {
+        VISION_FRAMES_CHANNEL.name,
+        INPUT_ACTIONS_CHANNEL.name,
+    }:
+        return True
+    return False
+
+
+def _split_drop_events_for_integrity(
+    *,
+    drop_events: list[dict[str, Any]],
+    session_start_timestamp_ns: int,
+    session_end_timestamp_ns: int,
+    grace_window_ns: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not drop_events:
+        return [], []
+
+    effective_drop_events: list[dict[str, Any]] = []
+    ignored_drop_events: list[dict[str, Any]] = []
+    grace_window_ns = max(0, int(grace_window_ns))
+    for drop_event in drop_events:
+        if grace_window_ns <= 0 or not _is_grace_filterable_drop_event(drop_event):
+            effective_drop_events.append(drop_event)
+            continue
+
+        timestamp_ns = int(drop_event.get("timestamp_ns", 0) or 0)
+        if timestamp_ns <= 0:
+            effective_drop_events.append(drop_event)
+            continue
+
+        if (
+            timestamp_ns <= session_start_timestamp_ns + grace_window_ns
+            or timestamp_ns >= session_end_timestamp_ns - grace_window_ns
+        ):
+            ignored_drop_events.append(dict(drop_event))
+            continue
+
+        effective_drop_events.append(drop_event)
+
+    return effective_drop_events, ignored_drop_events
+
+
 def _native_capture_timing_summary(
     frame_payloads: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -524,7 +609,7 @@ class FFmpegVideoWriter:
             "-f",
             "rawvideo",
             "-pixel_format",
-            "bgr24",
+            "rgb24",
             "-video_size",
             f"{config.width}x{config.height}",
             "-framerate",
@@ -566,15 +651,15 @@ class FFmpegVideoWriter:
         detail = f" {stderr_text}" if stderr_text else ""
         raise RuntimeError(f"{context}.{detail}".strip())
 
-    def write_frame(self, frame_bgr: np.ndarray) -> None:
+    def write_frame(self, frame_rgb: np.ndarray) -> None:
         if self._closed:
             raise RuntimeError("ffmpeg video writer is already closed.")
 
         if (
-            frame_bgr.ndim != 3
-            or frame_bgr.shape[0] != self.config.height
-            or frame_bgr.shape[1] != self.config.width
-            or frame_bgr.shape[2] != 3
+            frame_rgb.ndim != 3
+            or frame_rgb.shape[0] != self.config.height
+            or frame_rgb.shape[1] != self.config.width
+            or frame_rgb.shape[2] != 3
         ):
             raise RuntimeError(
                 "Frame shape does not match active blackbox video session format."
@@ -583,9 +668,9 @@ class FFmpegVideoWriter:
         if self._process.stdin is None:
             self._raise_process_failure("ffmpeg stdin is not available")
 
-        frame_bgr = np.ascontiguousarray(frame_bgr)
+        frame_rgb = np.ascontiguousarray(frame_rgb)
         try:
-            self._process.stdin.write(memoryview(frame_bgr))
+            self._process.stdin.write(memoryview(frame_rgb))
         except BrokenPipeError:
             self._raise_process_failure("ffmpeg exited while writing blackbox video")
 
@@ -729,8 +814,7 @@ class BlackboxSessionWriter:
             self._action_flush_items = 0
 
     def _write_frame_task(self, task: FrameWriteTask) -> None:
-        frame_bgr = _frame_bgr_from_rgb(task.frame_rgb)
-        self._video_writer.write_frame(frame_bgr)
+        self._video_writer.write_frame(task.frame_rgb)
         writer_committed_timestamp_ns = time.time_ns()
         self._frames_written += 1
         frame_entry = _frame_entry_from_task(
@@ -1011,7 +1095,6 @@ class BlackboxRecorder:
             return
         pipeline_stats = frame_metadata.get("pipeline_stats")
         if not isinstance(pipeline_stats, dict):
-            self._session_native_overload_active = False
             return
         overload_active = bool(pipeline_stats.get("overload_active", False))
         if overload_active and not self._session_native_overload_active:
@@ -1180,8 +1263,11 @@ class BlackboxRecorder:
             frame_message.subscriber_received_timestamp_ns
             or frame_message.envelope.publish_timestamp_ns
         )
+        frame_rgb = np.asarray(frame_message.payload, dtype=np.uint8)
+        if not frame_rgb.flags["C_CONTIGUOUS"]:
+            frame_rgb = np.ascontiguousarray(frame_rgb)
         return FrameWriteTask(
-            frame_rgb=np.asarray(frame_message.payload, dtype=np.uint8).copy(),
+            frame_rgb=frame_rgb,
             frame_envelope=frame_message.envelope,
             frame_metadata=dict(frame_message.envelope.metadata),
             capture_timestamp_ns=frame_capture_timestamp_ns(frame_message),
@@ -1297,7 +1383,7 @@ class BlackboxRecorder:
                 self._session_transport_baselines.get("actions"),
             ),
         }
-        drop_events = list(self._session_drop_events) + list(writer_drop_events)
+        raw_drop_events = list(self._session_drop_events) + list(writer_drop_events)
         gap_stats = _frame_gap_stats(frame_payloads)
         repeat_frame_count = sum(
             1
@@ -1318,16 +1404,19 @@ class BlackboxRecorder:
                 fresh_capture_frame_count += 1
                 last_capture_frame_id = capture_frame_id
 
-        integrity_degraded = bool(drop_events)
-        integrity_degraded = integrity_degraded or bool(
-            transport_stats["vision"]["missing_message_count"]
-            or transport_stats["vision"]["local_overflow_dropped_messages"]
-            or transport_stats["actions"]["missing_message_count"]
-            or transport_stats["actions"]["local_overflow_dropped_messages"]
-            or writer_stats["frame_queue_dropped_frames"]
-            or writer_stats["action_queue_dropped_entries"]
-            or native_pipeline_summary.get("missed_publish_deadlines", 0)
+        session_start_timestamp_ns, session_end_timestamp_ns = _session_data_window_ns(
+            frame_payloads=frame_payloads,
+            action_payloads=action_payloads,
+            created_timestamp_ns=self._session_created_timestamp_ns,
         )
+        drop_events, ignored_drop_events = _split_drop_events_for_integrity(
+            drop_events=raw_drop_events,
+            session_start_timestamp_ns=session_start_timestamp_ns,
+            session_end_timestamp_ns=session_end_timestamp_ns,
+            grace_window_ns=INTEGRITY_EDGE_GRACE_NS,
+        )
+
+        integrity_degraded = bool(drop_events)
 
         performance_stats = {
             "native_capture": native_capture_performance,
@@ -1386,6 +1475,8 @@ class BlackboxRecorder:
             "session_integrity": {
                 "status": "degraded" if integrity_degraded else "ok",
                 "drop_event_count": int(len(drop_events)),
+                "ignored_drop_event_count": int(len(ignored_drop_events)),
+                "edge_grace_window_seconds": float(INTEGRITY_EDGE_GRACE_SECONDS),
             },
             "session_stats": {
                 "frame_count": int(len(frame_payloads)),
@@ -1394,11 +1485,14 @@ class BlackboxRecorder:
                 "fresh_capture_frame_count": int(fresh_capture_frame_count),
                 **gap_stats,
                 "native_pipeline": native_pipeline_summary,
+                "timeline_start_timestamp_ns": int(session_start_timestamp_ns),
+                "timeline_end_timestamp_ns": int(session_end_timestamp_ns),
             },
             "performance_stats": performance_stats,
             "transport_stats": transport_stats,
             "writer_stats": writer_stats,
             "drop_events": drop_events,
+            "ignored_drop_events": ignored_drop_events,
             "frames": frame_payloads,
             "actions": action_payloads,
         }

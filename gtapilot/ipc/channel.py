@@ -334,14 +334,6 @@ class ChannelSubscriber:
             self._buffer.clear()
             return messages
 
-    def transport_stats_snapshot(self) -> ChannelTransportStats:
-        with self._lock:
-            return self._transport_tracker.snapshot()
-
-    def drain_transport_events(self) -> list[ChannelTransportEvent]:
-        with self._lock:
-            return self._transport_tracker.drain_events()
-
     def close(self) -> None:
         self._running = False
         with self._lock:

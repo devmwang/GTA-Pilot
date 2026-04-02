@@ -176,22 +176,6 @@ def _draw_text(frame, text: str, y: int, color=(0, 255, 0)):
     )
 
 
-def _capture_overlay(
-    blackbox_enabled: bool,
-    recording_enabled: bool,
-    record_hotkey: str,
-) -> tuple[str, tuple[int, int, int]]:
-    if not blackbox_enabled:
-        return ("Blackbox: DISABLED", (128, 128, 128))
-    if recording_enabled:
-        return (f"Blackbox: REC hotkey={record_hotkey}", (0, 0, 255))
-    return (f"Blackbox: IDLE hotkey={record_hotkey}", (0, 128, 255))
-
-
-def _input_device_overlay(action) -> str:
-    return f"Input Device: {action.active_device}"
-
-
 def _controller_summary_overlay(action) -> str | None:
     controller_inputs = dict(action.device_inputs.get("xinput_controller", {}))
     if not bool(controller_inputs.get("connected", False)):
@@ -312,30 +296,21 @@ def main(
                 packet.envelope.metadata.get("target_window_hwnd", "")
             )
 
-            line_y = OVERLAY_TOP
-            _draw_text(
-                frame,
-                f"Preview FPS: {fps:.2f} preview={preview_nominal_fps:.2f} source={source_nominal_fps:.2f}",
-                line_y,
-            )
-            line_y += OVERLAY_LINE_STEP
-            _draw_text(
-                frame,
-                f"Frame {packet.envelope.metadata.get('frame_id', '?')} "
-                f"capture={packet.envelope.metadata.get('capture_frame_id', '?')} "
-                f"mode={capture_mode} repeat={1 if is_repeat else 0}",
-                line_y,
-            )
-            line_y += OVERLAY_LINE_STEP
+            overlay_rows: list[tuple[str, tuple[int, int, int]]] = [
+                (
+                    f"Preview FPS: {fps:.2f} preview={preview_nominal_fps:.2f} "
+                    f"source={source_nominal_fps:.2f}",
+                    (0, 255, 0),
+                ),
+                (
+                    f"Frame {packet.envelope.metadata.get('frame_id', '?')} "
+                    f"capture={packet.envelope.metadata.get('capture_frame_id', '?')} "
+                    f"mode={capture_mode} repeat={1 if is_repeat else 0}",
+                    (0, 255, 0),
+                ),
+            ]
             if target_window_title:
-                _draw_text(
-                    frame,
-                    f"Target: {target_window_title}",
-                    line_y,
-                )
-                line_y += OVERLAY_LINE_STEP
-
-            action_base_y = line_y
+                overlay_rows.append((f"Target: {target_window_title}", (0, 255, 0)))
 
             if action is not None:
                 action_source = (
@@ -343,57 +318,43 @@ def main(
                     if action_message is None
                     else action_message.envelope.source
                 )
-                _draw_text(
-                    frame,
-                    "Action "
-                    f"steer={action.steer:+.1f} throttle={action.throttle:.1f} "
-                    f"brake={action.brake:.1f} handbrake={action.handbrake:.1f} "
-                    f"reverse={action.reverse:.1f}",
-                    action_base_y,
-                    color=(255, 255, 0),
+                overlay_rows.append(
+                    (
+                        "Action "
+                        f"steer={action.steer:+.1f} throttle={action.throttle:.1f} "
+                        f"brake={action.brake:.1f} handbrake={action.handbrake:.1f} "
+                        f"reverse={action.reverse:.1f}",
+                        (255, 255, 0),
+                    )
                 )
-                action_base_y += OVERLAY_LINE_STEP
                 pilot_mode = "POLICY" if action.pilot_active >= 0.5 else "MANUAL"
-                _draw_text(
-                    frame,
-                    f"Pilot: {pilot_mode} action_source={action_source}",
-                    action_base_y,
-                    color=(255, 255, 0),
+                overlay_rows.append(
+                    (
+                        f"Pilot: {pilot_mode} action_source={action_source}",
+                        (255, 255, 0),
+                    )
                 )
-                action_base_y += OVERLAY_LINE_STEP
-                _draw_text(
-                    frame,
-                    _input_device_overlay(action),
-                    action_base_y,
-                    color=(255, 255, 0),
+                overlay_rows.append(
+                    (f"Input Device: {action.active_device}", (255, 255, 0))
                 )
-                action_base_y += OVERLAY_LINE_STEP
                 controller_summary = _controller_summary_overlay(action)
                 if controller_summary is not None:
-                    _draw_text(
-                        frame,
-                        controller_summary,
-                        action_base_y,
-                        color=(255, 255, 0),
-                    )
-                    action_base_y += OVERLAY_LINE_STEP
-                    blackbox_y = action_base_y
-                else:
-                    blackbox_y = action_base_y
-            else:
-                blackbox_y = action_base_y
+                    overlay_rows.append((controller_summary, (255, 255, 0)))
 
-            capture_text, capture_color = _capture_overlay(
-                blackbox_enabled,
-                recording_enabled,
-                record_hotkey,
-            )
-            _draw_text(
-                frame,
-                capture_text,
-                blackbox_y,
-                color=capture_color,
-            )
+            if not blackbox_enabled:
+                overlay_rows.append(("Blackbox: DISABLED", (128, 128, 128)))
+            elif recording_enabled:
+                overlay_rows.append((f"Blackbox: REC hotkey={record_hotkey}", (0, 0, 255)))
+            else:
+                overlay_rows.append((f"Blackbox: IDLE hotkey={record_hotkey}", (0, 128, 255)))
+
+            for row_index, (text, color) in enumerate(overlay_rows):
+                _draw_text(
+                    frame,
+                    text,
+                    OVERLAY_TOP + row_index * OVERLAY_LINE_STEP,
+                    color=color,
+                )
 
             if target_window_hwnd != positioned_for_target_window_hwnd:
                 _position_visualization_window(target_window_hwnd=target_window_hwnd)

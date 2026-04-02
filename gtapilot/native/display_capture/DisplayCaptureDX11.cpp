@@ -162,11 +162,6 @@ struct WindowCandidate {
     std::wstring executable;
 };
 
-struct WindowMatch {
-    WindowCandidate candidate;
-    std::vector<WindowCandidate> candidates;
-};
-
 struct AdapterSelection {
     ComPtr<IDXGIAdapter1> adapter;
     DXGI_ADAPTER_DESC1 desc{};
@@ -268,7 +263,7 @@ static std::string describe_candidate(const WindowCandidate &candidate) {
            utf8_from_hwnd(candidate.hwnd);
 }
 
-static WindowMatch find_gta_window_or_throw() {
+static WindowCandidate find_gta_window_or_throw() {
     WindowSearchState state;
     EnumWindows(enum_windows_for_gta, reinterpret_cast<LPARAM>(&state));
 
@@ -278,11 +273,8 @@ static WindowMatch find_gta_window_or_throw() {
             "windowed mode before launching the runtime.");
     }
 
-    WindowMatch match;
-    match.candidates = state.candidates;
     if (state.candidates.size() == 1) {
-        match.candidate = state.candidates.front();
-        return match;
+        return state.candidates.front();
     }
 
     const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
@@ -295,8 +287,7 @@ static WindowMatch find_gta_window_or_throw() {
         }
     }
     if (foregroundMatchCount == 1 && foregroundCandidate != nullptr) {
-        match.candidate = *foregroundCandidate;
-        return match;
+        return *foregroundCandidate;
     }
 
     std::string message =
@@ -458,7 +449,6 @@ struct ReadbackSlot {
     std::vector<uint8_t> bgra;
     uint64_t captureTimestampNs = 0;
     uint64_t captureFrameId = 0;
-    uint64_t frameArrivalWaitNs = 0;
     uint64_t gpuReadbackNs = 0;
 };
 
@@ -467,9 +457,6 @@ struct ConvertedSlot {
     std::vector<uint8_t> previewRgb;
     uint64_t captureTimestampNs = 0;
     uint64_t captureFrameId = 0;
-    uint64_t frameArrivalWaitNs = 0;
-    uint64_t gpuReadbackNs = 0;
-    uint64_t cpuConvertNs = 0;
 };
 
 static void ensure_readback_slot(ID3D11Device *device, UINT width, UINT height,
@@ -531,16 +518,9 @@ static void initialize_slot_queues(SharedPipelineState &state) {
     }
 }
 
-static void update_max_atomic(std::atomic<int> &target, int value) {
-    int current = target.load();
-    while (value > current &&
-           !target.compare_exchange_weak(current, value)) {
-    }
-}
-
-static void update_max_atomic_u64(std::atomic<uint64_t> &target,
-                                  uint64_t value) {
-    uint64_t current = target.load();
+template <typename T>
+static void update_max_atomic(std::atomic<T> &target, T value) {
+    T current = target.load();
     while (value > current &&
            !target.compare_exchange_weak(current, value)) {
     }
@@ -574,35 +554,6 @@ static void convertBGRA_to_RGB_resized(const uint8_t *bgra, int srcW, int srcH,
             drow[x * 3 + 0] = p[2];
             drow[x * 3 + 1] = p[1];
             drow[x * 3 + 2] = p[0];
-        }
-    }
-}
-
-static void resize_RGB_nearest(const std::vector<uint8_t> &srcRGB, int srcW,
-                               int srcH, int outW, int outH,
-                               std::vector<uint8_t> &outRGB) {
-    const size_t requiredSize =
-        static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3U;
-    if (outRGB.size() != requiredSize) {
-        outRGB.resize(requiredSize);
-    }
-    if (srcW == outW && srcH == outH) {
-        std::memcpy(outRGB.data(), srcRGB.data(), requiredSize);
-        return;
-    }
-    for (int y = 0; y < outH; ++y) {
-        const int sy = y * srcH / outH;
-        const uint8_t *srow =
-            srcRGB.data() + static_cast<size_t>(sy) * static_cast<size_t>(srcW) * 3U;
-        uint8_t *drow =
-            outRGB.data() + static_cast<size_t>(y) * static_cast<size_t>(outW) * 3U;
-        for (int x = 0; x < outW; ++x) {
-            const int sx = x * srcW / outW;
-            const uint8_t *sp = srow + static_cast<size_t>(sx) * 3U;
-            uint8_t *dp = drow + static_cast<size_t>(x) * 3U;
-            dp[0] = sp[0];
-            dp[1] = sp[1];
-            dp[2] = sp[2];
         }
     }
 }
@@ -649,6 +600,11 @@ struct SharedFrameWriteDescriptor {
     int slotIndex = 0;
     uint64_t slotGeneration = 0;
     size_t frameBytes = 0;
+};
+
+struct CaptureTargetMetadata {
+    std::string title;
+    uint64_t hwnd = 0;
 };
 
 class SharedFrameRingWriter {
@@ -738,8 +694,8 @@ class SharedFrameRingWriter {
 
 static json build_frame_metadata(
     int width, int height, uint64_t frameId, uint64_t captureFrameId,
-    uint64_t captureTimestampNs, bool isRepeat, double nominalFps,
-    const WindowCandidate &targetWindow,
+    uint64_t captureTimestampNs, double nominalFps,
+    const CaptureTargetMetadata &targetWindow,
     const SharedFrameWriteDescriptor &descriptor, const PipelineTelemetry *telemetry,
     bool overloadActive, const char *captureSource) {
     json metadata = {
@@ -751,11 +707,10 @@ static json build_frame_metadata(
         {"capture_frame_id", captureFrameId},
         {"nominal_fps", nominalFps},
         {"capture_timestamp_ns", captureTimestampNs},
-        {"is_repeat", isRepeat},
+        {"is_repeat", false},
         {"capture_mode", CAPTURE_MODE},
-        {"target_window_title", utf8_from_wide(targetWindow.title)},
-        {"target_window_hwnd",
-         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(targetWindow.hwnd))},
+        {"target_window_title", targetWindow.title},
+        {"target_window_hwnd", targetWindow.hwnd},
         {"shm_name", descriptor.shmName},
         {"slot_bytes", descriptor.slotBytes},
         {"slot_index", descriptor.slotIndex},
@@ -782,16 +737,15 @@ static void publish_shared_frame(zmq::socket_t &socket,
                                  uint64_t frameId,
                                  uint64_t captureFrameId,
                                  uint64_t captureTimestampNs,
-                                 bool isRepeat,
                                  double nominalFps,
-                                 const WindowCandidate &targetWindow,
+                                 const CaptureTargetMetadata &targetWindow,
                                  const PipelineTelemetry *telemetry,
                                  bool overloadActive,
                                  json extraMetadata = json::object()) {
     const SharedFrameWriteDescriptor descriptor = writer.write(frameData, frameBytes);
     json metadata = build_frame_metadata(width, height, frameId,
                                          captureFrameId, captureTimestampNs,
-                                         isRepeat, nominalFps, targetWindow, descriptor,
+                                         nominalFps, targetWindow, descriptor,
                                          telemetry, overloadActive, sourceName);
     for (auto it = extraMetadata.begin(); it != extraMetadata.end(); ++it) {
         metadata[it.key()] = it.value();
@@ -817,15 +771,15 @@ static void publish_shared_frame(zmq::socket_t &socket,
 static void publish_frame(zmq::socket_t &pubRAW,
                           SharedFrameRingWriter &frameWriter,
                           const ConvertedSlot &frame,
-                          uint64_t publishFrameId, bool isRepeat, int rawW,
+                          uint64_t publishFrameId, int rawW,
                           int rawH, const PipelineTelemetry &telemetry,
                           bool overloadActive,
-                          const WindowCandidate &targetWindow,
+                          const CaptureTargetMetadata &targetWindow,
                           bool includeTelemetry) {
     publish_shared_frame(pubRAW, frameWriter, FRAMES_CPU_TOPIC, VISION_CHANNEL,
                          FRAME_SOURCE, frame.rgb.data(), frame.rgb.size(), rawW,
                          rawH, publishFrameId, publishFrameId,
-                         frame.captureFrameId, frame.captureTimestampNs, isRepeat,
+                         frame.captureFrameId, frame.captureTimestampNs,
                          FRAME_NOMINAL_FPS, targetWindow,
                          includeTelemetry ? &telemetry : nullptr, overloadActive);
 }
@@ -835,13 +789,13 @@ static void publish_preview_frame(zmq::socket_t &pubPreview,
                                   const ConvertedSlot &frame,
                                   uint64_t previewSequenceId,
                                   uint64_t sourceFrameId,
-                                  const WindowCandidate &targetWindow,
+                                  const CaptureTargetMetadata &targetWindow,
                                   double previewNominalFps) {
     publish_shared_frame(
         pubPreview, previewWriter, FRAMES_PREVIEW_TOPIC, PREVIEW_CHANNEL,
         PREVIEW_SOURCE, frame.previewRgb.data(), frame.previewRgb.size(), PREVIEW_W,
         PREVIEW_H, previewSequenceId, sourceFrameId, frame.captureFrameId,
-        frame.captureTimestampNs, false, previewNominalFps, targetWindow, nullptr,
+        frame.captureTimestampNs, previewNominalFps, targetWindow, nullptr,
         false, json{{"preview_source", VISION_CHANNEL},
                     {"source_nominal_fps", FRAME_NOMINAL_FPS}});
 }
@@ -1027,13 +981,19 @@ class WindowCaptureSession {
         hrx(_context->Map(slot.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped),
             "Map staging");
         const auto *src = reinterpret_cast<const uint8_t *>(mapped.pData);
-        for (UINT y = 0; y < cropHeight; ++y) {
-            const auto *srcRow =
-                src + static_cast<size_t>(y) * mapped.RowPitch;
-            std::memcpy(
-                &slot.bgra[static_cast<size_t>(y) *
-                           static_cast<size_t>(cropWidth) * 4U],
-                srcRow, static_cast<size_t>(cropWidth) * 4U);
+        const size_t rowBytes =
+            static_cast<size_t>(cropWidth) * 4U;
+        if (mapped.RowPitch == rowBytes) {
+            std::memcpy(slot.bgra.data(), src, rowBytes * cropHeight);
+        } else {
+            for (UINT y = 0; y < cropHeight; ++y) {
+                const auto *srcRow =
+                    src + static_cast<size_t>(y) * mapped.RowPitch;
+                std::memcpy(
+                    slot.bgra.data() +
+                        static_cast<size_t>(y) * rowBytes,
+                    srcRow, rowBytes);
+            }
         }
         _context->Unmap(slot.staging.Get(), 0);
         slot.gpuReadbackNs =
@@ -1142,7 +1102,11 @@ int main(int argc, char **argv) {
                   << " telemetry_interval=" << telemetrySampleInterval
                   << "\n";
 
-        WindowMatch targetMatch = find_gta_window_or_throw();
+        WindowCandidate targetWindow = find_gta_window_or_throw();
+        const CaptureTargetMetadata targetWindowMetadata{
+            utf8_from_wide(targetWindow.title),
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(targetWindow.hwnd)),
+        };
 
         zmq::context_t zctx(1);
         zmq::socket_t pubRAW(zctx, zmq::socket_type::pub);
@@ -1181,7 +1145,7 @@ int main(int argc, char **argv) {
 
         std::thread acquisitionThread([&]() {
             try {
-                WindowCaptureSession capture(targetMatch.candidate);
+                WindowCaptureSession capture(targetWindow);
                 capture.initialize();
 
                 uint64_t captureFrameId = 0;
@@ -1223,15 +1187,14 @@ int main(int argc, char **argv) {
                     capture.copy_client_frame_to_bgra(frame, rawSlot);
                     rawSlot.captureTimestampNs = unix_time_ns();
                     rawSlot.captureFrameId = ++captureFrameId;
-                    rawSlot.frameArrivalWaitNs = frameArrivalWaitNs;
                     telemetry.freshFramesAcquired.store(captureFrameId);
                     telemetry.sampleCaptureFrameId.store(captureFrameId);
                     telemetry.lastFrameArrivalWaitNs.store(frameArrivalWaitNs);
-                    update_max_atomic_u64(telemetry.maxFrameArrivalWaitNs,
-                                          frameArrivalWaitNs);
+                    update_max_atomic(telemetry.maxFrameArrivalWaitNs,
+                                      frameArrivalWaitNs);
                     telemetry.lastGpuReadbackNs.store(rawSlot.gpuReadbackNs);
-                    update_max_atomic_u64(telemetry.maxGpuReadbackNs,
-                                          rawSlot.gpuReadbackNs);
+                    update_max_atomic(telemetry.maxGpuReadbackNs,
+                                      rawSlot.gpuReadbackNs);
 
                     {
                         std::lock_guard<std::mutex> lock(state.mutex);
@@ -1287,8 +1250,11 @@ int main(int argc, char **argv) {
                         static_cast<int>(rawSlot.width) * 4, rawW, rawH,
                         convertedFrame.rgb);
                     if (previewEnabled) {
-                        resize_RGB_nearest(convertedFrame.rgb, rawW, rawH, PREVIEW_W,
-                                           PREVIEW_H, convertedFrame.previewRgb);
+                        convertBGRA_to_RGB_resized(
+                            rawSlot.bgra.data(), static_cast<int>(rawSlot.width),
+                            static_cast<int>(rawSlot.height),
+                            static_cast<int>(rawSlot.width) * 4, PREVIEW_W,
+                            PREVIEW_H, convertedFrame.previewRgb);
                     }
                     const uint64_t cpuConvertNs = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1296,14 +1262,10 @@ int main(int argc, char **argv) {
                             .count());
                     convertedFrame.captureTimestampNs = rawSlot.captureTimestampNs;
                     convertedFrame.captureFrameId = rawSlot.captureFrameId;
-                    convertedFrame.frameArrivalWaitNs = rawSlot.frameArrivalWaitNs;
-                    convertedFrame.gpuReadbackNs = rawSlot.gpuReadbackNs;
-                    convertedFrame.cpuConvertNs = cpuConvertNs;
                     telemetry.convertedFramesCompleted.fetch_add(1);
                     telemetry.sampleCaptureFrameId.store(rawSlot.captureFrameId);
                     telemetry.lastCpuConvertNs.store(cpuConvertNs);
-                    update_max_atomic_u64(telemetry.maxCpuConvertNs,
-                                          cpuConvertNs);
+                    update_max_atomic(telemetry.maxCpuConvertNs, cpuConvertNs);
 
                     const bool overloadActive =
                         telemetry.conversionBacklogDepth.load() > 1;
@@ -1312,8 +1274,8 @@ int main(int argc, char **argv) {
                         (convertedFrame.captureFrameId % telemetrySampleInterval) == 0;
 
                     publish_frame(pubRAW, frameWriter, convertedFrame,
-                                  publishFrameId, false, rawW, rawH, telemetry,
-                                  overloadActive, targetMatch.candidate,
+                                  publishFrameId, rawW, rawH, telemetry,
+                                  overloadActive, targetWindowMetadata,
                                   includeTelemetry);
                     telemetry.publishedFreshFrames.fetch_add(1);
 
@@ -1325,7 +1287,7 @@ int main(int argc, char **argv) {
                     ) {
                         publish_preview_frame(*pubPreview, *previewWriter,
                                               convertedFrame, previewSequenceId,
-                                              publishFrameId, targetMatch.candidate,
+                                              publishFrameId, targetWindowMetadata,
                                               previewMaxFps);
                         telemetry.previewFramesPublished.fetch_add(1);
                         lastPreviewCaptureTimestampNs =

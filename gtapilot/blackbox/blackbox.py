@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Callable, TypeVar
 
 import cv2
 import numpy as np
@@ -20,7 +20,6 @@ from gtapilot.ipc.channel import ChannelTransportTracker
 from gtapilot.ipc.channels import (
     INPUT_ACTIONS_CHANNEL,
     VISION_FRAMES_CHANNEL,
-    frame_capture_timestamp_ns,
 )
 from gtapilot.ipc.settings_client import SettingsClient
 from gtapilot.ipc.settings_registry import (
@@ -53,6 +52,7 @@ WRITER_JOURNAL_FLUSH_ITEMS = 60
 RECORDER_VISION_RCVHWM = 32
 RECORDER_ACTION_RCVHWM = 128
 POLL_TIMEOUT_MS = 100
+POLL_TIMEOUT_SECONDS = POLL_TIMEOUT_MS / 1000.0
 VISION_DRAIN_BATCH_LIMIT = 4
 ACTION_DRAIN_BATCH_LIMIT = 128
 PREROLL_FRAME_BUFFER_HEADROOM = 8
@@ -67,7 +67,6 @@ T = TypeVar("T")
 
 @dataclass(slots=True)
 class BlackboxSessionPaths:
-    output_dir: Path
     video_path: Path
     metadata_path: Path
     frames_journal_path: Path
@@ -80,11 +79,6 @@ class VideoSessionConfig:
     width: int
     height: int
     nominal_fps: float
-    codec: str = VIDEO_CODEC
-    container: str = VIDEO_CONTAINER
-    pixel_format: str = VIDEO_PIXEL_FORMAT
-    preset: str = VIDEO_PRESET
-    crf: int = VIDEO_CRF
 
 
 @dataclass(slots=True, frozen=True)
@@ -97,10 +91,6 @@ class AlignedActionData:
 @dataclass(slots=True)
 class BufferedFrame:
     frame_envelope: ChannelEnvelope
-    frame_metadata: dict[str, Any]
-    capture_timestamp_ns: int
-    resolution_height: int
-    resolution_width: int
     jpeg_bytes: bytes
     aligned_action: AlignedActionData
     subscriber_received_timestamp_ns: int
@@ -111,10 +101,6 @@ class BufferedFrame:
 class FrameWriteTask:
     frame_rgb: np.ndarray
     frame_envelope: ChannelEnvelope
-    frame_metadata: dict[str, Any]
-    capture_timestamp_ns: int
-    resolution_height: int
-    resolution_width: int
     aligned_action: AlignedActionData
     subscriber_received_timestamp_ns: int
     subscriber_queue_latency_ns: int
@@ -131,7 +117,6 @@ def _build_session_paths(output_dir: Path) -> BlackboxSessionPaths:
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_prefix = f"capture_{session_timestamp}"
     return BlackboxSessionPaths(
-        output_dir=output_dir,
         video_path=output_dir / f"{output_prefix}_video{VIDEO_FILE_SUFFIX}",
         metadata_path=output_dir / f"{output_prefix}_metadata.json",
         frames_journal_path=output_dir / f"{output_prefix}_frames.tmp.jsonl",
@@ -150,6 +135,17 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             continue
         records.append(json.loads(stripped))
     return records
+
+
+def _bounded_append(
+    queue: collections.deque[T],
+    item: T,
+    *,
+    capacity: int,
+) -> None:
+    queue.append(item)
+    while len(queue) > capacity:
+        queue.popleft()
 
 
 def _aligned_message_before_with_cursor(
@@ -186,10 +182,7 @@ def _format_nominal_fps(value: float) -> str:
 
 
 def _frame_config_from_parts(
-    *,
     frame_metadata: dict[str, Any],
-    resolution_height: int,
-    resolution_width: int,
 ) -> VideoSessionConfig:
     raw_nominal_fps = frame_metadata.get("nominal_fps")
     if raw_nominal_fps is None:
@@ -204,18 +197,9 @@ def _frame_config_from_parts(
         )
 
     return VideoSessionConfig(
-        width=int(frame_metadata.get("w", resolution_width)),
-        height=int(frame_metadata.get("h", resolution_height)),
+        width=int(frame_metadata["w"]),
+        height=int(frame_metadata["h"]),
         nominal_fps=_normalize_nominal_fps(nominal_fps),
-    )
-
-
-def _frame_config_from_message(frame_message: ChannelMessage[np.ndarray]) -> VideoSessionConfig:
-    frame_metadata = dict(frame_message.envelope.metadata)
-    return _frame_config_from_parts(
-        frame_metadata=frame_metadata,
-        resolution_height=int(frame_message.payload.shape[0]),
-        resolution_width=int(frame_message.payload.shape[1]),
     )
 
 
@@ -247,21 +231,32 @@ def _aligned_action_from_message(
     )
 
 
+def _subscriber_timestamps(
+    envelope: ChannelEnvelope,
+    subscriber_received_timestamp_ns: int | None,
+) -> tuple[int, int]:
+    received_timestamp_ns = int(
+        subscriber_received_timestamp_ns or envelope.publish_timestamp_ns
+    )
+    return received_timestamp_ns, max(
+        0,
+        received_timestamp_ns - int(envelope.publish_timestamp_ns),
+    )
+
+
 def _action_stream_entry(action_message: ChannelMessage) -> dict[str, Any]:
-    subscriber_received_timestamp_ns = int(
-        action_message.subscriber_received_timestamp_ns
-        or action_message.envelope.publish_timestamp_ns
+    subscriber_received_timestamp_ns, subscriber_queue_latency_ns = (
+        _subscriber_timestamps(
+            action_message.envelope,
+            action_message.subscriber_received_timestamp_ns,
+        )
     )
     return {
         "envelope": action_message.envelope.to_dict(),
         "payload": action_message.payload.to_dict(),
         "action_vector": action_message.payload.vector,
         "subscriber_received_timestamp_ns": subscriber_received_timestamp_ns,
-        "subscriber_queue_latency_ns": max(
-            0,
-            subscriber_received_timestamp_ns
-            - int(action_message.envelope.publish_timestamp_ns),
-        ),
+        "subscriber_queue_latency_ns": subscriber_queue_latency_ns,
     }
 
 
@@ -273,31 +268,33 @@ def _frame_entry_from_task(
     video_frame_index: int,
     writer_committed_timestamp_ns: int,
 ) -> dict[str, Any]:
+    frame_metadata = task.frame_envelope.metadata
+    height, width = task.frame_rgb.shape[:2]
     return {
         "video_file_name": session_paths.video_path.name,
         "video_frame_index": int(video_frame_index),
         "video_nominal_fps": float(session_config.nominal_fps),
-        "video_codec": session_config.codec,
-        "video_container": session_config.container,
+        "video_codec": VIDEO_CODEC,
+        "video_container": VIDEO_CONTAINER,
         "encoded_width": int(session_config.width),
         "encoded_height": int(session_config.height),
-        "frame_id": int(task.frame_metadata.get("frame_id", -1)),
+        "frame_id": int(frame_metadata.get("frame_id", -1)),
         "capture_frame_id": int(
-            task.frame_metadata.get(
+            frame_metadata.get(
                 "capture_frame_id",
-                task.frame_metadata.get("frame_id", -1),
+                frame_metadata.get("frame_id", -1),
             )
         ),
-        "capture_timestamp_ns": int(task.capture_timestamp_ns),
+        "capture_timestamp_ns": _frame_timestamp_ns_from_envelope(task.frame_envelope),
         "publish_timestamp_ns": int(task.frame_envelope.publish_timestamp_ns),
         "subscriber_received_timestamp_ns": int(task.subscriber_received_timestamp_ns),
         "writer_committed_timestamp_ns": int(writer_committed_timestamp_ns),
         "subscriber_queue_latency_ns": int(task.subscriber_queue_latency_ns),
-        "resolution_height": int(task.frame_metadata.get("h", task.resolution_height)),
-        "resolution_width": int(task.frame_metadata.get("w", task.resolution_width)),
+        "resolution_height": int(frame_metadata.get("h", height)),
+        "resolution_width": int(frame_metadata.get("w", width)),
         "frame_source": task.frame_envelope.source,
         "frame_envelope": task.frame_envelope.to_dict(),
-        "frame_metadata": dict(task.frame_metadata),
+        "frame_metadata": dict(frame_metadata),
         "action": None if task.aligned_action.payload is None else dict(task.aligned_action.payload),
         "action_envelope": (
             None if task.aligned_action.envelope is None else dict(task.aligned_action.envelope)
@@ -353,19 +350,11 @@ def _timing_summary_ns(values: list[int]) -> dict[str, int]:
     }
 
 
-def _preroll_frame_capacity(preroll_seconds: float) -> int:
+def _preroll_capacity(preroll_seconds: float, headroom: int) -> int:
     return max(
         1,
         int(round(max(0.0, float(preroll_seconds)) * 60.0))
-        + PREROLL_FRAME_BUFFER_HEADROOM,
-    )
-
-
-def _preroll_action_capacity(preroll_seconds: float) -> int:
-    return max(
-        1,
-        int(round(max(0.0, float(preroll_seconds)) * 60.0))
-        + PREROLL_ACTION_BUFFER_HEADROOM,
+        + int(headroom),
     )
 
 
@@ -376,6 +365,10 @@ def _frame_timestamp_ns_from_envelope(envelope: ChannelEnvelope) -> int:
             envelope.message_timestamp_ns,
         )
     )
+
+
+def _buffered_frame_timestamp_ns(frame: BufferedFrame) -> int:
+    return _frame_timestamp_ns_from_envelope(frame.frame_envelope)
 
 
 def _build_sub_socket(
@@ -618,15 +611,15 @@ class FFmpegVideoWriter:
             "pipe:0",
             "-an",
             "-c:v",
-            config.codec,
+            VIDEO_CODEC,
             "-preset",
-            config.preset,
+            VIDEO_PRESET,
             "-crf",
-            str(config.crf),
+            str(VIDEO_CRF),
             "-pix_fmt",
-            config.pixel_format,
+            VIDEO_PIXEL_FORMAT,
             "-f",
-            config.container,
+            VIDEO_CONTAINER,
             str(output_path),
         ]
         self._process = subprocess.Popen(
@@ -729,79 +722,99 @@ class BlackboxSessionWriter:
     def _append_drop_event(self, payload: dict[str, Any]) -> None:
         self._drop_events.append(payload)
 
+    def _enqueue_bounded(
+        self,
+        queue: collections.deque[T],
+        item: T,
+        *,
+        capacity: int,
+        max_depth_attr: str,
+        overflow_count_attr: str,
+        dropped_count_attr: str,
+        drop_event: Callable[[T], dict[str, Any]],
+    ) -> None:
+        if len(queue) >= capacity and queue:
+            dropped_item = queue.popleft()
+            setattr(
+                self,
+                overflow_count_attr,
+                int(getattr(self, overflow_count_attr)) + 1,
+            )
+            setattr(
+                self,
+                dropped_count_attr,
+                int(getattr(self, dropped_count_attr)) + 1,
+            )
+            self._append_drop_event(drop_event(dropped_item))
+        queue.append(item)
+        setattr(
+            self,
+            max_depth_attr,
+            max(int(getattr(self, max_depth_attr)), len(queue)),
+        )
+        self._available.notify_all()
+
+    def _action_overflow_event(self, dropped_entry: dict[str, Any]) -> dict[str, Any]:
+        envelope = dict(dropped_entry.get("envelope", {}))
+        sequence_id = envelope.get("sequence_id")
+        return {
+            "kind": "writer_action_queue_overflow",
+            "channel": "blackbox.writer",
+            "source": str(envelope.get("source", "unknown")),
+            "timestamp_ns": time.time_ns(),
+            "sequence_id_start": None if sequence_id is None else int(sequence_id),
+            "sequence_id_end": None if sequence_id is None else int(sequence_id),
+            "dropped_count": 1,
+            "details": {"queue_capacity": ACTION_WRITE_QUEUE_SIZE},
+        }
+
+    def _frame_overflow_event(self, dropped_task: FrameWriteTask) -> dict[str, Any]:
+        frame_metadata = dropped_task.frame_envelope.metadata
+        frame_id = int(frame_metadata.get("frame_id", -1))
+        return {
+            "kind": "writer_frame_queue_overflow",
+            "channel": "blackbox.writer",
+            "source": dropped_task.frame_envelope.source,
+            "timestamp_ns": time.time_ns(),
+            "sequence_id_start": int(dropped_task.frame_envelope.sequence_id),
+            "sequence_id_end": int(dropped_task.frame_envelope.sequence_id),
+            "dropped_count": 1,
+            "details": {
+                "queue_capacity": FRAME_WRITE_QUEUE_SIZE,
+                "frame_id": frame_id,
+                "capture_frame_id": int(
+                    frame_metadata.get("capture_frame_id", frame_id)
+                ),
+            },
+        }
+
     def enqueue_action(self, action_entry: dict[str, Any]) -> None:
         with self._queue_lock:
             if self._writer_error is not None:
                 raise self._writer_error
-            if len(self._action_queue) >= ACTION_WRITE_QUEUE_SIZE and self._action_queue:
-                dropped_entry = self._action_queue.popleft()
-                self._action_queue_overflow_count += 1
-                self._action_queue_dropped_entries += 1
-                envelope = dict(dropped_entry.get("envelope", {}))
-                self._append_drop_event(
-                    {
-                        "kind": "writer_action_queue_overflow",
-                        "channel": "blackbox.writer",
-                        "source": str(envelope.get("source", "unknown")),
-                        "timestamp_ns": time.time_ns(),
-                        "sequence_id_start": (
-                            None
-                            if envelope.get("sequence_id") is None
-                            else int(envelope["sequence_id"])
-                        ),
-                        "sequence_id_end": (
-                            None
-                            if envelope.get("sequence_id") is None
-                            else int(envelope["sequence_id"])
-                        ),
-                        "dropped_count": 1,
-                        "details": {"queue_capacity": ACTION_WRITE_QUEUE_SIZE},
-                    }
-                )
-            self._action_queue.append(dict(action_entry))
-            self._action_queue_max_depth = max(
-                self._action_queue_max_depth,
-                len(self._action_queue),
+            self._enqueue_bounded(
+                self._action_queue,
+                dict(action_entry),
+                capacity=ACTION_WRITE_QUEUE_SIZE,
+                max_depth_attr="_action_queue_max_depth",
+                overflow_count_attr="_action_queue_overflow_count",
+                dropped_count_attr="_action_queue_dropped_entries",
+                drop_event=self._action_overflow_event,
             )
-            self._available.notify_all()
 
     def enqueue_frame(self, task: FrameWriteTask) -> None:
         with self._queue_lock:
             if self._writer_error is not None:
                 raise self._writer_error
-            if len(self._frame_queue) >= FRAME_WRITE_QUEUE_SIZE and self._frame_queue:
-                dropped_task = self._frame_queue.popleft()
-                self._frame_queue_overflow_count += 1
-                self._frame_queue_dropped_frames += 1
-                self._append_drop_event(
-                    {
-                        "kind": "writer_frame_queue_overflow",
-                        "channel": "blackbox.writer",
-                        "source": dropped_task.frame_envelope.source,
-                        "timestamp_ns": time.time_ns(),
-                        "sequence_id_start": int(dropped_task.frame_envelope.sequence_id),
-                        "sequence_id_end": int(dropped_task.frame_envelope.sequence_id),
-                        "dropped_count": 1,
-                        "details": {
-                            "queue_capacity": FRAME_WRITE_QUEUE_SIZE,
-                            "frame_id": int(
-                                dropped_task.frame_metadata.get("frame_id", -1)
-                            ),
-                            "capture_frame_id": int(
-                                dropped_task.frame_metadata.get(
-                                    "capture_frame_id",
-                                    dropped_task.frame_metadata.get("frame_id", -1),
-                                )
-                            ),
-                        },
-                    }
-                )
-            self._frame_queue.append(task)
-            self._frame_queue_max_depth = max(
-                self._frame_queue_max_depth,
-                len(self._frame_queue),
+            self._enqueue_bounded(
+                self._frame_queue,
+                task,
+                capacity=FRAME_WRITE_QUEUE_SIZE,
+                max_depth_attr="_frame_queue_max_depth",
+                overflow_count_attr="_frame_queue_overflow_count",
+                dropped_count_attr="_frame_queue_dropped_frames",
+                drop_event=self._frame_overflow_event,
             )
-            self._available.notify_all()
 
     def _write_action_entry(self, action_entry: dict[str, Any]) -> None:
         action_payload = dict(action_entry)
@@ -1014,7 +1027,6 @@ class BlackboxRecorder:
         self._vision_frames_decoded_while_inactive = 0
         self._session_vision_frames_decoded_baseline = 0
         self._session_vision_frames_decoded_while_inactive_baseline = 0
-        self._last_session_performance_stats: dict[str, Any] = {}
         self._current_ingest_mode = INGEST_MODE_ACTIVE
 
         initial_recording_setting = self._refresh_runtime_settings()
@@ -1077,18 +1089,16 @@ class BlackboxRecorder:
 
     def _handle_transport_event(self, event: ChannelTransportEvent) -> None:
         if not self._session_active():
-            self.preroll_transport_events.append(event)
-            while len(self.preroll_transport_events) > _preroll_action_capacity(
-                self.preroll_seconds
-            ):
-                self.preroll_transport_events.popleft()
+            _bounded_append(
+                self.preroll_transport_events,
+                event,
+                capacity=_preroll_capacity(
+                    self.preroll_seconds,
+                    PREROLL_ACTION_BUFFER_HEADROOM,
+                ),
+            )
             return
         self._session_drop_events.append(event.to_dict())
-
-    def _append_session_event(self, payload: dict[str, Any]) -> None:
-        if not self._session_active():
-            return
-        self._session_drop_events.append(dict(payload))
 
     def _handle_native_pipeline_telemetry(self, frame_metadata: dict[str, Any]) -> None:
         if not self._session_active():
@@ -1098,7 +1108,7 @@ class BlackboxRecorder:
             return
         overload_active = bool(pipeline_stats.get("overload_active", False))
         if overload_active and not self._session_native_overload_active:
-            self._append_session_event(
+            self._session_drop_events.append(
                 {
                     "kind": "native_overload",
                     "channel": self.vision_channel.name,
@@ -1204,7 +1214,8 @@ class BlackboxRecorder:
         cutoff_timestamp_ns = reference_timestamp_ns - self.preroll_ns
         while (
             self.preroll_frames
-            and self.preroll_frames[0].capture_timestamp_ns < cutoff_timestamp_ns
+            and _buffered_frame_timestamp_ns(self.preroll_frames[0])
+            < cutoff_timestamp_ns
         ):
             self.preroll_frames.popleft()
         while (
@@ -1230,38 +1241,37 @@ class BlackboxRecorder:
         if jpeg_bytes is None:
             return
 
-        subscriber_received_timestamp_ns = int(
-            frame_message.subscriber_received_timestamp_ns
-            or frame_message.envelope.publish_timestamp_ns
+        subscriber_received_timestamp_ns, subscriber_queue_latency_ns = (
+            _subscriber_timestamps(
+                frame_message.envelope,
+                frame_message.subscriber_received_timestamp_ns,
+            )
         )
-        self.preroll_frames.append(
+        _bounded_append(
+            self.preroll_frames,
             BufferedFrame(
                 frame_envelope=frame_message.envelope,
-                frame_metadata=dict(frame_message.envelope.metadata),
-                capture_timestamp_ns=frame_capture_timestamp_ns(frame_message),
-                resolution_height=int(frame_message.payload.shape[0]),
-                resolution_width=int(frame_message.payload.shape[1]),
                 jpeg_bytes=jpeg_bytes,
                 aligned_action=aligned_action,
                 subscriber_received_timestamp_ns=subscriber_received_timestamp_ns,
-                subscriber_queue_latency_ns=max(
-                    0,
-                    subscriber_received_timestamp_ns
-                    - int(frame_message.envelope.publish_timestamp_ns),
-                ),
-            )
+                subscriber_queue_latency_ns=subscriber_queue_latency_ns,
+            ),
+            capacity=_preroll_capacity(
+                self.preroll_seconds,
+                PREROLL_FRAME_BUFFER_HEADROOM,
+            ),
         )
-        while len(self.preroll_frames) > _preroll_frame_capacity(self.preroll_seconds):
-            self.preroll_frames.popleft()
 
     def _frame_task_from_message(
         self,
         frame_message: ChannelMessage[np.ndarray],
         aligned_action: AlignedActionData,
     ) -> FrameWriteTask:
-        subscriber_received_timestamp_ns = int(
-            frame_message.subscriber_received_timestamp_ns
-            or frame_message.envelope.publish_timestamp_ns
+        subscriber_received_timestamp_ns, subscriber_queue_latency_ns = (
+            _subscriber_timestamps(
+                frame_message.envelope,
+                frame_message.subscriber_received_timestamp_ns,
+            )
         )
         frame_rgb = np.asarray(frame_message.payload, dtype=np.uint8)
         if not frame_rgb.flags["C_CONTIGUOUS"]:
@@ -1269,17 +1279,9 @@ class BlackboxRecorder:
         return FrameWriteTask(
             frame_rgb=frame_rgb,
             frame_envelope=frame_message.envelope,
-            frame_metadata=dict(frame_message.envelope.metadata),
-            capture_timestamp_ns=frame_capture_timestamp_ns(frame_message),
-            resolution_height=int(frame_message.payload.shape[0]),
-            resolution_width=int(frame_message.payload.shape[1]),
             aligned_action=aligned_action,
             subscriber_received_timestamp_ns=subscriber_received_timestamp_ns,
-            subscriber_queue_latency_ns=max(
-                0,
-                subscriber_received_timestamp_ns
-                - int(frame_message.envelope.publish_timestamp_ns),
-            ),
+            subscriber_queue_latency_ns=subscriber_queue_latency_ns,
         )
 
     def _frame_task_from_buffered(self, buffered_frame: BufferedFrame) -> FrameWriteTask | None:
@@ -1289,10 +1291,6 @@ class BlackboxRecorder:
         return FrameWriteTask(
             frame_rgb=frame_rgb,
             frame_envelope=buffered_frame.frame_envelope,
-            frame_metadata=dict(buffered_frame.frame_metadata),
-            capture_timestamp_ns=buffered_frame.capture_timestamp_ns,
-            resolution_height=int(frame_rgb.shape[0]),
-            resolution_width=int(frame_rgb.shape[1]),
             aligned_action=buffered_frame.aligned_action,
             subscriber_received_timestamp_ns=buffered_frame.subscriber_received_timestamp_ns,
             subscriber_queue_latency_ns=buffered_frame.subscriber_queue_latency_ns,
@@ -1315,16 +1313,14 @@ class BlackboxRecorder:
             return
         for buffered_frame in self.preroll_frames:
             buffered_config = _frame_config_from_parts(
-                frame_metadata=buffered_frame.frame_metadata,
-                resolution_height=buffered_frame.resolution_height,
-                resolution_width=buffered_frame.resolution_width,
+                buffered_frame.frame_envelope.metadata
             )
             if not _configs_match(buffered_config, self.session_config):
                 continue
             task = self._frame_task_from_buffered(buffered_frame)
             if task is None:
                 continue
-            self._handle_native_pipeline_telemetry(task.frame_metadata)
+            self._handle_native_pipeline_telemetry(task.frame_envelope.metadata)
             self.session_writer.enqueue_frame(task)
         self.preroll_frames.clear()
 
@@ -1453,8 +1449,6 @@ class BlackboxRecorder:
                 ),
             },
         }
-        self._last_session_performance_stats = performance_stats
-
         return {
             "schema_version": SCHEMA_VERSION,
             "session_timestamp": self.paths.session_timestamp,
@@ -1465,8 +1459,8 @@ class BlackboxRecorder:
             "action_channel": self.action_channel.name,
             "action_topic": self.action_channel.topic.decode("utf-8"),
             "video_file_name": self.paths.video_path.name,
-            "video_codec": self.session_config.codec,
-            "video_container": self.session_config.container,
+            "video_codec": VIDEO_CODEC,
+            "video_container": VIDEO_CONTAINER,
             "video_nominal_fps": float(self.session_config.nominal_fps),
             "encoded_width": int(self.session_config.width),
             "encoded_height": int(self.session_config.height),
@@ -1541,7 +1535,7 @@ class BlackboxRecorder:
             )
 
     def _roll_session_if_needed(self, frame_message: ChannelMessage[np.ndarray]) -> None:
-        frame_config = _frame_config_from_message(frame_message)
+        frame_config = _frame_config_from_parts(frame_message.envelope.metadata)
         if not self._session_active():
             self.start_session(frame_config)
             return
@@ -1556,28 +1550,19 @@ class BlackboxRecorder:
         self,
         action_message: ChannelMessage,
         *,
-        current_recording_enabled: bool,
-        current_revision: int,
-        current_updated_timestamp_ns: int,
-        previous_recording_enabled: bool,
-        previous_revision: int,
+        recording_enabled_for_action: bool,
     ) -> None:
-        recording_enabled_for_action = self._recording_enabled_at(
-            action_message.envelope.message_timestamp_ns,
-            current_recording_enabled=current_recording_enabled,
-            current_revision=current_revision,
-            current_updated_timestamp_ns=current_updated_timestamp_ns,
-            previous_recording_enabled=previous_recording_enabled,
-            previous_revision=previous_revision,
-        )
         if recording_enabled_for_action and self._session_active():
             self._enqueue_action_message(action_message)
         else:
-            self.preroll_actions.append(action_message)
-            while len(self.preroll_actions) > _preroll_action_capacity(
-                self.preroll_seconds
-            ):
-                self.preroll_actions.popleft()
+            _bounded_append(
+                self.preroll_actions,
+                action_message,
+                capacity=_preroll_capacity(
+                    self.preroll_seconds,
+                    PREROLL_ACTION_BUFFER_HEADROOM,
+                ),
+            )
         self.latest_action_message = action_message
 
     def _handle_frame_message(
@@ -1586,13 +1571,9 @@ class BlackboxRecorder:
         drained_action_messages: list[ChannelMessage],
         action_cursor: int,
         *,
-        current_recording_enabled: bool,
-        current_revision: int,
-        current_updated_timestamp_ns: int,
-        previous_recording_enabled: bool,
-        previous_revision: int,
+        frame_timestamp_ns: int,
+        recording_enabled_for_frame: bool,
     ) -> int:
-        frame_timestamp_ns = frame_capture_timestamp_ns(frame_message)
         frame_action_message, next_action_cursor = _aligned_message_before_with_cursor(
             frame_timestamp_ns,
             self.latest_action_message,
@@ -1600,20 +1581,11 @@ class BlackboxRecorder:
             start_index=action_cursor,
         )
         aligned_action = _aligned_action_from_message(frame_action_message)
-        recording_enabled_for_frame = self._recording_enabled_at(
-            frame_timestamp_ns,
-            current_recording_enabled=current_recording_enabled,
-            current_revision=current_revision,
-            current_updated_timestamp_ns=current_updated_timestamp_ns,
-            previous_recording_enabled=previous_recording_enabled,
-            previous_revision=previous_revision,
-        )
-
         if recording_enabled_for_frame:
             self._roll_session_if_needed(frame_message)
             if self.session_writer is not None:
                 frame_task = self._frame_task_from_message(frame_message, aligned_action)
-                self._handle_native_pipeline_telemetry(frame_task.frame_metadata)
+                self._handle_native_pipeline_telemetry(frame_task.frame_envelope.metadata)
                 self.session_writer.enqueue_frame(frame_task)
         else:
             if self._session_active():
@@ -1623,25 +1595,32 @@ class BlackboxRecorder:
         self._prune_preroll(frame_timestamp_ns)
         return next_action_cursor
 
-    def _enter_inactive_ingest(self) -> None:
-        if self._session_active():
+    def _set_ingest_mode(self, ingest_mode: str) -> None:
+        if ingest_mode == self._current_ingest_mode:
+            return
+        if ingest_mode == INGEST_MODE_INACTIVE and self._session_active():
             self.stop_session()
         self.latest_action_message = None
         self._clear_preroll_buffers()
-
-    def _enter_active_ingest(self) -> None:
-        self.latest_action_message = None
-        self._clear_preroll_buffers()
-        self._discard_socket_backlog(
-            self.action_socket,
-            spec=self.action_channel,
-            transport_tracker=self.action_transport_tracker,
-        )
-        self._discard_socket_backlog(
-            self.vision_socket,
-            spec=self.vision_channel,
-            transport_tracker=self.vision_transport_tracker,
-        )
+        if ingest_mode == INGEST_MODE_ACTIVE:
+            for socket, spec, tracker in (
+                (
+                    self.action_socket,
+                    self.action_channel,
+                    self.action_transport_tracker,
+                ),
+                (
+                    self.vision_socket,
+                    self.vision_channel,
+                    self.vision_transport_tracker,
+                ),
+            ):
+                self._discard_socket_backlog(
+                    socket,
+                    spec=spec,
+                    transport_tracker=tracker,
+                )
+        self._current_ingest_mode = ingest_mode
 
     def close(self) -> None:
         stop_error: Exception | None = None
@@ -1691,12 +1670,16 @@ class BlackboxRecorder:
                     )
 
                 next_ingest_mode = self._ingest_mode_for(current_recording_enabled)
-                if next_ingest_mode != self._current_ingest_mode:
-                    if next_ingest_mode == INGEST_MODE_ACTIVE:
-                        self._enter_active_ingest()
-                    else:
-                        self._enter_inactive_ingest()
-                    self._current_ingest_mode = next_ingest_mode
+                self._set_ingest_mode(next_ingest_mode)
+                def recording_enabled_at(timestamp_ns: int) -> bool:
+                    return self._recording_enabled_at(
+                        timestamp_ns,
+                        current_recording_enabled=current_recording_enabled,
+                        current_revision=current_recording_revision,
+                        current_updated_timestamp_ns=current_recording_updated_timestamp_ns,
+                        previous_recording_enabled=previous_recording_enabled,
+                        previous_revision=previous_recording_revision,
+                    )
 
                 if self._current_ingest_mode == INGEST_MODE_INACTIVE:
                     self.recording_enabled = current_recording_enabled
@@ -1704,7 +1687,7 @@ class BlackboxRecorder:
                     self.recording_setting_updated_timestamp_ns = (
                         current_recording_updated_timestamp_ns
                     )
-                    time.sleep(POLL_TIMEOUT_MS / 1000.0)
+                    time.sleep(POLL_TIMEOUT_SECONDS)
                     continue
 
                 events = dict(self.poller.poll(POLL_TIMEOUT_MS))
@@ -1726,11 +1709,9 @@ class BlackboxRecorder:
                     for action_message in drained_action_messages:
                         self._handle_action_message(
                             action_message,
-                            current_recording_enabled=current_recording_enabled,
-                            current_revision=current_recording_revision,
-                            current_updated_timestamp_ns=current_recording_updated_timestamp_ns,
-                            previous_recording_enabled=previous_recording_enabled,
-                            previous_revision=previous_recording_revision,
+                            recording_enabled_for_action=recording_enabled_at(
+                                action_message.envelope.message_timestamp_ns
+                            ),
                         )
 
                 if events.get(self.vision_socket) == zmq.POLLIN:
@@ -1745,13 +1726,8 @@ class BlackboxRecorder:
                         frame_timestamp_ns = _frame_timestamp_ns_from_envelope(
                             raw_frame_message.envelope
                         )
-                        recording_enabled_for_frame = self._recording_enabled_at(
-                            frame_timestamp_ns,
-                            current_recording_enabled=current_recording_enabled,
-                            current_revision=current_recording_revision,
-                            current_updated_timestamp_ns=current_recording_updated_timestamp_ns,
-                            previous_recording_enabled=previous_recording_enabled,
-                            previous_revision=previous_recording_revision,
+                        recording_enabled_for_frame = recording_enabled_at(
+                            frame_timestamp_ns
                         )
                         should_decode_frame = (
                             recording_enabled_for_frame or self.preroll_ns > 0
@@ -1768,11 +1744,8 @@ class BlackboxRecorder:
                             frame_message,
                             drained_action_messages,
                             action_cursor,
-                            current_recording_enabled=current_recording_enabled,
-                            current_revision=current_recording_revision,
-                            current_updated_timestamp_ns=current_recording_updated_timestamp_ns,
-                            previous_recording_enabled=previous_recording_enabled,
-                            previous_revision=previous_recording_revision,
+                            frame_timestamp_ns=frame_timestamp_ns,
+                            recording_enabled_for_frame=recording_enabled_for_frame,
                         )
 
                 self.recording_enabled = current_recording_enabled

@@ -60,14 +60,13 @@ class ConvertedLaneSample:
 
 @dataclass
 class BlackboxFrameRecord:
+    sequence_id: int
     video_frame_index: int
     capture_timestamp_ns: int
     publish_timestamp_ns: int
     frame_id: int
     capture_frame_id: int
-    frame_source: str
-    frame_metadata: dict[str, Any]
-    action: dict[str, Any] | None
+    is_repeat: bool
     action_vector: np.ndarray
     action_message_timestamp_ns: int | None = None
     subscriber_received_timestamp_ns: int | None = None
@@ -76,8 +75,8 @@ class BlackboxFrameRecord:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BlackboxFrameRecord":
-        action_envelope = payload.get("action_envelope") or {}
         return cls(
+            sequence_id=int(payload.get("sequence_id", -1)),
             video_frame_index=int(payload["video_frame_index"]),
             capture_timestamp_ns=int(payload["capture_timestamp_ns"]),
             publish_timestamp_ns=int(payload["publish_timestamp_ns"]),
@@ -85,13 +84,13 @@ class BlackboxFrameRecord:
             capture_frame_id=int(
                 payload.get("capture_frame_id", payload.get("frame_id", -1))
             ),
-            frame_source=str(payload.get("frame_source", "")),
-            frame_metadata=dict(payload.get("frame_metadata", {})),
-            action=None if payload.get("action") is None else dict(payload["action"]),
+            is_repeat=bool(payload.get("is_repeat", False)),
             action_vector=np.asarray(payload["action_vector"], dtype=np.float32),
-            action_message_timestamp_ns=None
-            if action_envelope.get("message_timestamp_ns") is None
-            else int(action_envelope["message_timestamp_ns"]),
+            action_message_timestamp_ns=(
+                None
+                if payload.get("action_message_timestamp_ns") is None
+                else int(payload["action_message_timestamp_ns"])
+            ),
             subscriber_received_timestamp_ns=None
             if payload.get("subscriber_received_timestamp_ns") is None
             else int(payload["subscriber_received_timestamp_ns"]),
@@ -106,37 +105,50 @@ class BlackboxFrameRecord:
 
 @dataclass
 class BlackboxActionRecord:
+    sequence_id: int
     message_timestamp_ns: int
     publish_timestamp_ns: int
-    action_vector: np.ndarray
-    envelope: dict[str, Any]
     payload: dict[str, Any]
+    subscriber_received_timestamp_ns: int | None = None
+    subscriber_queue_latency_ns: int | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BlackboxActionRecord":
-        envelope = dict(payload.get("envelope", {}))
         raw_payload = payload.get("payload")
-        vector_payload = payload.get("action_vector")
-        if vector_payload is None and isinstance(raw_payload, dict):
-            vector_payload = [
-                raw_payload.get("steer", 0.0),
-                raw_payload.get("throttle", 0.0),
-                raw_payload.get("brake", 0.0),
-                raw_payload.get("handbrake", 0.0),
-                raw_payload.get("reverse", 0.0),
-                raw_payload.get("pilot_active", 0.0),
-            ]
         return cls(
-            message_timestamp_ns=int(envelope.get("message_timestamp_ns", 0)),
-            publish_timestamp_ns=int(envelope.get("publish_timestamp_ns", 0)),
-            action_vector=np.asarray(vector_payload or np.zeros(6, dtype=np.float32), dtype=np.float32),
-            envelope=envelope,
+            sequence_id=int(payload.get("sequence_id", -1)),
+            message_timestamp_ns=int(payload.get("message_timestamp_ns", 0)),
+            publish_timestamp_ns=int(payload.get("publish_timestamp_ns", 0)),
             payload={} if raw_payload is None else dict(raw_payload),
+            subscriber_received_timestamp_ns=(
+                None
+                if payload.get("subscriber_received_timestamp_ns") is None
+                else int(payload["subscriber_received_timestamp_ns"])
+            ),
+            subscriber_queue_latency_ns=(
+                None
+                if payload.get("subscriber_queue_latency_ns") is None
+                else int(payload["subscriber_queue_latency_ns"])
+            ),
         )
 
     @property
     def timestamp_ns(self) -> int:
         return self.message_timestamp_ns
+
+    @property
+    def action_vector(self) -> np.ndarray:
+        return np.asarray(
+            [
+                self.payload.get("steer", 0.0),
+                self.payload.get("throttle", 0.0),
+                self.payload.get("brake", 0.0),
+                self.payload.get("handbrake", 0.0),
+                self.payload.get("reverse", 0.0),
+                self.payload.get("pilot_active", 0.0),
+            ],
+            dtype=np.float32,
+        )
 
 
 @dataclass

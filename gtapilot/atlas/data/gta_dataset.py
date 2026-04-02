@@ -259,10 +259,19 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             return timeline
 
         manifest = _read_json(metadata_path)
+        if int(manifest.get("schema_version", 0)) != 2:
+            raise ValueError(
+                f"Unsupported blackbox manifest schema for Atlas: {metadata_path}"
+            )
+        capture_session = dict(manifest.get("capture_session", {}))
+        video_session = dict(manifest.get("video_session", {}))
         frame_payloads = manifest.get("frames", [])
         frame_count = len(frame_payloads)
         clip_id = metadata_path.stem.replace("_metadata", "")
-        video_path = metadata_path.with_name(str(manifest["video_file_name"])).resolve()
+        video_file_name = str(video_session.get("file_name", ""))
+        if not video_file_name:
+            raise ValueError(f"Missing video_session.file_name in {metadata_path}")
+        video_path = metadata_path.with_name(video_file_name).resolve()
         privileged_dir = metadata_path.with_name(f"{clip_id}_privileged").resolve()
         privileged_path = privileged_dir if (privileged_dir / "manifest.json").exists() else None
 
@@ -281,18 +290,14 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             dtype=np.int64,
             count=frame_count,
         )
-        frame_source = (
-            str(frame_payloads[0].get("frame_source", ""))
-            if frame_payloads
-            else ""
-        )
-        nominal_fps = float(manifest.get("video_nominal_fps", 0.0) or 0.0)
-        if nominal_fps <= 0.0 and frame_payloads:
-            nominal_fps = float(
-                (frame_payloads[0].get("frame_metadata") or {}).get("nominal_fps", 60.0)
+        frame_source = str(capture_session.get("capture_source", ""))
+        nominal_fps = float(
+            video_session.get(
+                "nominal_fps",
+                capture_session.get("nominal_fps", 60.0),
             )
-        if nominal_fps <= 0.0:
-            nominal_fps = 60.0
+            or 60.0
+        )
 
         action_payloads = manifest.get("actions", [])
         action_timestamps_ns: np.ndarray | None = None
@@ -301,25 +306,22 @@ class AtlasBlackboxClipDataset(Dataset[dict[str, Any]]):
             raw_action_timestamps: list[int] = []
             raw_action_vectors: list[list[float]] = []
             for action_payload in action_payloads:
-                envelope = action_payload.get("envelope") or {}
                 timestamp_ns = int(
-                    envelope.get("message_timestamp_ns", 0)
-                    or envelope.get("publish_timestamp_ns", 0)
+                    action_payload.get("message_timestamp_ns", 0)
+                    or action_payload.get("publish_timestamp_ns", 0)
                     or 0
                 )
                 if timestamp_ns <= 0:
                     continue
-                vector_payload = action_payload.get("action_vector")
-                if vector_payload is None:
-                    raw_payload = action_payload.get("payload") or {}
-                    vector_payload = [
-                        raw_payload.get("steer", 0.0),
-                        raw_payload.get("throttle", 0.0),
-                        raw_payload.get("brake", 0.0),
-                        raw_payload.get("handbrake", 0.0),
-                        raw_payload.get("reverse", 0.0),
-                        raw_payload.get("pilot_active", 0.0),
-                    ]
+                raw_payload = action_payload.get("payload") or {}
+                vector_payload = [
+                    raw_payload.get("steer", 0.0),
+                    raw_payload.get("throttle", 0.0),
+                    raw_payload.get("brake", 0.0),
+                    raw_payload.get("handbrake", 0.0),
+                    raw_payload.get("reverse", 0.0),
+                    raw_payload.get("pilot_active", 0.0),
+                ]
                 raw_action_timestamps.append(timestamp_ns)
                 raw_action_vectors.append([float(value) for value in vector_payload])
             if raw_action_timestamps:

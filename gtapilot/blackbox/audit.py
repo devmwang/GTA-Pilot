@@ -91,32 +91,22 @@ def _fresh_capture_timestamps_ns(frames: list[dict[str, Any]]) -> list[int]:
 
 
 def _native_timing_summary(
-    frames: list[dict[str, Any]],
-    native_capture_perf: dict[str, Any],
+    native_capture_stats: dict[str, Any],
+    native_pipeline_samples: list[dict[str, Any]],
 ) -> dict[str, dict[str, float]]:
-    if native_capture_perf:
+    if native_capture_stats:
         return {
-            metric_name: _bucket_ms(native_capture_perf.get(key))
+            metric_name: _bucket_ms(native_capture_stats.get(key))
             for key, metric_name in TIMING_KEYS
         }
 
-    sample_capture_frame_id: int | None = None
     samples: dict[str, list[int]] = {key: [] for key, _ in TIMING_KEYS}
-    for frame in frames:
-        pipeline_stats = (frame.get("frame_metadata") or {}).get("pipeline_stats")
-        if not isinstance(pipeline_stats, dict):
+    for sample in native_pipeline_samples:
+        stats = sample.get("stats")
+        if not isinstance(stats, dict):
             continue
-        current_sample_capture_frame_id = int(
-            pipeline_stats.get(
-                "sample_capture_frame_id",
-                frame.get("capture_frame_id", frame.get("frame_id", -1)),
-            )
-        )
-        if sample_capture_frame_id == current_sample_capture_frame_id:
-            continue
-        sample_capture_frame_id = current_sample_capture_frame_id
         for key in samples:
-            value = pipeline_stats.get(key)
+            value = stats.get(key)
             if value is not None:
                 samples[key].append(int(value))
 
@@ -143,11 +133,15 @@ def main() -> None:
 
     metadata_path = Path(args.metadata_path).resolve()
     manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
-    frames = list(manifest.get("frames", []))
+    if int(manifest.get("schema_version", 0)) != 2:
+        raise ValueError(f"Unsupported blackbox manifest schema: {metadata_path}")
+
+    session = dict(manifest.get("session", {}))
     session_integrity = dict(manifest.get("session_integrity", {}))
-    session_stats = dict(manifest.get("session_stats", {}))
-    performance_stats = dict(manifest.get("performance_stats", {}))
-    native_capture_perf = dict(performance_stats.get("native_capture", {}))
+    capture_session = dict(manifest.get("capture_session", {}))
+    native_capture_stats = dict(manifest.get("native_capture_stats", {}))
+    native_pipeline_samples = list(manifest.get("native_pipeline_samples", []))
+    frames = list(manifest.get("frames", []))
 
     frame_ids = [
         int(frame.get("frame_id", -1))
@@ -163,11 +157,7 @@ def main() -> None:
         for frame in frames
         if frame.get("publish_timestamp_ns") is not None
     ]
-    repeat_frame_count = sum(
-        1
-        for frame in frames
-        if bool((frame.get("frame_metadata") or {}).get("is_repeat", False))
-    )
+    repeat_frame_count = sum(1 for frame in frames if bool(frame.get("is_repeat", False)))
     writer_lag_ns = [
         int(frame.get("writer_committed_timestamp_ns", 0))
         - int(frame.get("subscriber_received_timestamp_ns", 0))
@@ -176,7 +166,10 @@ def main() -> None:
         and frame.get("subscriber_received_timestamp_ns") is not None
     ]
 
-    native_timing_summary = _native_timing_summary(frames, native_capture_perf)
+    native_timing_summary = _native_timing_summary(
+        native_capture_stats,
+        native_pipeline_samples,
+    )
     published_gap_summary = _gap_summary(frame_ids)
     fresh_gap_summary = _gap_summary(capture_frame_ids, dedupe=True)
     published_dt = _summary_ms(_timestamp_deltas(publish_timestamps_ns))
@@ -197,8 +190,8 @@ def main() -> None:
         "session_integrity_edge_grace_window_seconds="
         f"{float(session_integrity.get('edge_grace_window_seconds', 0.0)):.1f}"
     )
-    print(f"frame_count={len(frames)}")
-    print(f"action_count={len(manifest.get('actions', []))}")
+    print(f"frame_count={int(session.get('frame_count', len(frames)))}")
+    print(f"action_count={int(session.get('action_count', len(manifest.get('actions', []))))}")
     print(f"repeat_frame_count={repeat_frame_count}")
     print(f"published_dt_ms={_format_ms(published_dt)}")
     print(f"fresh_capture_dt_ms={_format_ms(fresh_dt)}")
@@ -229,15 +222,16 @@ def main() -> None:
         "writer_stats=" + json.dumps(dict(manifest.get("writer_stats", {})), sort_keys=True)
     )
     print(
-        "native_pipeline="
-        + json.dumps(dict(session_stats.get("native_pipeline", {})), sort_keys=True)
+        "native_capture_stats="
+        + json.dumps(native_capture_stats, sort_keys=True)
     )
     print(
-        "blackbox_ingest="
-        + json.dumps(dict(performance_stats.get("blackbox_ingest", {})), sort_keys=True)
+        "capture_session="
+        + json.dumps(capture_session, sort_keys=True)
     )
     print(f"drop_event_count={len(manifest.get('drop_events', []))}")
     print(f"ignored_drop_event_count={len(manifest.get('ignored_drop_events', []))}")
+    print(f"session_event_count={len(manifest.get('session_events', []))}")
 
 
 if __name__ == "__main__":

@@ -166,6 +166,9 @@ Vision payload contract:
   - `capture_mode`
   - `target_window_title`
   - `target_window_hwnd`
+  - `target_window_executable`
+  - `target_window_foreground`
+  - adapter / monitor / preview provenance for blackbox capture-session manifests
   - `shm_name`
   - `slot_bytes`
   - `slot_index`
@@ -256,28 +259,29 @@ Outputs under `blackbox-recordings/`:
 - `capture_<timestamp>_video.mkv`
 - `capture_<timestamp>_metadata.json`
 
-Current manifest schema version: `1`
+Current manifest schema version: `2`
 
 The manifest records:
 
 - session metadata
+- capture-session provenance
 - session video settings
+- input-session provenance
 - session integrity and drop-event summaries
 - session-integrity grace-window summaries plus ignored startup/shutdown drop events
-- performance stats for native capture timing, blackbox ingest mode, idle
-  vision-decode counters, and writer lag
 - transport stats for `vision.frames` and `input.actions`
 - writer queue / latency stats
-- per-frame metadata and video frame index
-- per-frame envelope data
+- native capture timing summaries
+- sparse native pipeline telemetry samples
+- sparse session events for window focus and active input-device changes
+- per-frame timeline rows and video frame index
 - per-frame `capture_frame_id`
 - per-frame `subscriber_received_timestamp_ns`
 - per-frame `writer_committed_timestamp_ns`
 - per-frame `subscriber_queue_latency_ns`
-- frame-aligned action payload
-- frame-aligned action envelope data
 - frame-aligned action vector
-- raw action stream entries
+- frame-aligned action message timestamps
+- raw action stream entries with compact saved payloads
 
 Behavior notes:
 
@@ -376,8 +380,9 @@ Current Stage 1 data contract:
 - `mid_summary_hz = 6` is a sparse sampling grid over the same source timeline
 - for each desired model timestamp, the loader uses the latest source frame or raw
   action packet at or before that timestamp
-- `actions_hist` should prefer the raw blackbox `actions` stream and only fall back
-  to frame-aligned `action_vector` for older recordings that do not have it
+- `actions_hist` should use the raw blackbox `actions` stream; per-frame
+  `action_vector` remains a convenience aligned field inside the same schema-2
+  manifests
 - privileged Stage 1B / 1C targets should live in the sibling
   `capture_<timestamp>_privileged/` directory and be indexed through
   `AtlasTemporalClipIndex.privileged_dir`

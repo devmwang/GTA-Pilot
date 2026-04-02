@@ -175,6 +175,19 @@ struct AdapterSelection {
     bool matchedWindowMonitor = false;
 };
 
+struct MonitorMetadata {
+    int width = 0;
+    int height = 0;
+    double refreshHz = 0.0;
+};
+
+struct WindowGeometryMetadata {
+    int contentWidth = 0;
+    int contentHeight = 0;
+    int clientWidth = 0;
+    int clientHeight = 0;
+};
+
 static std::wstring read_window_text(HWND hwnd) {
     const int length = GetWindowTextLengthW(hwnd);
     if (length <= 0) {
@@ -213,6 +226,61 @@ static std::wstring read_window_executable(HWND hwnd) {
     }
     CloseHandle(process);
     return executable;
+}
+
+static WindowGeometryMetadata read_window_geometry(HWND hwnd) {
+    WindowGeometryMetadata metadata{};
+    RECT windowRect{};
+    if (GetWindowRect(hwnd, &windowRect)) {
+        metadata.contentWidth =
+            std::max(0, static_cast<int>(windowRect.right - windowRect.left));
+        metadata.contentHeight =
+            std::max(0, static_cast<int>(windowRect.bottom - windowRect.top));
+    }
+    RECT clientRect{};
+    if (GetClientRect(hwnd, &clientRect)) {
+        metadata.clientWidth =
+            std::max(0, static_cast<int>(clientRect.right - clientRect.left));
+        metadata.clientHeight =
+            std::max(0, static_cast<int>(clientRect.bottom - clientRect.top));
+    }
+    return metadata;
+}
+
+static MonitorMetadata read_monitor_metadata(HWND hwnd) {
+    MonitorMetadata metadata{};
+    const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr) {
+        return metadata;
+    }
+
+    MONITORINFOEXW monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(monitor, &monitorInfo)) {
+        return metadata;
+    }
+
+    metadata.width = std::max(
+        0, static_cast<int>(monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left));
+    metadata.height = std::max(
+        0, static_cast<int>(monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top));
+
+    DEVMODEW currentMode{};
+    currentMode.dmSize = sizeof(currentMode);
+    if (EnumDisplaySettingsW(monitorInfo.szDevice, ENUM_CURRENT_SETTINGS,
+                             &currentMode)) {
+        metadata.width = static_cast<int>(currentMode.dmPelsWidth);
+        metadata.height = static_cast<int>(currentMode.dmPelsHeight);
+        if (currentMode.dmDisplayFrequency > 1) {
+            metadata.refreshHz = static_cast<double>(currentMode.dmDisplayFrequency);
+        }
+    }
+    return metadata;
+}
+
+static bool is_target_window_foreground(HWND hwnd) {
+    const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    return foreground != nullptr && foreground == GetAncestor(hwnd, GA_ROOT);
 }
 
 static bool is_top_level_capture_window(HWND hwnd) {
@@ -626,8 +694,28 @@ struct SharedFrameWriteDescriptor {
 };
 
 struct CaptureTargetMetadata {
+    HWND hwndHandle = nullptr;
     std::string title;
+    std::string executable;
     uint64_t hwnd = 0;
+    std::string adapterDescription;
+    uint32_t adapterVendorId = 0;
+    uint32_t adapterDeviceId = 0;
+    std::string adapterLuid;
+    bool matchedWindowMonitor = false;
+    int initialContentWidth = 0;
+    int initialContentHeight = 0;
+    int initialClientWidth = 0;
+    int initialClientHeight = 0;
+    int monitorWidth = 0;
+    int monitorHeight = 0;
+    double monitorRefreshHz = 0.0;
+    int previewWidth = 0;
+    int previewHeight = 0;
+    double previewMaxFps = 0.0;
+    uint64_t telemetrySampleInterval = 0;
+    int framePoolBufferCount = 0;
+    int stagingRingSize = 0;
 };
 
 class SharedFrameRingWriter {
@@ -734,6 +822,27 @@ static json build_frame_metadata(
         {"capture_mode", CAPTURE_MODE},
         {"target_window_title", targetWindow.title},
         {"target_window_hwnd", targetWindow.hwnd},
+        {"target_window_executable", targetWindow.executable},
+        {"target_window_foreground",
+         is_target_window_foreground(targetWindow.hwndHandle)},
+        {"adapter_description", targetWindow.adapterDescription},
+        {"adapter_vendor_id", targetWindow.adapterVendorId},
+        {"adapter_device_id", targetWindow.adapterDeviceId},
+        {"adapter_luid", targetWindow.adapterLuid},
+        {"matched_window_monitor", targetWindow.matchedWindowMonitor},
+        {"initial_content_width", targetWindow.initialContentWidth},
+        {"initial_content_height", targetWindow.initialContentHeight},
+        {"initial_client_width", targetWindow.initialClientWidth},
+        {"initial_client_height", targetWindow.initialClientHeight},
+        {"monitor_width", targetWindow.monitorWidth},
+        {"monitor_height", targetWindow.monitorHeight},
+        {"monitor_refresh_hz", targetWindow.monitorRefreshHz},
+        {"preview_width", targetWindow.previewWidth},
+        {"preview_height", targetWindow.previewHeight},
+        {"preview_max_fps", targetWindow.previewMaxFps},
+        {"telemetry_sample_interval", targetWindow.telemetrySampleInterval},
+        {"frame_pool_buffer_count", targetWindow.framePoolBufferCount},
+        {"staging_ring_size", targetWindow.stagingRingSize},
         {"shm_name", descriptor.shmName},
         {"slot_bytes", descriptor.slotBytes},
         {"slot_index", descriptor.slotIndex},
@@ -825,23 +934,22 @@ static void publish_preview_frame(zmq::socket_t &pubPreview,
 
 class WindowCaptureSession {
   public:
-    explicit WindowCaptureSession(WindowCandidate targetWindow)
-        : _targetWindow(std::move(targetWindow)) {}
+    explicit WindowCaptureSession(WindowCandidate targetWindow,
+                                  AdapterSelection adapterSelection)
+        : _targetWindow(std::move(targetWindow)),
+          _adapterSelection(std::move(adapterSelection)) {}
 
     ~WindowCaptureSession() { stop(); }
 
     void initialize() {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
-        const AdapterSelection adapterSelection =
-            select_adapter_for_window(_targetWindow.hwnd);
-
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifdef _DEBUG
         flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
         D3D_FEATURE_LEVEL fl{};
-        hrx(D3D11CreateDevice(adapterSelection.adapter.Get(),
+        hrx(D3D11CreateDevice(_adapterSelection.adapter.Get(),
                               D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                               flags, nullptr, 0, D3D11_SDK_VERSION,
                               _device.GetAddressOf(), &fl,
@@ -908,13 +1016,14 @@ class WindowCaptureSession {
         std::cout << "[DisplayCaptureDX11] Target window "
                   << describe_candidate(_targetWindow) << "\n";
         std::cout << "[DisplayCaptureDX11] Capture adapter "
-                  << adapter_description_utf8(adapterSelection.desc)
-                  << " vendor=0x" << std::hex << adapterSelection.desc.VendorId
-                  << " device=0x" << adapterSelection.desc.DeviceId << std::dec
+                  << adapter_description_utf8(_adapterSelection.desc)
+                  << " vendor=0x" << std::hex << _adapterSelection.desc.VendorId
+                  << " device=0x" << _adapterSelection.desc.DeviceId << std::dec
                   << " luid="
-                  << adapter_luid_string(adapterSelection.desc.AdapterLuid)
+                  << adapter_luid_string(_adapterSelection.desc.AdapterLuid)
                   << " matched_monitor="
-                  << (adapterSelection.matchedWindowMonitor ? "1" : "0") << "\n";
+                  << (_adapterSelection.matchedWindowMonitor ? "1" : "0")
+                  << "\n";
     }
 
     WGC::Direct3D11CaptureFrame wait_for_latest_frame(int timeoutMs) {
@@ -1083,6 +1192,7 @@ class WindowCaptureSession {
 
   private:
     WindowCandidate _targetWindow;
+    AdapterSelection _adapterSelection;
     ComPtr<ID3D11Device> _device;
     ComPtr<ID3D11DeviceContext> _context;
     WGD::IDirect3DDevice _winrtDevice{nullptr};
@@ -1135,9 +1245,35 @@ int main(int argc, char **argv) {
                   << "\n";
 
         WindowCandidate targetWindow = find_gta_window_or_throw();
+        const AdapterSelection adapterSelection =
+            select_adapter_for_window(targetWindow.hwnd);
+        const WindowGeometryMetadata geometryMetadata =
+            read_window_geometry(targetWindow.hwnd);
+        const MonitorMetadata monitorMetadata =
+            read_monitor_metadata(targetWindow.hwnd);
         const CaptureTargetMetadata targetWindowMetadata{
+            targetWindow.hwnd,
             utf8_from_wide(targetWindow.title),
+            utf8_from_wide(targetWindow.executable),
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(targetWindow.hwnd)),
+            adapter_description_utf8(adapterSelection.desc),
+            adapterSelection.desc.VendorId,
+            adapterSelection.desc.DeviceId,
+            adapter_luid_string(adapterSelection.desc.AdapterLuid),
+            adapterSelection.matchedWindowMonitor,
+            geometryMetadata.contentWidth,
+            geometryMetadata.contentHeight,
+            geometryMetadata.clientWidth,
+            geometryMetadata.clientHeight,
+            monitorMetadata.width,
+            monitorMetadata.height,
+            monitorMetadata.refreshHz,
+            previewEnabled ? PREVIEW_W : 0,
+            previewEnabled ? PREVIEW_H : 0,
+            previewMaxFps,
+            telemetrySampleInterval,
+            FRAME_POOL_BUFFER_COUNT,
+            STAGING_RING_SIZE,
         };
 
         zmq::context_t zctx(1);
@@ -1187,7 +1323,7 @@ int main(int argc, char **argv) {
 
         std::thread acquisitionThread([&]() {
             try {
-                WindowCaptureSession capture(targetWindow);
+                WindowCaptureSession capture(targetWindow, adapterSelection);
                 capture.initialize();
                 auto retireCompletedReadbacks = [&]() {
                     bool retiredAny = false;

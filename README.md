@@ -220,6 +220,10 @@ metadata. Current frame metadata includes:
 - `capture_mode`
 - `target_window_title`
 - `target_window_hwnd`
+- `target_window_executable`
+- `target_window_foreground`
+- additive native capture provenance such as adapter, monitor, preview, and
+  buffer configuration
 - `shm_name`
 - `slot_bytes`
 - `slot_index`
@@ -336,31 +340,33 @@ Each start/stop cycle produces a separate recording pair. If you toggle
 recording on twice in one runtime, you will get two clips.
 
 Blackbox now requires `ffmpeg` on `PATH` when recording is enabled. Frames are
-streamed into ffmpeg as raw `bgr24` and encoded as H.264 in an MKV container.
+streamed into ffmpeg as raw `rgb24` and encoded as H.264 in an MKV container.
 Current runtime producers publish 60 Hz vision streams, so new live and video
-override blackbox clips are authored with `video_nominal_fps = 60.0`.
+override blackbox clips are authored with `video_session.nominal_fps = 60.0`.
 The JSON manifest is still the authoritative source for frame timing and action
-alignment. The current manifest schema version is `1`. Recording now uses
+alignment. The current manifest schema version is `2`. Recording now uses
 append-only temporary frame/action journals during capture and synthesizes the
 final `capture_<timestamp>_metadata.json` once when the session stops.
 
-Schema `1` manifests contain:
+Schema `2` manifests contain:
 
 - session-level metadata
+- capture-session provenance
 - session video settings
+- input-session provenance
 - session integrity status plus structured drop/overflow events
-- performance stats for native capture timing, blackbox ingest mode, idle
-  vision-decode counters, and writer lag
 - transport stats for `vision.frames` and `input.actions`
 - writer queue / writer-lag stats
-- frame envelope and frame metadata
-- per-frame video file name and video frame index
+- native capture timing summaries
+- sparse native pipeline telemetry samples
+- sparse session events for focus/device changes
+- per-frame timeline rows and video frame index
 - per-frame `capture_frame_id`
 - per-frame `subscriber_received_timestamp_ns`
 - per-frame `writer_committed_timestamp_ns`
 - per-frame `subscriber_queue_latency_ns`
-- frame-aligned action payloads
 - frame-aligned action vectors
+- frame-aligned action message timestamps
 - the raw action stream seen during capture
 
 Any detected transport gap, subscriber overflow, writer overflow, or native
@@ -435,9 +441,9 @@ the model-time grids:
 - mid-summary sampling at `6 Hz`
 
 Frame selection uses the latest source frame at or before each desired model
-timestamp, and action history is built from the raw blackbox action stream when
-it exists. Older recordings without a raw `actions` stream fall back to the
-frame-aligned `action_vector` path while still preserving exact `dt`.
+timestamp, and action history is built from the raw blackbox `actions` stream.
+The per-frame `action_vector` remains in the same schema-2 manifest as a
+convenience aligned field while still preserving exact `dt`.
 
 Privileged Stage 1B / Stage 1C targets are a separate sibling package:
 
@@ -503,12 +509,10 @@ Current blackbox outputs:
 
 - an MKV video clip encoded via ffmpeg
 - a JSON manifest containing:
-  - session video settings
-  - frame envelope metadata
-  - per-frame metadata
-  - per-frame video file name and frame index
-  - frame-aligned action payloads and action envelope data
-  - frame-aligned action vectors
+  - session, capture-session, video-session, and input-session summaries
+  - integrity, transport, writer, and native-capture timing summaries
+  - sparse native telemetry samples and sparse session events
+  - per-frame timeline rows with aligned `action_vector`
   - the raw action stream seen during capture
 
 This gives us a usable interim dataset for Atlas training and replay using only

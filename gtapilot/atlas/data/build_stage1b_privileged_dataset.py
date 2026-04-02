@@ -14,6 +14,8 @@ from .schema import BlackboxFrameRecord
 
 def _load_source_frames(metadata_path: Path) -> tuple[dict, list[BlackboxFrameRecord]]:
     manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if int(manifest.get("schema_version", 0)) != 2:
+        raise RuntimeError(f"Unsupported blackbox manifest schema: {metadata_path}")
     frames = [
         BlackboxFrameRecord.from_dict(frame_payload)
         for frame_payload in manifest.get("frames", [])
@@ -213,7 +215,10 @@ def main() -> None:
     )
 
     clip_id = metadata_path.stem.replace("_metadata", "")
-    source_video_file = args.source_video_file or manifest.get("video_file_name")
+    source_video_file = (
+        args.source_video_file
+        or (manifest.get("video_session") or {}).get("file_name")
+    )
     output_dir = metadata_path.with_name(f"{clip_id}_privileged")
     manifest_path = write_privileged_clip(
         output_dir=output_dir,

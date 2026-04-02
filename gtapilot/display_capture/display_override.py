@@ -178,6 +178,10 @@ def main(video_path: str):
                         "nominal_fps": FRAME_NOMINAL_FPS,
                         "is_repeat": is_repeat,
                         "capture_mode": "video_override",
+                        "capture_source": "display_override",
+                        "preview_width": PREVIEW_SIZE[0],
+                        "preview_height": PREVIEW_SIZE[1],
+                        "preview_max_fps": preview_max_fps,
                     },
                 )
                 if preview_interval_ns is not None and (
@@ -201,6 +205,7 @@ def main(video_path: str):
                             "source_nominal_fps": FRAME_NOMINAL_FPS,
                             "is_repeat": is_repeat,
                             "capture_mode": "video_override",
+                            "capture_source": "display_override_preview",
                             "preview_source": "vision.frames",
                         },
                     )

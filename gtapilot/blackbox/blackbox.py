@@ -15,7 +15,11 @@ import cv2
 import numpy as np
 import zmq
 
-from gtapilot.config import BLACKBOX_PREROLL_SECONDS, BLACKBOX_RECORD_ON_START
+from gtapilot.config import (
+    BLACKBOX_PREROLL_SECONDS,
+    BLACKBOX_RECORD_HOTKEY,
+    BLACKBOX_RECORD_ON_START,
+)
 from gtapilot.ipc.channel import ChannelTransportTracker
 from gtapilot.ipc.channels import (
     INPUT_ACTIONS_CHANNEL,
@@ -36,7 +40,7 @@ from gtapilot.ipc.types import (
 )
 
 DEFAULT_OUTPUT_DIR = Path("blackbox-recordings")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PREROLL_JPEG_QUALITY = 85
 SETTINGS_REFRESH_INTERVAL_SECONDS = 0.5
 VIDEO_CODEC = "libx264"
@@ -61,6 +65,8 @@ INGEST_MODE_INACTIVE = "inactive"
 INGEST_MODE_ACTIVE = "active"
 INTEGRITY_EDGE_GRACE_SECONDS = 5.0
 INTEGRITY_EDGE_GRACE_NS = int(INTEGRITY_EDGE_GRACE_SECONDS * 1_000_000_000)
+INPUT_NOMINAL_HZ = 60.0
+INPUT_MAPPING_VERSION = 1
 
 T = TypeVar("T")
 
@@ -83,9 +89,8 @@ class VideoSessionConfig:
 
 @dataclass(slots=True, frozen=True)
 class AlignedActionData:
-    payload: dict[str, Any] | None
     vector: list[float]
-    envelope: dict[str, Any] | None
+    message_timestamp_ns: int | None
 
 
 @dataclass(slots=True)
@@ -213,9 +218,8 @@ def _configs_match(left: VideoSessionConfig, right: VideoSessionConfig) -> bool:
 
 def _empty_aligned_action() -> AlignedActionData:
     return AlignedActionData(
-        payload=None,
         vector=[0.0] * 6,
-        envelope=None,
+        message_timestamp_ns=None,
     )
 
 
@@ -225,9 +229,8 @@ def _aligned_action_from_message(
     if action_message is None:
         return _empty_aligned_action()
     return AlignedActionData(
-        payload=action_message.payload.to_dict(),
         vector=action_message.payload.vector,
-        envelope=action_message.envelope.to_dict(),
+        message_timestamp_ns=int(action_message.envelope.message_timestamp_ns),
     )
 
 
@@ -244,6 +247,56 @@ def _subscriber_timestamps(
     )
 
 
+def _action_payload_dict(payload: Any) -> dict[str, Any]:
+    raw_payload = payload.to_dict()
+    return {
+        "steer": float(raw_payload.get("steer", 0.0)),
+        "throttle": float(raw_payload.get("throttle", 0.0)),
+        "brake": float(raw_payload.get("brake", 0.0)),
+        "handbrake": float(raw_payload.get("handbrake", 0.0)),
+        "reverse": float(raw_payload.get("reverse", 0.0)),
+        "pilot_active": float(raw_payload.get("pilot_active", 0.0)),
+        "active_device": str(raw_payload.get("active_device", "none")),
+        "device_inputs": dict(raw_payload.get("device_inputs", {})),
+    }
+
+
+def _action_vector_from_payload(payload: dict[str, Any]) -> list[float]:
+    return [
+        float(payload.get("steer", 0.0)),
+        float(payload.get("throttle", 0.0)),
+        float(payload.get("brake", 0.0)),
+        float(payload.get("handbrake", 0.0)),
+        float(payload.get("reverse", 0.0)),
+        float(payload.get("pilot_active", 0.0)),
+    ]
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
+
+
 def _action_stream_entry(action_message: ChannelMessage) -> dict[str, Any]:
     subscriber_received_timestamp_ns, subscriber_queue_latency_ns = (
         _subscriber_timestamps(
@@ -251,33 +304,27 @@ def _action_stream_entry(action_message: ChannelMessage) -> dict[str, Any]:
             action_message.subscriber_received_timestamp_ns,
         )
     )
+    payload = _action_payload_dict(action_message.payload)
     return {
-        "envelope": action_message.envelope.to_dict(),
-        "payload": action_message.payload.to_dict(),
-        "action_vector": action_message.payload.vector,
+        "sequence_id": int(action_message.envelope.sequence_id),
+        "message_timestamp_ns": int(action_message.envelope.message_timestamp_ns),
+        "publish_timestamp_ns": int(action_message.envelope.publish_timestamp_ns),
         "subscriber_received_timestamp_ns": subscriber_received_timestamp_ns,
         "subscriber_queue_latency_ns": subscriber_queue_latency_ns,
+        "payload": payload,
     }
 
 
 def _frame_entry_from_task(
     *,
     task: FrameWriteTask,
-    session_paths: BlackboxSessionPaths,
-    session_config: VideoSessionConfig,
     video_frame_index: int,
     writer_committed_timestamp_ns: int,
 ) -> dict[str, Any]:
     frame_metadata = task.frame_envelope.metadata
-    height, width = task.frame_rgb.shape[:2]
-    return {
-        "video_file_name": session_paths.video_path.name,
+    frame_entry = {
+        "sequence_id": int(task.frame_envelope.sequence_id),
         "video_frame_index": int(video_frame_index),
-        "video_nominal_fps": float(session_config.nominal_fps),
-        "video_codec": VIDEO_CODEC,
-        "video_container": VIDEO_CONTAINER,
-        "encoded_width": int(session_config.width),
-        "encoded_height": int(session_config.height),
         "frame_id": int(frame_metadata.get("frame_id", -1)),
         "capture_frame_id": int(
             frame_metadata.get(
@@ -290,17 +337,102 @@ def _frame_entry_from_task(
         "subscriber_received_timestamp_ns": int(task.subscriber_received_timestamp_ns),
         "writer_committed_timestamp_ns": int(writer_committed_timestamp_ns),
         "subscriber_queue_latency_ns": int(task.subscriber_queue_latency_ns),
-        "resolution_height": int(frame_metadata.get("h", height)),
-        "resolution_width": int(frame_metadata.get("w", width)),
-        "frame_source": task.frame_envelope.source,
-        "frame_envelope": task.frame_envelope.to_dict(),
-        "frame_metadata": dict(frame_metadata),
-        "action": None if task.aligned_action.payload is None else dict(task.aligned_action.payload),
-        "action_envelope": (
-            None if task.aligned_action.envelope is None else dict(task.aligned_action.envelope)
-        ),
+        "is_repeat": bool(frame_metadata.get("is_repeat", False)),
         "action_vector": list(task.aligned_action.vector),
+        "action_message_timestamp_ns": (
+            None
+            if task.aligned_action.message_timestamp_ns is None
+            else int(task.aligned_action.message_timestamp_ns)
+        ),
     }
+    pipeline_stats = frame_metadata.get("pipeline_stats")
+    if isinstance(pipeline_stats, dict):
+        frame_entry["pipeline_stats"] = dict(pipeline_stats)
+    return frame_entry
+
+
+def _capture_session_payload(
+    *,
+    frame_envelope: ChannelEnvelope,
+    session_config: VideoSessionConfig,
+) -> dict[str, Any]:
+    frame_metadata = frame_envelope.metadata
+    return {
+        "capture_mode": _optional_str(frame_metadata.get("capture_mode")),
+        "capture_source": _optional_str(
+            frame_metadata.get("capture_source", frame_envelope.source)
+        ),
+        "nominal_fps": float(frame_metadata.get("nominal_fps", session_config.nominal_fps)),
+        "frame_width": int(frame_metadata.get("w", session_config.width)),
+        "frame_height": int(frame_metadata.get("h", session_config.height)),
+        "frame_channels": int(frame_metadata.get("channels", 3)),
+        "frame_dtype": str(frame_metadata.get("dtype", "uint8")),
+        "target_window_title": _optional_str(frame_metadata.get("target_window_title")),
+        "target_window_hwnd": _optional_int(frame_metadata.get("target_window_hwnd")),
+        "target_window_executable": _optional_str(
+            frame_metadata.get("target_window_executable")
+        ),
+        "adapter_description": _optional_str(frame_metadata.get("adapter_description")),
+        "adapter_vendor_id": _optional_int(frame_metadata.get("adapter_vendor_id")),
+        "adapter_device_id": _optional_int(frame_metadata.get("adapter_device_id")),
+        "adapter_luid": _optional_str(frame_metadata.get("adapter_luid")),
+        "matched_window_monitor": _optional_bool(
+            frame_metadata.get("matched_window_monitor")
+        ),
+        "initial_content_width": _optional_int(frame_metadata.get("initial_content_width")),
+        "initial_content_height": _optional_int(frame_metadata.get("initial_content_height")),
+        "initial_client_width": _optional_int(frame_metadata.get("initial_client_width")),
+        "initial_client_height": _optional_int(frame_metadata.get("initial_client_height")),
+        "monitor_width": _optional_int(frame_metadata.get("monitor_width")),
+        "monitor_height": _optional_int(frame_metadata.get("monitor_height")),
+        "monitor_refresh_hz": _optional_float(frame_metadata.get("monitor_refresh_hz")),
+        "preview_width": _optional_int(frame_metadata.get("preview_width")),
+        "preview_height": _optional_int(frame_metadata.get("preview_height")),
+        "preview_max_fps": _optional_float(frame_metadata.get("preview_max_fps")),
+        "telemetry_sample_interval": _optional_int(
+            frame_metadata.get("telemetry_sample_interval")
+        ),
+        "frame_pool_buffer_count": _optional_int(
+            frame_metadata.get("frame_pool_buffer_count")
+        ),
+        "staging_ring_size": _optional_int(frame_metadata.get("staging_ring_size")),
+    }
+
+
+def _native_pipeline_samples(
+    frame_payloads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    last_sample_capture_frame_id: int | None = None
+    for frame_payload in frame_payloads:
+        pipeline_stats = frame_payload.pop("pipeline_stats", None)
+        if not isinstance(pipeline_stats, dict):
+            continue
+        current_capture_frame_id = int(
+            pipeline_stats.get(
+                "sample_capture_frame_id",
+                frame_payload.get("capture_frame_id", frame_payload.get("frame_id", -1)),
+            )
+        )
+        if current_capture_frame_id == last_sample_capture_frame_id:
+            continue
+        last_sample_capture_frame_id = current_capture_frame_id
+        samples.append(
+            {
+                "capture_frame_id": current_capture_frame_id,
+                "capture_timestamp_ns": int(frame_payload.get("capture_timestamp_ns", 0)),
+                "stats": dict(pipeline_stats),
+            }
+        )
+    return samples
+
+
+def _active_devices_seen(action_payloads: list[dict[str, Any]]) -> list[str]:
+    devices = {
+        str((action_payload.get("payload") or {}).get("active_device", "none"))
+        for action_payload in action_payloads
+    }
+    return sorted(device for device in devices if device)
 
 
 def _encode_preroll_jpeg(frame_rgb: np.ndarray) -> bytes | None:
@@ -467,9 +599,8 @@ def _session_data_window_ns(
             timestamps_ns.append(timestamp_ns)
 
     for action_payload in action_payloads:
-        envelope = dict(action_payload.get("envelope") or {})
         timestamp_ns = int(
-            envelope.get(
+            action_payload.get(
                 "message_timestamp_ns",
                 action_payload.get("subscriber_received_timestamp_ns", 0),
             )
@@ -536,32 +667,19 @@ def _split_drop_events_for_integrity(
 
 
 def _native_capture_timing_summary(
-    frame_payloads: list[dict[str, Any]],
+    native_pipeline_samples: list[dict[str, Any]],
 ) -> dict[str, Any]:
     latest_pipeline_stats: dict[str, Any] = {}
-    sample_capture_frame_id: int | None = None
     frame_arrival_wait_ns: list[int] = []
     gpu_readback_ns: list[int] = []
     cpu_convert_ns: list[int] = []
     publish_deadline_lag_ns: list[int] = []
 
-    for frame_payload in frame_payloads:
-        pipeline_stats = (frame_payload.get("frame_metadata") or {}).get("pipeline_stats")
+    for sample in native_pipeline_samples:
+        pipeline_stats = sample.get("stats")
         if not isinstance(pipeline_stats, dict):
             continue
         latest_pipeline_stats = dict(pipeline_stats)
-        current_sample_capture_frame_id = int(
-            pipeline_stats.get(
-                "sample_capture_frame_id",
-                frame_payload.get("capture_frame_id", frame_payload.get("frame_id", -1)),
-            )
-        )
-        if (
-            sample_capture_frame_id is not None
-            and current_sample_capture_frame_id == sample_capture_frame_id
-        ):
-            continue
-        sample_capture_frame_id = current_sample_capture_frame_id
 
         for bucket, key in (
             (frame_arrival_wait_ns, "frame_arrival_wait_ns"),
@@ -817,9 +935,7 @@ class BlackboxSessionWriter:
             )
 
     def _write_action_entry(self, action_entry: dict[str, Any]) -> None:
-        action_payload = dict(action_entry)
-        action_payload["writer_committed_timestamp_ns"] = time.time_ns()
-        self._actions_journal.write(json.dumps(action_payload) + "\n")
+        self._actions_journal.write(json.dumps(action_entry) + "\n")
         self._actions_written += 1
         self._action_flush_items += 1
         if self._action_flush_items >= WRITER_JOURNAL_FLUSH_ITEMS:
@@ -832,8 +948,6 @@ class BlackboxSessionWriter:
         self._frames_written += 1
         frame_entry = _frame_entry_from_task(
             task=task,
-            session_paths=self.paths,
-            session_config=self.config,
             video_frame_index=self._frames_written,
             writer_committed_timestamp_ns=writer_committed_timestamp_ns,
         )
@@ -1021,6 +1135,10 @@ class BlackboxRecorder:
         self._written_action_keys: set[tuple[str, int]] = set()
         self._session_transport_baselines: dict[str, ChannelTransportStats] = {}
         self._session_drop_events: list[dict[str, Any]] = []
+        self._session_events: list[dict[str, Any]] = []
+        self._session_capture_metadata: dict[str, Any] = {}
+        self._session_last_focus_state: str | None = None
+        self._session_last_active_device: str | None = None
         self._session_native_overload_active = False
         self._session_created_timestamp_ns = 0
         self._vision_frames_decoded_total = 0
@@ -1054,6 +1172,42 @@ class BlackboxRecorder:
         self.preroll_frames.clear()
         self.preroll_actions.clear()
         self.preroll_transport_events.clear()
+
+    def _record_session_event(self, payload: dict[str, Any]) -> None:
+        if not self._session_active():
+            return
+        self._session_events.append(dict(payload))
+
+    def _record_focus_event(self, frame_metadata: dict[str, Any]) -> None:
+        foreground = frame_metadata.get("target_window_foreground")
+        if foreground is None:
+            return
+        focus_state = "foreground" if bool(foreground) else "background"
+        if focus_state == self._session_last_focus_state:
+            return
+        self._session_last_focus_state = focus_state
+        self._record_session_event(
+            {
+                "kind": "target_window_focus",
+                "timestamp_ns": int(
+                    frame_metadata.get("capture_timestamp_ns", time.time_ns())
+                ),
+                "state": focus_state,
+            }
+        )
+
+    def _record_active_device_event(self, action_message: ChannelMessage) -> None:
+        active_device = str(action_message.payload.active_device)
+        if active_device == self._session_last_active_device:
+            return
+        self._session_last_active_device = active_device
+        self._record_session_event(
+            {
+                "kind": "active_input_device",
+                "timestamp_ns": int(action_message.envelope.message_timestamp_ns),
+                "active_device": active_device,
+            }
+        )
 
     def _refresh_runtime_settings(self) -> SettingValue | None:
         now = time.monotonic()
@@ -1320,11 +1474,16 @@ class BlackboxRecorder:
             task = self._frame_task_from_buffered(buffered_frame)
             if task is None:
                 continue
+            self._record_focus_event(task.frame_envelope.metadata)
             self._handle_native_pipeline_telemetry(task.frame_envelope.metadata)
             self.session_writer.enqueue_frame(task)
         self.preroll_frames.clear()
 
-    def start_session(self, session_config: VideoSessionConfig) -> None:
+    def start_session(
+        self,
+        session_config: VideoSessionConfig,
+        initial_frame_envelope: ChannelEnvelope,
+    ) -> None:
         if self._session_active():
             return
 
@@ -1336,6 +1495,13 @@ class BlackboxRecorder:
         )
         self._written_action_keys.clear()
         self._session_drop_events = []
+        self._session_events = []
+        self._session_capture_metadata = _capture_session_payload(
+            frame_envelope=initial_frame_envelope,
+            session_config=session_config,
+        )
+        self._session_last_focus_state = None
+        self._session_last_active_device = None
         self._session_native_overload_active = False
         self._session_created_timestamp_ns = time.time_ns()
         self._session_vision_frames_decoded_baseline = int(
@@ -1354,6 +1520,7 @@ class BlackboxRecorder:
         self.preroll_transport_events.clear()
 
         for action_message in self.preroll_actions:
+            self._record_active_device_event(action_message)
             self._enqueue_action_message(action_message)
         self.preroll_actions.clear()
         self._append_matching_preroll_frames()
@@ -1369,6 +1536,8 @@ class BlackboxRecorder:
         if self.paths is None or self.session_config is None:
             raise RuntimeError("Blackbox session paths/config are not available.")
 
+        normalized_frame_payloads = [dict(frame_payload) for frame_payload in frame_payloads]
+        native_pipeline_samples = _native_pipeline_samples(normalized_frame_payloads)
         transport_stats = {
             "vision": _delta_transport_stats(
                 self.vision_transport_tracker.snapshot(),
@@ -1380,19 +1549,16 @@ class BlackboxRecorder:
             ),
         }
         raw_drop_events = list(self._session_drop_events) + list(writer_drop_events)
-        gap_stats = _frame_gap_stats(frame_payloads)
+        gap_stats = _frame_gap_stats(normalized_frame_payloads)
         repeat_frame_count = sum(
             1
-            for frame_payload in frame_payloads
-            if bool((frame_payload.get("frame_metadata") or {}).get("is_repeat", False))
+            for frame_payload in normalized_frame_payloads
+            if bool(frame_payload.get("is_repeat", False))
         )
         fresh_capture_frame_count = 0
         last_capture_frame_id: int | None = None
-        native_capture_performance = _native_capture_timing_summary(frame_payloads)
-        native_pipeline_summary = dict(
-            native_capture_performance.get("latest_pipeline_stats", {})
-        )
-        for frame_payload in frame_payloads:
+        native_capture_stats = _native_capture_timing_summary(native_pipeline_samples)
+        for frame_payload in normalized_frame_payloads:
             capture_frame_id = int(
                 frame_payload.get("capture_frame_id", frame_payload.get("frame_id", -1))
             )
@@ -1401,7 +1567,7 @@ class BlackboxRecorder:
                 last_capture_frame_id = capture_frame_id
 
         session_start_timestamp_ns, session_end_timestamp_ns = _session_data_window_ns(
-            frame_payloads=frame_payloads,
+            frame_payloads=normalized_frame_payloads,
             action_payloads=action_payloads,
             created_timestamp_ns=self._session_created_timestamp_ns,
         )
@@ -1413,81 +1579,62 @@ class BlackboxRecorder:
         )
 
         integrity_degraded = bool(drop_events)
-
-        performance_stats = {
-            "native_capture": native_capture_performance,
-            "blackbox_ingest": {
-                "session_mode": INGEST_MODE_ACTIVE,
-                "vision_frames_decoded_total": max(
-                    0,
-                    int(self._vision_frames_decoded_total)
-                    - int(self._session_vision_frames_decoded_baseline),
-                ),
-                "vision_frames_decoded_while_inactive": int(
-                    max(
-                        0,
-                        int(self._vision_frames_decoded_while_inactive)
-                        - int(
-                            self._session_vision_frames_decoded_while_inactive_baseline
-                        ),
-                    )
-                ),
-            },
-            "writer": {
-                "writer_lag_ns": dict(writer_stats.get("writer_lag_ns", {})),
-                "frame_queue_max_depth": int(
-                    writer_stats.get("frame_queue_max_depth", 0)
-                ),
-                "frame_queue_dropped_frames": int(
-                    writer_stats.get("frame_queue_dropped_frames", 0)
-                ),
-                "action_queue_max_depth": int(
-                    writer_stats.get("action_queue_max_depth", 0)
-                ),
-                "action_queue_dropped_entries": int(
-                    writer_stats.get("action_queue_dropped_entries", 0)
-                ),
-            },
-        }
+        capture_session = dict(self._session_capture_metadata)
+        capture_session.setdefault("capture_source", None)
+        capture_session.setdefault("capture_mode", None)
+        capture_session.setdefault("nominal_fps", float(self.session_config.nominal_fps))
+        capture_session.setdefault("frame_width", int(self.session_config.width))
+        capture_session.setdefault("frame_height", int(self.session_config.height))
+        capture_session.setdefault("frame_channels", 3)
+        capture_session.setdefault("frame_dtype", "uint8")
         return {
             "schema_version": SCHEMA_VERSION,
-            "session_timestamp": self.paths.session_timestamp,
-            "created_timestamp_ns": int(self._session_created_timestamp_ns),
-            "finalized_timestamp_ns": time.time_ns(),
-            "frame_channel": self.vision_channel.name,
-            "frame_topic": self.vision_channel.topic.decode("utf-8"),
-            "action_channel": self.action_channel.name,
-            "action_topic": self.action_channel.topic.decode("utf-8"),
-            "video_file_name": self.paths.video_path.name,
-            "video_codec": VIDEO_CODEC,
-            "video_container": VIDEO_CONTAINER,
-            "video_nominal_fps": float(self.session_config.nominal_fps),
-            "encoded_width": int(self.session_config.width),
-            "encoded_height": int(self.session_config.height),
-            "frame_count": int(len(frame_payloads)),
-            "action_count": int(len(action_payloads)),
+            "session": {
+                "session_timestamp": self.paths.session_timestamp,
+                "created_timestamp_ns": int(self._session_created_timestamp_ns),
+                "finalized_timestamp_ns": time.time_ns(),
+                "timeline_start_timestamp_ns": int(session_start_timestamp_ns),
+                "timeline_end_timestamp_ns": int(session_end_timestamp_ns),
+                "frame_count": int(len(normalized_frame_payloads)),
+                "action_count": int(len(action_payloads)),
+                "frame_channel": self.vision_channel.name,
+                "frame_topic": self.vision_channel.topic.decode("utf-8"),
+                "action_channel": self.action_channel.name,
+                "action_topic": self.action_channel.topic.decode("utf-8"),
+            },
+            "capture_session": capture_session,
+            "video_session": {
+                "file_name": self.paths.video_path.name,
+                "codec": VIDEO_CODEC,
+                "container": VIDEO_CONTAINER,
+                "pixel_format": VIDEO_PIXEL_FORMAT,
+                "encoded_width": int(self.session_config.width),
+                "encoded_height": int(self.session_config.height),
+                "nominal_fps": float(self.session_config.nominal_fps),
+            },
+            "input_session": {
+                "input_nominal_hz": INPUT_NOMINAL_HZ,
+                "record_hotkey": BLACKBOX_RECORD_HOTKEY,
+                "input_mapping_version": INPUT_MAPPING_VERSION,
+                "active_devices_seen": _active_devices_seen(action_payloads),
+            },
             "session_integrity": {
                 "status": "degraded" if integrity_degraded else "ok",
                 "drop_event_count": int(len(drop_events)),
                 "ignored_drop_event_count": int(len(ignored_drop_events)),
                 "edge_grace_window_seconds": float(INTEGRITY_EDGE_GRACE_SECONDS),
-            },
-            "session_stats": {
-                "frame_count": int(len(frame_payloads)),
-                "action_count": int(len(action_payloads)),
                 "repeat_frame_count": int(repeat_frame_count),
                 "fresh_capture_frame_count": int(fresh_capture_frame_count),
                 **gap_stats,
-                "native_pipeline": native_pipeline_summary,
-                "timeline_start_timestamp_ns": int(session_start_timestamp_ns),
-                "timeline_end_timestamp_ns": int(session_end_timestamp_ns),
             },
-            "performance_stats": performance_stats,
             "transport_stats": transport_stats,
             "writer_stats": writer_stats,
+            "native_capture_stats": native_capture_stats,
+            "native_pipeline_samples": native_pipeline_samples,
             "drop_events": drop_events,
             "ignored_drop_events": ignored_drop_events,
-            "frames": frame_payloads,
+            "session_events": list(self._session_events),
+            "frames": normalized_frame_payloads,
             "actions": action_payloads,
         }
 
@@ -1525,6 +1672,10 @@ class BlackboxRecorder:
             self._written_action_keys.clear()
             self._session_transport_baselines = {}
             self._session_drop_events = []
+            self._session_events = []
+            self._session_capture_metadata = {}
+            self._session_last_focus_state = None
+            self._session_last_active_device = None
             self._session_native_overload_active = False
             self._session_created_timestamp_ns = 0
             self._session_vision_frames_decoded_baseline = int(
@@ -1537,14 +1688,14 @@ class BlackboxRecorder:
     def _roll_session_if_needed(self, frame_message: ChannelMessage[np.ndarray]) -> None:
         frame_config = _frame_config_from_parts(frame_message.envelope.metadata)
         if not self._session_active():
-            self.start_session(frame_config)
+            self.start_session(frame_config, frame_message.envelope)
             return
 
         if self.session_config is None or _configs_match(self.session_config, frame_config):
             return
 
         self.stop_session()
-        self.start_session(frame_config)
+        self.start_session(frame_config, frame_message.envelope)
 
     def _handle_action_message(
         self,
@@ -1553,6 +1704,7 @@ class BlackboxRecorder:
         recording_enabled_for_action: bool,
     ) -> None:
         if recording_enabled_for_action and self._session_active():
+            self._record_active_device_event(action_message)
             self._enqueue_action_message(action_message)
         else:
             _bounded_append(
@@ -1585,6 +1737,7 @@ class BlackboxRecorder:
             self._roll_session_if_needed(frame_message)
             if self.session_writer is not None:
                 frame_task = self._frame_task_from_message(frame_message, aligned_action)
+                self._record_focus_event(frame_task.frame_envelope.metadata)
                 self._handle_native_pipeline_telemetry(frame_task.frame_envelope.metadata)
                 self.session_writer.enqueue_frame(frame_task)
         else:

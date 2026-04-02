@@ -58,8 +58,8 @@ namespace WGD = winrt::Windows::Graphics::DirectX::Direct3D11;
 namespace WFM = winrt::Windows::Foundation::Metadata;
 
 static constexpr int CAP_FRAME_TIMEOUT_MS = 17;
-static constexpr int FRAME_POOL_BUFFER_COUNT = 2;
-static constexpr int STAGING_RING_SIZE = 4;
+static constexpr int FRAME_POOL_BUFFER_COUNT = 4;
+static constexpr int STAGING_RING_SIZE = 8;
 static constexpr int SHARED_FRAME_SLOT_COUNT = 8;
 static constexpr int SHARED_PREVIEW_SLOT_COUNT = 4;
 static constexpr int PREVIEW_W = 1280;
@@ -153,6 +153,13 @@ static inline uint64_t unix_time_ns() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+static inline uint64_t steady_time_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
             .count());
 }
 
@@ -444,11 +451,13 @@ static WGD::IDirect3DDevice create_winrt_device_from_d3d11(
 
 struct ReadbackSlot {
     ComPtr<ID3D11Texture2D> staging;
+    ComPtr<ID3D11Query> readyQuery;
     UINT width = 0;
     UINT height = 0;
     std::vector<uint8_t> bgra;
     uint64_t captureTimestampNs = 0;
     uint64_t captureFrameId = 0;
+    uint64_t copyIssuedSteadyNs = 0;
     uint64_t gpuReadbackNs = 0;
 };
 
@@ -481,6 +490,13 @@ static void ensure_readback_slot(ID3D11Device *device, UINT width, UINT height,
         slot.width = width;
         slot.height = height;
     }
+    if (!slot.readyQuery) {
+        D3D11_QUERY_DESC queryDesc{};
+        queryDesc.Query = D3D11_QUERY_EVENT;
+        queryDesc.MiscFlags = 0;
+        hrx(device->CreateQuery(&queryDesc, slot.readyQuery.GetAddressOf()),
+            "Create readback ready query");
+    }
     slot.bgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) *
                      4U);
 }
@@ -499,6 +515,8 @@ struct PipelineTelemetry {
     std::atomic<uint64_t> maxGpuReadbackNs{0};
     std::atomic<uint64_t> lastCpuConvertNs{0};
     std::atomic<uint64_t> maxCpuConvertNs{0};
+    std::atomic<int> pendingReadbackDepth{0};
+    std::atomic<int> maxPendingReadbackDepth{0};
     std::atomic<int> conversionBacklogDepth{0};
     std::atomic<int> maxConversionBacklogDepth{0};
 };
@@ -508,6 +526,7 @@ struct SharedPipelineState {
     std::condition_variable rawReadyAvailable;
     std::array<ReadbackSlot, STAGING_RING_SIZE> rawSlots;
     std::deque<int> freeRawSlots;
+    std::deque<int> pendingReadbackSlots;
     std::deque<int> readyRawSlots;
     std::atomic<bool> running{true};
 };
@@ -587,6 +606,10 @@ static json pipeline_stats_json(const PipelineTelemetry &telemetry,
          telemetry.lastCpuConvertNs.load()},
         {"max_cpu_convert_ns",
          telemetry.maxCpuConvertNs.load()},
+        {"pending_readback_depth",
+         telemetry.pendingReadbackDepth.load()},
+        {"max_pending_readback_depth",
+         telemetry.maxPendingReadbackDepth.load()},
         {"conversion_backlog_depth",
          telemetry.conversionBacklogDepth.load()},
         {"max_conversion_backlog_depth",
@@ -935,8 +958,8 @@ class WindowCaptureSession {
         }
     }
 
-    void copy_client_frame_to_bgra(WGC::Direct3D11CaptureFrame const &frame,
-                                   ReadbackSlot &slot) {
+    void issue_copy_to_staging(WGC::Direct3D11CaptureFrame const &frame,
+                               ReadbackSlot &slot) {
         auto frameSurface =
             get_dxgi_interface_from_object<ID3D11Texture2D>(frame.Surface());
 
@@ -964,6 +987,8 @@ class WindowCaptureSession {
         }
 
         ensure_readback_slot(_device.Get(), cropWidth, cropHeight, slot);
+        slot.width = cropWidth;
+        slot.height = cropHeight;
 
         D3D11_BOX srcBox{};
         srcBox.left = static_cast<UINT>(clientBox.left);
@@ -973,35 +998,9 @@ class WindowCaptureSession {
         srcBox.front = 0;
         srcBox.back = 1;
 
-        const auto readbackStart = std::chrono::steady_clock::now();
         _context->CopySubresourceRegion(slot.staging.Get(), 0, 0, 0, 0,
                                         frameSurface.get(), 0, &srcBox);
-
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        hrx(_context->Map(slot.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped),
-            "Map staging");
-        const auto *src = reinterpret_cast<const uint8_t *>(mapped.pData);
-        const size_t rowBytes =
-            static_cast<size_t>(cropWidth) * 4U;
-        if (mapped.RowPitch == rowBytes) {
-            std::memcpy(slot.bgra.data(), src, rowBytes * cropHeight);
-        } else {
-            for (UINT y = 0; y < cropHeight; ++y) {
-                const auto *srcRow =
-                    src + static_cast<size_t>(y) * mapped.RowPitch;
-                std::memcpy(
-                    slot.bgra.data() +
-                        static_cast<size_t>(y) * rowBytes,
-                    srcRow, rowBytes);
-            }
-        }
-        _context->Unmap(slot.staging.Get(), 0);
-        slot.gpuReadbackNs =
-            static_cast<uint64_t>(std::chrono::duration_cast<
-                                      std::chrono::nanoseconds>(
-                                      std::chrono::steady_clock::now() -
-                                      readbackStart)
-                                      .count());
+        _context->End(slot.readyQuery.Get());
 
         const auto frameSize = frame.ContentSize();
         if (frameSize.Width != _lastSize.Width ||
@@ -1013,8 +1012,41 @@ class WindowCaptureSession {
                 FRAME_POOL_BUFFER_COUNT, frameSize);
             _lastSize = frameSize;
         }
-        slot.width = cropWidth;
-        slot.height = cropHeight;
+    }
+
+    bool try_complete_readback(ReadbackSlot &slot) {
+        BOOL ready = FALSE;
+        const HRESULT queryHr = _context->GetData(
+            slot.readyQuery.Get(), &ready, sizeof(ready),
+            D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (queryHr == S_FALSE || !ready) {
+            return false;
+        }
+        hrx(queryHr, "GetData readback ready query");
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hrx(_context->Map(slot.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped),
+            "Map staging");
+        const auto *src = reinterpret_cast<const uint8_t *>(mapped.pData);
+        const size_t rowBytes =
+            static_cast<size_t>(slot.width) * 4U;
+        if (mapped.RowPitch == rowBytes) {
+            std::memcpy(slot.bgra.data(), src,
+                        rowBytes * static_cast<size_t>(slot.height));
+        } else {
+            for (UINT y = 0; y < slot.height; ++y) {
+                const auto *srcRow =
+                    src + static_cast<size_t>(y) * mapped.RowPitch;
+                std::memcpy(
+                    slot.bgra.data() +
+                        static_cast<size_t>(y) * rowBytes,
+                    srcRow, rowBytes);
+            }
+        }
+        _context->Unmap(slot.staging.Get(), 0);
+        slot.gpuReadbackNs =
+            steady_time_ns() - slot.copyIssuedSteadyNs;
+        return true;
     }
 
     bool target_still_valid() const {
@@ -1132,6 +1164,16 @@ int main(int argc, char **argv) {
                               static_cast<size_t>(rawH) * 4U);
         }
         PipelineTelemetry telemetry;
+        auto updateQueueTelemetryLocked = [&]() {
+            const int pendingDepth =
+                static_cast<int>(state.pendingReadbackSlots.size());
+            telemetry.pendingReadbackDepth.store(pendingDepth);
+            update_max_atomic(telemetry.maxPendingReadbackDepth, pendingDepth);
+            const int readyDepth =
+                static_cast<int>(state.readyRawSlots.size());
+            telemetry.conversionBacklogDepth.store(readyDepth);
+            update_max_atomic(telemetry.maxConversionBacklogDepth, readyDepth);
+        };
         std::exception_ptr workerError;
         std::mutex workerErrorMutex;
         auto setWorkerError = [&](std::exception_ptr error) {
@@ -1147,6 +1189,36 @@ int main(int argc, char **argv) {
             try {
                 WindowCaptureSession capture(targetWindow);
                 capture.initialize();
+                auto retireCompletedReadbacks = [&]() {
+                    bool retiredAny = false;
+                    while (state.running.load()) {
+                        int pendingSlotIndex = -1;
+                        {
+                            std::lock_guard<std::mutex> lock(state.mutex);
+                            if (state.pendingReadbackSlots.empty()) {
+                                break;
+                            }
+                            pendingSlotIndex = state.pendingReadbackSlots.front();
+                        }
+                        auto &pendingSlot = state.rawSlots[pendingSlotIndex];
+                        if (!capture.try_complete_readback(pendingSlot)) {
+                            break;
+                        }
+                        telemetry.lastGpuReadbackNs.store(pendingSlot.gpuReadbackNs);
+                        update_max_atomic(telemetry.maxGpuReadbackNs,
+                                          pendingSlot.gpuReadbackNs);
+                        {
+                            std::lock_guard<std::mutex> lock(state.mutex);
+                            state.pendingReadbackSlots.pop_front();
+                            state.readyRawSlots.push_back(pendingSlotIndex);
+                            updateQueueTelemetryLocked();
+                        }
+                        retiredAny = true;
+                    }
+                    if (retiredAny) {
+                        state.rawReadyAvailable.notify_one();
+                    }
+                };
 
                 uint64_t captureFrameId = 0;
                 while (state.running.load()) {
@@ -1155,6 +1227,8 @@ int main(int argc, char **argv) {
                             "Grand Theft Auto V window was lost or minimized.");
                     }
 
+                    retireCompletedReadbacks();
+
                     const auto waitStart = std::chrono::steady_clock::now();
                     auto frame = capture.wait_for_latest_frame(CAP_FRAME_TIMEOUT_MS);
                     const uint64_t frameArrivalWaitNs = static_cast<uint64_t>(
@@ -1162,6 +1236,7 @@ int main(int argc, char **argv) {
                             std::chrono::steady_clock::now() - waitStart)
                             .count());
                     if (!frame) {
+                        retireCompletedReadbacks();
                         continue;
                     }
 
@@ -1171,42 +1246,32 @@ int main(int argc, char **argv) {
                         if (!state.freeRawSlots.empty()) {
                             rawSlotIndex = state.freeRawSlots.front();
                             state.freeRawSlots.pop_front();
-                        } else if (!state.readyRawSlots.empty()) {
-                            rawSlotIndex = state.readyRawSlots.front();
-                            state.readyRawSlots.pop_front();
-                            telemetry.acquisitionDropCount.fetch_add(1);
-                            telemetry.droppedStagingSlots.fetch_add(1);
                         } else {
                             telemetry.acquisitionDropCount.fetch_add(1);
                             telemetry.droppedStagingSlots.fetch_add(1);
-                            continue;
                         }
+                    }
+                    if (rawSlotIndex < 0) {
+                        continue;
                     }
 
                     auto &rawSlot = state.rawSlots[rawSlotIndex];
-                    capture.copy_client_frame_to_bgra(frame, rawSlot);
-                    rawSlot.captureTimestampNs = unix_time_ns();
                     rawSlot.captureFrameId = ++captureFrameId;
+                    rawSlot.captureTimestampNs = unix_time_ns();
+                    rawSlot.copyIssuedSteadyNs = steady_time_ns();
+                    capture.issue_copy_to_staging(frame, rawSlot);
                     telemetry.freshFramesAcquired.store(captureFrameId);
                     telemetry.sampleCaptureFrameId.store(captureFrameId);
                     telemetry.lastFrameArrivalWaitNs.store(frameArrivalWaitNs);
                     update_max_atomic(telemetry.maxFrameArrivalWaitNs,
                                       frameArrivalWaitNs);
-                    telemetry.lastGpuReadbackNs.store(rawSlot.gpuReadbackNs);
-                    update_max_atomic(telemetry.maxGpuReadbackNs,
-                                      rawSlot.gpuReadbackNs);
 
                     {
                         std::lock_guard<std::mutex> lock(state.mutex);
-                        state.readyRawSlots.push_back(rawSlotIndex);
-                        const int backlogDepth =
-                            static_cast<int>(state.readyRawSlots.size());
-                        telemetry.conversionBacklogDepth.store(backlogDepth);
-                        update_max_atomic(
-                            telemetry.maxConversionBacklogDepth,
-                            backlogDepth);
+                        state.pendingReadbackSlots.push_back(rawSlotIndex);
+                        updateQueueTelemetryLocked();
                     }
-                    state.rawReadyAvailable.notify_one();
+                    retireCompletedReadbacks();
                 }
             } catch (...) {
                 setWorkerError(std::current_exception());
@@ -1239,8 +1304,7 @@ int main(int argc, char **argv) {
                         }
                         rawSlotIndex = state.readyRawSlots.front();
                         state.readyRawSlots.pop_front();
-                        telemetry.conversionBacklogDepth.store(
-                            static_cast<int>(state.readyRawSlots.size()));
+                        updateQueueTelemetryLocked();
                     }
                     auto &rawSlot = state.rawSlots[rawSlotIndex];
                     const auto convertStart = std::chrono::steady_clock::now();

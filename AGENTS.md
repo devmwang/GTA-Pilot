@@ -21,7 +21,7 @@ present them as already implemented.
 
 ## 1. Ground Truth
 
-- Language: Python 3.13+ (`pyproject.toml` currently requires `~=3.13`).
+- Language: Python 3.13+ (`pyproject.toml` currently requires `>=3.13,<3.15`).
 - Package: `gtapilot`.
 - Atlas scaffolding exists under `gtapilot/atlas`.
 - PyTorch and torchvision are now project dependencies.
@@ -318,6 +318,11 @@ Behavior notes:
 - use `python -m gtapilot.blackbox.audit --metadata-path ...` to summarize
   cadence, repeat rate, transport gaps, writer lag, native overload stats, and
   native timing summaries
+- use `python gtapilot/blackbox/trim.py <clip_name> <trim_start_seconds> <trim_end_seconds>`
+  to trim an existing clip in place; it rewrites metadata first, trims the MKV
+  to the exact kept frame range, backs up the originals under
+  `blackbox-recordings/originals/`, and trims a sibling
+  `capture_<timestamp>_privileged/` package if present
 
 Do not silently change the manifest format. If it must evolve, bump
 `schema_version`.

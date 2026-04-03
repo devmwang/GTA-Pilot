@@ -74,7 +74,7 @@ What it does **not** do yet:
 Current practical assumptions:
 
 - Windows for the native GTA window capture path
-- Python `3.13`
+- Python `3.13` or `3.14` (`3.14` preferred)
 - `uv` for environment management
 - `ffmpeg` on `PATH` if `BLACKBOX_ENABLED = True`
 - GTA V running in borderless or windowed mode with a title containing
@@ -378,6 +378,19 @@ To audit a saved clip:
 ```bash
 uv run python -m gtapilot.blackbox.audit --metadata-path blackbox-recordings/capture_<timestamp>_metadata.json
 ```
+
+To trim a saved clip in place while keeping metadata and MKV frame-perfectly
+aligned:
+
+```bash
+python gtapilot/blackbox/trim.py capture_<timestamp> <trim_start_seconds> <trim_end_seconds>
+```
+
+The trim tool selects the kept frame window from the metadata timeline first,
+rewrites the MKV to that exact contiguous frame range, and moves the original
+clip into `blackbox-recordings/originals/` before replacing it. If a sibling
+`capture_<timestamp>_privileged/` package exists, it is sliced to the same kept
+frame window and rewritten against the trimmed source metadata.
 
 This is the current usable dataset path for Atlas Stage 1A and related
 inference-time training work.

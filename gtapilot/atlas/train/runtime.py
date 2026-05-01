@@ -91,7 +91,7 @@ def _resolve_metadata_source_paths(data_cfg: DataConfig) -> list[Path]:
             for line in lines
             if line.strip()
         ]
-    return sorted(root.glob("capture_*_metadata.json"))
+    return sorted(root.glob("capture_*/metadata.json"))
 
 
 def _missing_privileged_message(
@@ -102,9 +102,7 @@ def _missing_privileged_message(
     root = Path(data_cfg.recordings_root)
     metadata_paths = _resolve_metadata_source_paths(data_cfg)
     expected_dirs = [
-        metadata_path.with_name(
-            f"{metadata_path.stem.replace('_metadata', '')}_privileged"
-        )
+        metadata_path.parent / "privileged"
         for metadata_path in metadata_paths
     ]
     present = [
@@ -120,7 +118,7 @@ def _missing_privileged_message(
         )
     return (
         f"{stage} requires privileged clip packages, but {coverage}. "
-        "Build sibling capture_<timestamp>_privileged/ manifests first, for example with "
+        "Build sibling capture_<timestamp>/privileged manifests first, for example with "
         "`python -m gtapilot.atlas.data.build_stage1b_privileged_dataset ...`, "
         "or point the split at clips that already have privileged packages."
     )

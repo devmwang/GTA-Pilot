@@ -6,6 +6,7 @@ from .samplers import ClipGroupedBatchSampler
 from .schema import (
     AtlasTemporalClipIndex,
     BlackboxActionRecord,
+    BlackboxFrameActionRecord,
     BlackboxFrameRecord,
     ConvertedLaneSample,
     LaneSegment3D,
@@ -17,6 +18,7 @@ __all__ = [
     "AtlasPrivilegedClipDataset",
     "AtlasTemporalClipIndex",
     "BlackboxActionRecord",
+    "BlackboxFrameActionRecord",
     "BlackboxFrameRecord",
     "ConvertedLaneSample",
     "LaneSegment3D",

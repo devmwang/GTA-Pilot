@@ -67,8 +67,6 @@ class BlackboxFrameRecord:
     frame_id: int
     capture_frame_id: int
     is_repeat: bool
-    action_vector: np.ndarray
-    action_message_timestamp_ns: int | None = None
     subscriber_received_timestamp_ns: int | None = None
     writer_committed_timestamp_ns: int | None = None
     subscriber_queue_latency_ns: int | None = None
@@ -85,12 +83,6 @@ class BlackboxFrameRecord:
                 payload.get("capture_frame_id", payload.get("frame_id", -1))
             ),
             is_repeat=bool(payload.get("is_repeat", False)),
-            action_vector=np.asarray(payload["action_vector"], dtype=np.float32),
-            action_message_timestamp_ns=(
-                None
-                if payload.get("action_message_timestamp_ns") is None
-                else int(payload["action_message_timestamp_ns"])
-            ),
             subscriber_received_timestamp_ns=None
             if payload.get("subscriber_received_timestamp_ns") is None
             else int(payload["subscriber_received_timestamp_ns"]),
@@ -100,6 +92,33 @@ class BlackboxFrameRecord:
             subscriber_queue_latency_ns=None
             if payload.get("subscriber_queue_latency_ns") is None
             else int(payload["subscriber_queue_latency_ns"]),
+        )
+
+
+@dataclass
+class BlackboxFrameActionRecord:
+    video_frame_index: int
+    capture_timestamp_ns: int
+    frame_id: int
+    capture_frame_id: int
+    action_vector: np.ndarray
+    action_message_timestamp_ns: int | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "BlackboxFrameActionRecord":
+        return cls(
+            video_frame_index=int(payload["video_frame_index"]),
+            capture_timestamp_ns=int(payload["capture_timestamp_ns"]),
+            frame_id=int(payload.get("frame_id", -1)),
+            capture_frame_id=int(
+                payload.get("capture_frame_id", payload.get("frame_id", -1))
+            ),
+            action_vector=np.asarray(payload["action_vector"], dtype=np.float32),
+            action_message_timestamp_ns=(
+                None
+                if payload.get("action_message_timestamp_ns") is None
+                else int(payload["action_message_timestamp_ns"])
+            ),
         )
 
 
@@ -155,6 +174,7 @@ class BlackboxActionRecord:
 class AtlasTemporalClipIndex:
     clip_id: str
     metadata_path: str
+    actions_path: str
     video_path: str
     anchor_timestamp_ns: int
     action_source: str
@@ -170,6 +190,7 @@ class AtlasTemporalClipIndex:
         return cls(
             clip_id=str(payload["clip_id"]),
             metadata_path=str(payload["metadata_path"]),
+            actions_path=str(payload["actions_path"]),
             video_path=str(payload["video_path"]),
             anchor_timestamp_ns=int(payload["anchor_timestamp_ns"]),
             action_source=str(payload["action_source"]),
@@ -187,6 +208,10 @@ class AtlasTemporalClipIndex:
     @property
     def video_file(self) -> Path:
         return Path(self.video_path)
+
+    @property
+    def actions_file(self) -> Path:
+        return Path(self.actions_path)
 
     @property
     def privileged_path(self) -> Path | None:

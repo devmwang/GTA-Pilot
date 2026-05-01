@@ -14,8 +14,10 @@ from .schema import BlackboxFrameRecord
 
 def _load_source_frames(metadata_path: Path) -> tuple[dict, list[BlackboxFrameRecord]]:
     manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if int(manifest.get("schema_version", 0)) != 2:
+    if int(manifest.get("schema_version", 0)) != 3:
         raise RuntimeError(f"Unsupported blackbox manifest schema: {metadata_path}")
+    if str(manifest.get("kind")) != "video_metadata":
+        raise RuntimeError(f"Unsupported blackbox metadata kind: {metadata_path}")
     frames = [
         BlackboxFrameRecord.from_dict(frame_payload)
         for frame_payload in manifest.get("frames", [])
@@ -214,12 +216,15 @@ def main() -> None:
         ego_valid=aligned_ego_valid,
     )
 
-    clip_id = metadata_path.stem.replace("_metadata", "")
-    source_video_file = (
-        args.source_video_file
-        or (manifest.get("video_session") or {}).get("file_name")
-    )
-    output_dir = metadata_path.with_name(f"{clip_id}_privileged")
+    clip_id = str(manifest.get("clip_id", metadata_path.parent.name))
+    if args.source_video_file:
+        source_video_file = args.source_video_file
+    else:
+        video_file_name = str((manifest.get("video_session") or {}).get("file_name", ""))
+        if not video_file_name:
+            raise RuntimeError(f"Missing video_session.file_name in {metadata_path}")
+        source_video_file = str((metadata_path.parent / video_file_name).resolve())
+    output_dir = metadata_path.parent / "privileged"
     manifest_path = write_privileged_clip(
         output_dir=output_dir,
         clip_id=clip_id,

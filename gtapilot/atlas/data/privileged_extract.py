@@ -123,8 +123,8 @@ def main() -> None:
     ego_valid = None if args.ego_valid is None else np.load(args.ego_valid)
 
     metadata_path = Path(args.metadata_path)
-    clip_id = metadata_path.stem.replace("_metadata", "")
-    output_dir = metadata_path.with_name(f"{clip_id}_privileged")
+    clip_id = metadata_path.parent.name
+    output_dir = metadata_path.parent / "privileged"
 
     targets = build_stage1b_targets(
         cfg=cfg,

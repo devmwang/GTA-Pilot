@@ -256,17 +256,20 @@ The blackbox currently records inference-time data only.
 
 Outputs under `blackbox-recordings/`:
 
-- `capture_<timestamp>_video.mkv`
-- `capture_<timestamp>_metadata.json`
+- `capture_<timestamp>/`
+  - `video.mkv`
+  - `metadata.json`
+  - `actions.json`
+  - optional `privileged/`
+  - optional `backups/`
 
-Current manifest schema version: `2`
+Current blackbox manifest schema version: `3`
 
-The manifest records:
+`metadata.json` records:
 
 - session metadata
 - capture-session provenance
 - session video settings
-- input-session provenance
 - session integrity and drop-event summaries
 - session-integrity grace-window summaries plus ignored startup/shutdown drop events
 - transport stats for `vision.frames` and `input.actions`
@@ -279,8 +282,12 @@ The manifest records:
 - per-frame `subscriber_received_timestamp_ns`
 - per-frame `writer_committed_timestamp_ns`
 - per-frame `subscriber_queue_latency_ns`
-- frame-aligned action vector
-- frame-aligned action message timestamps
+
+`actions.json` records:
+
+- action-session metadata
+- input-session provenance
+- frame-aligned action vectors and message timestamps
 - raw action stream entries with compact saved payloads
 
 Behavior notes:
@@ -292,10 +299,10 @@ Behavior notes:
 - while idle, blackbox keeps a bounded in-memory pre-roll buffer only if
   `blackbox.preroll_seconds > 0`; otherwise it should stay inactive for
   vision-frame ingest and decoding
-- each start/stop cycle produces a separate `capture_<timestamp>_*` pair
+- each start/stop cycle produces a separate `capture_<timestamp>/` directory
 - frames are encoded into H.264 video in an MKV container via `ffmpeg`
 - active recording uses append-only temporary frame/action journals and writes the
-  final metadata JSON once at stop
+  final `metadata.json` plus `actions.json` once at stop
 - abrupt termination can still lose a small tail of in-memory state
 - the JSON manifest is the authoritative timestamp/alignment source, not the
   container timestamps
@@ -320,9 +327,8 @@ Behavior notes:
   native timing summaries
 - use `python gtapilot/blackbox/trim.py <clip_name> <trim_start_seconds> <trim_end_seconds>`
   to trim an existing clip in place; it rewrites metadata first, trims the MKV
-  to the exact kept frame range, backs up the originals under
-  `blackbox-recordings/originals/`, and trims a sibling
-  `capture_<timestamp>_privileged/` package if present
+  to the exact kept frame range, backs up the originals under that clip's
+  `backups/` directory, and trims a sibling `privileged/` package if present
 
 Do not silently change the manifest format. If it must evolve, bump
 `schema_version`.
@@ -385,11 +391,10 @@ Current Stage 1 data contract:
 - `mid_summary_hz = 6` is a sparse sampling grid over the same source timeline
 - for each desired model timestamp, the loader uses the latest source frame or raw
   action packet at or before that timestamp
-- `actions_hist` should use the raw blackbox `actions` stream; per-frame
-  `action_vector` remains a convenience aligned field inside the same schema-2
-  manifests
+- `actions_hist` should use the raw blackbox `actions.json` stream
+- frame-aligned action vectors now live in `actions.json`, not `metadata.json`
 - privileged Stage 1B / 1C targets should live in the sibling
-  `capture_<timestamp>_privileged/` directory and be indexed through
+  `capture_<timestamp>/privileged/` directory and be indexed through
   `AtlasTemporalClipIndex.privileged_dir`
 - build aligned privileged packages with
   `python -m gtapilot.atlas.data.build_stage1b_privileged_dataset ...`

@@ -19,14 +19,21 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gtapilot.blackbox.constants import (
+    ACTIONS_METADATA_FILE_NAME,
+    ACTIONS_METADATA_KIND,
     DEFAULT_OUTPUT_DIR,
     INTEGRITY_EDGE_GRACE_SECONDS,
+    SCHEMA_VERSION,
     VIDEO_CODEC,
     VIDEO_CONTAINER,
     VIDEO_CRF,
+    VIDEO_FILE_NAME,
+    VIDEO_METADATA_FILE_NAME,
+    VIDEO_METADATA_KIND,
     VIDEO_PIXEL_FORMAT,
     VIDEO_PRESET,
 )
+from gtapilot.blackbox.layout import resolve_clip_paths
 from gtapilot.blackbox.manifest_utils import (
     _active_devices_seen,
     _native_capture_timing_summary,
@@ -41,11 +48,14 @@ DEFAULT_ACTION_SOURCE = "manual_input"
 
 @dataclass(frozen=True)
 class ClipPaths:
-    clip_name: str
+    clip_id: str
     recordings_root: Path
+    clip_dir: Path
     metadata_path: Path
+    actions_path: Path
     video_path: Path
     privileged_dir: Path | None
+    backups_dir: Path
 
 
 @dataclass(frozen=True)
@@ -55,8 +65,6 @@ class TrimSelection:
     start_zero_based: int
     end_exclusive: int
     kept_frame_count: int
-    original_frame_count: int
-    original_action_count: int
 
 
 def _repo_root() -> Path:
@@ -87,38 +95,62 @@ def _write_json(path: Path, payload: dict[str, Any]) -> bytes:
     return text.encode("utf-8")
 
 
-def _resolve_clip_paths(clip_name: str) -> ClipPaths:
-    recordings_root = _recordings_root()
-    metadata_path = recordings_root / f"{clip_name}_metadata.json"
-    video_path = recordings_root / f"{clip_name}_video.mkv"
-    privileged_dir = recordings_root / f"{clip_name}_privileged"
+def _schema_version(payload: dict[str, Any]) -> int:
+    return int(payload.get("schema_version", 0))
 
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"Metadata not found: {metadata_path}")
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video not found: {video_path}")
-    if privileged_dir.exists():
-        if not privileged_dir.is_dir():
-            raise RuntimeError(f"Privileged sibling is not a directory: {privileged_dir}")
-        if not (privileged_dir / "manifest.json").exists():
-            raise RuntimeError(
-                f"Privileged sibling exists but manifest.json is missing: {privileged_dir}"
-            )
-        resolved_privileged_dir: Path | None = privileged_dir
-    else:
-        resolved_privileged_dir = None
 
+def _resolve_existing_clip(clip_name: str) -> ClipPaths:
+    resolved = resolve_clip_paths(_recordings_root(), clip_name)
+    if not resolved.clip_dir.exists() or not resolved.clip_dir.is_dir():
+        raise FileNotFoundError(f"Clip directory not found: {resolved.clip_dir}")
+    if not resolved.metadata_path.exists():
+        raise FileNotFoundError(f"Video metadata not found: {resolved.metadata_path}")
+    if not resolved.actions_path.exists():
+        raise FileNotFoundError(f"Actions metadata not found: {resolved.actions_path}")
+    if not resolved.video_path.exists():
+        raise FileNotFoundError(f"Video not found: {resolved.video_path}")
+    privileged_dir = resolved.privileged_dir if resolved.privileged_dir.exists() else None
+    if privileged_dir is not None and not (privileged_dir / "manifest.json").exists():
+        raise RuntimeError(
+            f"Privileged directory exists but manifest.json is missing: {privileged_dir}"
+        )
     return ClipPaths(
-        clip_name=clip_name,
-        recordings_root=recordings_root,
-        metadata_path=metadata_path.resolve(),
-        video_path=video_path.resolve(),
-        privileged_dir=None if resolved_privileged_dir is None else resolved_privileged_dir.resolve(),
+        clip_id=resolved.clip_id,
+        recordings_root=resolved.recordings_root,
+        clip_dir=resolved.clip_dir,
+        metadata_path=resolved.metadata_path,
+        actions_path=resolved.actions_path,
+        video_path=resolved.video_path,
+        privileged_dir=privileged_dir,
+        backups_dir=resolved.backups_dir,
     )
 
 
-def _schema_version(payload: dict[str, Any]) -> int:
-    return int(payload.get("schema_version", 0))
+def _require_video_manifest(paths: ClipPaths, manifest: dict[str, Any]) -> None:
+    if _schema_version(manifest) != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported video metadata schema: {paths.metadata_path}")
+    if str(manifest.get("kind")) != VIDEO_METADATA_KIND:
+        raise ValueError(f"Unsupported video metadata kind: {paths.metadata_path}")
+    if str(manifest.get("clip_id", "")) != paths.clip_id:
+        raise ValueError(f"Video metadata clip_id mismatch: {paths.metadata_path}")
+    video_session = dict(manifest.get("video_session", {}))
+    if str(video_session.get("file_name", "")) != VIDEO_FILE_NAME:
+        raise ValueError(
+            "Video metadata video_session.file_name does not match the canonical clip layout."
+        )
+    if str(manifest.get("actions_file", "")) != ACTIONS_METADATA_FILE_NAME:
+        raise ValueError("Video metadata actions_file does not match the canonical clip layout.")
+
+
+def _require_actions_manifest(paths: ClipPaths, manifest: dict[str, Any]) -> None:
+    if _schema_version(manifest) != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported actions metadata schema: {paths.actions_path}")
+    if str(manifest.get("kind")) != ACTIONS_METADATA_KIND:
+        raise ValueError(f"Unsupported actions metadata kind: {paths.actions_path}")
+    if str(manifest.get("clip_id", "")) != paths.clip_id:
+        raise ValueError(f"Actions metadata clip_id mismatch: {paths.actions_path}")
+    if str(manifest.get("metadata_file", "")) != VIDEO_METADATA_FILE_NAME:
+        raise ValueError("Actions metadata metadata_file does not match the canonical clip layout.")
 
 
 def _clip_selection(
@@ -127,15 +159,11 @@ def _clip_selection(
     trim_start_seconds: float,
     trim_end_seconds: float,
 ) -> tuple[list[dict[str, Any]], TrimSelection]:
-    if _schema_version(manifest) != 2:
-        raise ValueError("Unsupported blackbox manifest schema for trim.")
-
     if trim_start_seconds == 0.0 and trim_end_seconds == 0.0:
         raise ValueError("Zero-trim is not allowed. At least one trim value must be > 0.")
 
     session = dict(manifest.get("session", {}))
-    frames = list(manifest.get("frames", []))
-    actions = list(manifest.get("actions", []))
+    frames = [dict(frame) for frame in manifest.get("frames", [])]
     if not frames:
         raise ValueError("Clip has no frames to trim.")
 
@@ -169,25 +197,10 @@ def _clip_selection(
         start_zero_based=first_index - 1,
         end_exclusive=last_index,
         kept_frame_count=len(kept_frames),
-        original_frame_count=len(frames),
-        original_action_count=len(actions),
     )
 
 
-def _filter_actions(
-    actions: list[dict[str, Any]],
-    *,
-    keep_start_ns: int,
-    keep_end_ns: int,
-) -> list[dict[str, Any]]:
-    return [
-        dict(action)
-        for action in actions
-        if keep_start_ns <= int(action.get("message_timestamp_ns", 0) or 0) <= keep_end_ns
-    ]
-
-
-def _filter_timeline_records(
+def _filter_records_by_timestamp(
     records: list[dict[str, Any]],
     *,
     keep_start_ns: int,
@@ -202,10 +215,10 @@ def _filter_timeline_records(
     return kept
 
 
-def _renumber_video_frame_indices(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _renumber_video_frame_indices(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     renumbered: list[dict[str, Any]] = []
-    for index, frame in enumerate(frames, start=1):
-        updated = dict(frame)
+    for index, record in enumerate(records, start=1):
+        updated = dict(record)
         updated["video_frame_index"] = int(index)
         renumbered.append(updated)
     return renumbered
@@ -264,11 +277,7 @@ def _overflow_metrics(
     return int(overflow_count), int(dropped_messages), int(max_buffer_occupancy)
 
 
-def _source_name_from_stats(
-    transport_stats: dict[str, Any],
-    *,
-    fallback: str,
-) -> str:
+def _source_name_from_stats(transport_stats: dict[str, Any], *, fallback: str) -> str:
     last_sequence_by_source = dict(transport_stats.get("last_sequence_by_source", {}))
     if last_sequence_by_source:
         return str(next(iter(last_sequence_by_source.keys())))
@@ -276,22 +285,21 @@ def _source_name_from_stats(
 
 
 def _recomputed_transport_stats(
-    manifest: dict[str, Any],
+    video_manifest: dict[str, Any],
     *,
     frames: list[dict[str, Any]],
     actions: list[dict[str, Any]],
     raw_drop_events: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    source_transport = dict(manifest.get("transport_stats", {}))
+    source_transport = dict(video_manifest.get("transport_stats", {}))
     vision_source = _source_name_from_stats(
         dict(source_transport.get("vision", {})),
-        fallback=str((manifest.get("capture_session") or {}).get("capture_source", "unknown")),
+        fallback=str((video_manifest.get("capture_session") or {}).get("capture_source", "unknown")),
     )
     action_source = _source_name_from_stats(
         dict(source_transport.get("actions", {})),
         fallback=DEFAULT_ACTION_SOURCE,
     )
-
     frame_sequence_ids = [int(frame.get("sequence_id", 0)) for frame in frames]
     action_sequence_ids = [int(action.get("sequence_id", 0)) for action in actions]
     vision_gap_count, vision_missing = _sequence_gap_summary(frame_sequence_ids)
@@ -304,7 +312,6 @@ def _recomputed_transport_stats(
         raw_drop_events,
         channel="input.actions",
     )
-
     return {
         "vision": {
             "channel": "vision.frames",
@@ -315,9 +322,7 @@ def _recomputed_transport_stats(
             "local_overflow_dropped_messages": int(vision_overflow_dropped),
             "max_buffer_occupancy": int(vision_max_buffer),
             "last_sequence_by_source": (
-                {}
-                if not frame_sequence_ids
-                else {vision_source: int(frame_sequence_ids[-1])}
+                {} if not frame_sequence_ids else {vision_source: int(frame_sequence_ids[-1])}
             ),
         },
         "actions": {
@@ -329,9 +334,7 @@ def _recomputed_transport_stats(
             "local_overflow_dropped_messages": int(action_overflow_dropped),
             "max_buffer_occupancy": int(action_max_buffer),
             "last_sequence_by_source": (
-                {}
-                if not action_sequence_ids
-                else {action_source: int(action_sequence_ids[-1])}
+                {} if not action_sequence_ids else {action_source: int(action_sequence_ids[-1])}
             ),
         },
     }
@@ -353,15 +356,15 @@ def _recomputed_writer_stats(
 
 
 def _filter_raw_drop_events(
-    manifest: dict[str, Any],
+    video_manifest: dict[str, Any],
     *,
     keep_start_ns: int,
     keep_end_ns: int,
 ) -> list[dict[str, Any]]:
-    combined = list(manifest.get("drop_events", [])) + list(
-        manifest.get("ignored_drop_events", [])
+    combined = list(video_manifest.get("drop_events", [])) + list(
+        video_manifest.get("ignored_drop_events", [])
     )
-    return _filter_timeline_records(
+    return _filter_records_by_timestamp(
         [dict(event) for event in combined],
         keep_start_ns=keep_start_ns,
         keep_end_ns=keep_end_ns,
@@ -369,8 +372,8 @@ def _filter_raw_drop_events(
     )
 
 
-def _trimmed_manifest(
-    manifest: dict[str, Any],
+def _trimmed_video_metadata(
+    video_manifest: dict[str, Any],
     *,
     kept_frames: list[dict[str, Any]],
     kept_actions: list[dict[str, Any]],
@@ -379,13 +382,9 @@ def _trimmed_manifest(
     kept_session_events: list[dict[str, Any]],
     finalized_timestamp_ns: int,
 ) -> dict[str, Any]:
-    source_session = dict(manifest.get("session", {}))
-    source_capture_session = dict(manifest.get("capture_session", {}))
-    source_video_session = dict(manifest.get("video_session", {}))
-    source_input_session = dict(manifest.get("input_session", {}))
-    source_writer_stats = dict(manifest.get("writer_stats", {}))
-    source_integrity = dict(manifest.get("session_integrity", {}))
-
+    source_session = dict(video_manifest.get("session", {}))
+    source_writer_stats = dict(video_manifest.get("writer_stats", {}))
+    source_integrity = dict(video_manifest.get("session_integrity", {}))
     session_start_timestamp_ns, session_end_timestamp_ns = _session_data_window_ns(
         frame_payloads=kept_frames,
         action_payloads=kept_actions,
@@ -401,23 +400,19 @@ def _trimmed_manifest(
         session_end_timestamp_ns=session_end_timestamp_ns,
         grace_window_ns=edge_grace_window_ns,
     )
-
     session = dict(source_session)
     session["finalized_timestamp_ns"] = int(finalized_timestamp_ns)
     session["timeline_start_timestamp_ns"] = int(session_start_timestamp_ns)
     session["timeline_end_timestamp_ns"] = int(session_end_timestamp_ns)
     session["frame_count"] = int(len(kept_frames))
-    session["action_count"] = int(len(kept_actions))
-
-    input_session = dict(source_input_session)
-    input_session["active_devices_seen"] = _active_devices_seen(kept_actions)
-
     return {
-        "schema_version": 2,
+        "schema_version": SCHEMA_VERSION,
+        "kind": VIDEO_METADATA_KIND,
+        "clip_id": str(video_manifest["clip_id"]),
+        "actions_file": ACTIONS_METADATA_FILE_NAME,
         "session": session,
-        "capture_session": dict(source_capture_session),
-        "video_session": dict(source_video_session),
-        "input_session": input_session,
+        "capture_session": dict(video_manifest.get("capture_session", {})),
+        "video_session": dict(video_manifest.get("video_session", {})),
         "session_integrity": _session_integrity_payload(
             frame_payloads=kept_frames,
             drop_events=drop_events,
@@ -425,7 +420,7 @@ def _trimmed_manifest(
             edge_grace_window_seconds=edge_grace_window_seconds,
         ),
         "transport_stats": _recomputed_transport_stats(
-            manifest,
+            video_manifest,
             frames=kept_frames,
             actions=kept_actions,
             raw_drop_events=raw_drop_events,
@@ -441,19 +436,37 @@ def _trimmed_manifest(
         "ignored_drop_events": ignored_drop_events,
         "session_events": kept_session_events,
         "frames": kept_frames,
-        "actions": kept_actions,
     }
 
 
-def _ensure_video_manifest_match(paths: ClipPaths, manifest: dict[str, Any]) -> None:
-    video_session = dict(manifest.get("video_session", {}))
-    manifest_video_name = str(video_session.get("file_name", "") or "")
-    if not manifest_video_name:
-        raise RuntimeError("Manifest is missing video_session.file_name.")
-    if manifest_video_name != paths.video_path.name:
-        raise RuntimeError(
-            "Manifest video_session.file_name does not match the canonical clip video path."
-        )
+def _trimmed_actions_metadata(
+    actions_manifest: dict[str, Any],
+    *,
+    kept_actions: list[dict[str, Any]],
+    kept_frame_actions: list[dict[str, Any]],
+    session_start_timestamp_ns: int,
+    session_end_timestamp_ns: int,
+    finalized_timestamp_ns: int,
+) -> dict[str, Any]:
+    source_session = dict(actions_manifest.get("session", {}))
+    input_session = dict(actions_manifest.get("input_session", {}))
+    input_session["active_devices_seen"] = _active_devices_seen(kept_actions)
+    session = dict(source_session)
+    session["finalized_timestamp_ns"] = int(finalized_timestamp_ns)
+    session["timeline_start_timestamp_ns"] = int(session_start_timestamp_ns)
+    session["timeline_end_timestamp_ns"] = int(session_end_timestamp_ns)
+    session["action_count"] = int(len(kept_actions))
+    session["frame_action_count"] = int(len(kept_frame_actions))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": ACTIONS_METADATA_KIND,
+        "clip_id": str(actions_manifest["clip_id"]),
+        "metadata_file": VIDEO_METADATA_FILE_NAME,
+        "session": session,
+        "input_session": input_session,
+        "frame_actions": kept_frame_actions,
+        "actions": kept_actions,
+    }
 
 
 def _ffmpeg_binary(name: str) -> str:
@@ -557,11 +570,8 @@ def _trim_privileged_package(
     if int(manifest.get("schema_version", 0)) != 2:
         raise ValueError(f"Unsupported privileged manifest schema: {manifest_path}")
     frame_count = int(manifest.get("frame_count", 0))
-    if frame_count <= 0:
-        raise ValueError(f"Invalid privileged frame_count in {manifest_path}")
     if frame_count < end_exclusive:
         raise ValueError("Privileged frame_count is smaller than the kept source frame window.")
-
     if manifest.get("source_metadata_file") is not None:
         if Path(str(manifest["source_metadata_file"])).resolve() != source_metadata_path.resolve():
             raise ValueError("Privileged manifest source_metadata_file does not match the clip metadata.")
@@ -575,7 +585,6 @@ def _trim_privileged_package(
     output_dir.mkdir(parents=True, exist_ok=True)
     frame_slice = slice(int(start_zero_based), int(end_exclusive))
     kept_files: dict[str, str] = {}
-
     manifest_files = dict(manifest.get("files", {}))
     for key, rel_path in manifest_files.items():
         source_path = privileged_dir / rel_path
@@ -664,13 +673,12 @@ def _replace_with_backup(
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source_path), str(backup_path))
             backed_up.append((source_path, backup_path))
-
         for source_path, target_path in replacements:
             _safe_remove_path(target_path)
             shutil.move(str(source_path), str(target_path))
             moved_in.append((source_path, target_path))
     except Exception:
-        for _source_path, target_path in reversed(moved_in):
+        for _, target_path in reversed(moved_in):
             if target_path.exists():
                 _safe_remove_path(target_path)
         for original_path, backup_path in reversed(backed_up):
@@ -679,10 +687,9 @@ def _replace_with_backup(
         raise
 
 
-def _backup_dir(recordings_root: Path, clip_name: str) -> Path:
-    originals_root = recordings_root / "originals"
+def _backup_dir(backups_root: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    backup_dir = originals_root / f"{clip_name}_{timestamp}"
+    backup_dir = backups_root / timestamp
     backup_dir.mkdir(parents=True, exist_ok=False)
     return backup_dir
 
@@ -690,53 +697,76 @@ def _backup_dir(recordings_root: Path, clip_name: str) -> Path:
 def _build_trimmed_assets(
     *,
     paths: ClipPaths,
-    manifest: dict[str, Any],
+    video_manifest: dict[str, Any],
+    actions_manifest: dict[str, Any],
     selection: TrimSelection,
     kept_frames: list[dict[str, Any]],
-) -> tuple[Path, Path, Path | None]:
-    temp_root = Path(
-        tempfile.mkdtemp(prefix=f"{paths.clip_name}_trim_", dir=str(paths.recordings_root))
-    )
-    trimmed_metadata_path = temp_root / paths.metadata_path.name
-    trimmed_video_path = temp_root / paths.video_path.name
-    trimmed_privileged_dir = (
-        None if paths.privileged_dir is None else temp_root / paths.privileged_dir.name
-    )
+) -> tuple[Path, Path, Path, Path | None]:
+    temp_root = Path(tempfile.mkdtemp(prefix=f"{paths.clip_id}_trim_", dir=str(paths.recordings_root)))
+    temp_clip_dir = temp_root / paths.clip_id
+    temp_clip_dir.mkdir(parents=True, exist_ok=True)
+    trimmed_metadata_path = temp_clip_dir / VIDEO_METADATA_FILE_NAME
+    trimmed_actions_path = temp_clip_dir / ACTIONS_METADATA_FILE_NAME
+    trimmed_video_path = temp_clip_dir / VIDEO_FILE_NAME
+    trimmed_privileged_dir = None if paths.privileged_dir is None else temp_clip_dir / paths.privileged_dir.name
 
-    kept_actions = _filter_actions(
-        list(manifest.get("actions", [])),
+    kept_actions = _filter_records_by_timestamp(
+        list(actions_manifest.get("actions", [])),
         keep_start_ns=selection.keep_start_ns,
         keep_end_ns=selection.keep_end_ns,
+        timestamp_key="message_timestamp_ns",
     )
-    kept_pipeline_samples = _filter_timeline_records(
-        list(manifest.get("native_pipeline_samples", [])),
+    kept_frame_actions = _renumber_video_frame_indices(
+        _filter_records_by_timestamp(
+            list(actions_manifest.get("frame_actions", [])),
+            keep_start_ns=selection.keep_start_ns,
+            keep_end_ns=selection.keep_end_ns,
+            timestamp_key="capture_timestamp_ns",
+        )
+    )
+    renumbered_frames = _renumber_video_frame_indices(kept_frames)
+    if len(kept_frame_actions) != len(renumbered_frames):
+        raise RuntimeError("Trimmed frame_actions do not align one-to-one with trimmed frames.")
+
+    kept_pipeline_samples = _filter_records_by_timestamp(
+        list(video_manifest.get("native_pipeline_samples", [])),
         keep_start_ns=selection.keep_start_ns,
         keep_end_ns=selection.keep_end_ns,
         timestamp_key="capture_timestamp_ns",
     )
     raw_drop_events = _filter_raw_drop_events(
-        manifest,
+        video_manifest,
         keep_start_ns=selection.keep_start_ns,
         keep_end_ns=selection.keep_end_ns,
     )
-    kept_session_events = _filter_timeline_records(
-        list(manifest.get("session_events", [])),
+    kept_session_events = _filter_records_by_timestamp(
+        list(video_manifest.get("session_events", [])),
         keep_start_ns=selection.keep_start_ns,
         keep_end_ns=selection.keep_end_ns,
         timestamp_key="timestamp_ns",
     )
-
-    renumbered_frames = _renumber_video_frame_indices(kept_frames)
-    trimmed_manifest = _trimmed_manifest(
-        manifest,
+    finalized_timestamp_ns = time.time_ns()
+    trimmed_video_manifest = _trimmed_video_metadata(
+        video_manifest,
         kept_frames=renumbered_frames,
         kept_actions=kept_actions,
         kept_pipeline_samples=kept_pipeline_samples,
         raw_drop_events=raw_drop_events,
         kept_session_events=kept_session_events,
-        finalized_timestamp_ns=time.time_ns(),
+        finalized_timestamp_ns=finalized_timestamp_ns,
     )
-    metadata_bytes = _write_json(trimmed_metadata_path, trimmed_manifest)
+    session = dict(trimmed_video_manifest.get("session", {}))
+    trimmed_actions_manifest = _trimmed_actions_metadata(
+        actions_manifest,
+        kept_actions=kept_actions,
+        kept_frame_actions=kept_frame_actions,
+        session_start_timestamp_ns=int(session.get("timeline_start_timestamp_ns", 0) or 0),
+        session_end_timestamp_ns=int(session.get("timeline_end_timestamp_ns", 0) or 0),
+        finalized_timestamp_ns=finalized_timestamp_ns,
+    )
+
+    metadata_bytes = _write_json(trimmed_metadata_path, trimmed_video_manifest)
+    _write_json(trimmed_actions_path, trimmed_actions_manifest)
     trimmed_metadata_sha1 = _metadata_sha1(metadata_bytes)
 
     _trim_video(
@@ -766,66 +796,77 @@ def _build_trimmed_assets(
             expected_frame_count=selection.kept_frame_count,
         )
 
-    return temp_root, trimmed_metadata_path, trimmed_privileged_dir
+    return temp_root, trimmed_metadata_path, trimmed_actions_path, trimmed_privileged_dir
 
 
 def _validate_trimmed_assets(
     *,
     trimmed_metadata_path: Path,
+    trimmed_actions_path: Path,
     expected_frame_count: int,
 ) -> None:
-    manifest = _load_json(trimmed_metadata_path)
-    if _schema_version(manifest) != 2:
-        raise RuntimeError("Trimmed metadata did not preserve schema version 2.")
-    session = dict(manifest.get("session", {}))
-    frames = list(manifest.get("frames", []))
-    if int(session.get("frame_count", -1)) != int(expected_frame_count):
-        raise RuntimeError("Trimmed session.frame_count is inconsistent.")
+    video_manifest = _load_json(trimmed_metadata_path)
+    actions_manifest = _load_json(trimmed_actions_path)
+    if _schema_version(video_manifest) != SCHEMA_VERSION or str(video_manifest.get("kind")) != VIDEO_METADATA_KIND:
+        raise RuntimeError("Trimmed video metadata did not preserve the expected schema.")
+    if _schema_version(actions_manifest) != SCHEMA_VERSION or str(actions_manifest.get("kind")) != ACTIONS_METADATA_KIND:
+        raise RuntimeError("Trimmed actions metadata did not preserve the expected schema.")
+    frames = list(video_manifest.get("frames", []))
+    frame_actions = list(actions_manifest.get("frame_actions", []))
+    if int((video_manifest.get("session") or {}).get("frame_count", -1)) != expected_frame_count:
+        raise RuntimeError("Trimmed video session.frame_count is inconsistent.")
     if len(frames) != expected_frame_count:
-        raise RuntimeError("Trimmed metadata frame array is inconsistent.")
+        raise RuntimeError("Trimmed video metadata frames array is inconsistent.")
+    if len(frame_actions) != expected_frame_count:
+        raise RuntimeError("Trimmed actions metadata frame_actions array is inconsistent.")
     for expected_index, frame in enumerate(frames, start=1):
         if int(frame.get("video_frame_index", -1)) != expected_index:
-            raise RuntimeError("Trimmed metadata video_frame_index values are not contiguous from 1.")
+            raise RuntimeError("Trimmed video metadata frame indices are not contiguous from 1.")
+    for expected_index, frame_action in enumerate(frame_actions, start=1):
+        if int(frame_action.get("video_frame_index", -1)) != expected_index:
+            raise RuntimeError("Trimmed actions metadata frame indices are not contiguous from 1.")
 
 
 def _execute_trim(clip_name: str, trim_start_seconds: float, trim_end_seconds: float) -> None:
-    paths = _resolve_clip_paths(clip_name)
-    manifest = _load_json(paths.metadata_path)
-    if _schema_version(manifest) != 2:
-        raise ValueError(f"Unsupported blackbox manifest schema: {paths.metadata_path}")
-    _ensure_video_manifest_match(paths, manifest)
+    paths = _resolve_existing_clip(clip_name)
+    video_manifest = _load_json(paths.metadata_path)
+    actions_manifest = _load_json(paths.actions_path)
+    _require_video_manifest(paths, video_manifest)
+    _require_actions_manifest(paths, actions_manifest)
     kept_frames, selection = _clip_selection(
-        manifest,
+        video_manifest,
         trim_start_seconds=trim_start_seconds,
         trim_end_seconds=trim_end_seconds,
     )
 
     temp_root: Path | None = None
     try:
-        temp_root, trimmed_metadata_path, trimmed_privileged_dir = _build_trimmed_assets(
+        temp_root, trimmed_metadata_path, trimmed_actions_path, trimmed_privileged_dir = _build_trimmed_assets(
             paths=paths,
-            manifest=manifest,
+            video_manifest=video_manifest,
+            actions_manifest=actions_manifest,
             selection=selection,
             kept_frames=kept_frames,
         )
         _validate_trimmed_assets(
             trimmed_metadata_path=trimmed_metadata_path,
+            trimmed_actions_path=trimmed_actions_path,
             expected_frame_count=selection.kept_frame_count,
         )
-
-        backup_dir = _backup_dir(paths.recordings_root, paths.clip_name)
+        backup_dir = _backup_dir(paths.backups_dir)
         originals = [
             (paths.metadata_path, backup_dir / paths.metadata_path.name),
+            (paths.actions_path, backup_dir / paths.actions_path.name),
             (paths.video_path, backup_dir / paths.video_path.name),
         ]
         replacements = [
             (trimmed_metadata_path, paths.metadata_path),
-            (temp_root / paths.video_path.name, paths.video_path),
+            (trimmed_actions_path, paths.actions_path),
+            (temp_root / paths.clip_id / paths.video_path.name, paths.video_path),
         ]
         if paths.privileged_dir is not None and trimmed_privileged_dir is not None:
             originals.append((paths.privileged_dir, backup_dir / paths.privileged_dir.name))
             replacements.append((trimmed_privileged_dir, paths.privileged_dir))
-
         _replace_with_backup(originals=originals, replacements=replacements)
     finally:
         if temp_root is not None and temp_root.exists():
@@ -838,7 +879,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "clip_name",
-        help="Bare clip stem such as capture_20260401_184018_638080",
+        help="Clip directory name such as capture_20260401_184018_638080",
     )
     parser.add_argument("trim_start", help="Seconds to trim from the start")
     parser.add_argument("trim_end", help="Seconds to trim from the end")

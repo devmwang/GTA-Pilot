@@ -333,8 +333,12 @@ blackbox-recordings/
 
 Each session currently produces:
 
-- `capture_<timestamp>_video.mkv`
-- `capture_<timestamp>_metadata.json`
+- `capture_<timestamp>/`
+  - `video.mkv`
+  - `metadata.json`
+  - `actions.json`
+  - optional `privileged/`
+  - optional `backups/`
 
 Each start/stop cycle produces a separate recording pair. If you toggle
 recording on twice in one runtime, you will get two clips.
@@ -343,17 +347,16 @@ Blackbox now requires `ffmpeg` on `PATH` when recording is enabled. Frames are
 streamed into ffmpeg as raw `rgb24` and encoded as H.264 in an MKV container.
 Current runtime producers publish 60 Hz vision streams, so new live and video
 override blackbox clips are authored with `video_session.nominal_fps = 60.0`.
-The JSON manifest is still the authoritative source for frame timing and action
-alignment. The current manifest schema version is `2`. Recording now uses
-append-only temporary frame/action journals during capture and synthesizes the
-final `capture_<timestamp>_metadata.json` once when the session stops.
+The JSON manifests are still the authoritative source for frame timing and
+action alignment. The current manifest schema version is `3`. Recording now
+uses append-only temporary frame/action journals during capture and synthesizes
+the final `metadata.json` plus `actions.json` once when the session stops.
 
-Schema `2` manifests contain:
+`metadata.json` contains:
 
-- session-level metadata
+- session-level video/frame metadata
 - capture-session provenance
 - session video settings
-- input-session provenance
 - session integrity status plus structured drop/overflow events
 - transport stats for `vision.frames` and `input.actions`
 - writer queue / writer-lag stats
@@ -365,6 +368,11 @@ Schema `2` manifests contain:
 - per-frame `subscriber_received_timestamp_ns`
 - per-frame `writer_committed_timestamp_ns`
 - per-frame `subscriber_queue_latency_ns`
+
+`actions.json` contains:
+
+- action-session metadata
+- input-session provenance
 - frame-aligned action vectors
 - frame-aligned action message timestamps
 - the raw action stream seen during capture
@@ -376,7 +384,7 @@ silently hiding the issue.
 To audit a saved clip:
 
 ```bash
-uv run python -m gtapilot.blackbox.audit --metadata-path blackbox-recordings/capture_<timestamp>_metadata.json
+uv run python -m gtapilot.blackbox.audit --metadata-path blackbox-recordings/capture_<timestamp>/metadata.json
 ```
 
 To trim a saved clip in place while keeping metadata and MKV frame-perfectly
@@ -388,9 +396,10 @@ python gtapilot/blackbox/trim.py capture_<timestamp> <trim_start_seconds> <trim_
 
 The trim tool selects the kept frame window from the metadata timeline first,
 rewrites the MKV to that exact contiguous frame range, and moves the original
-clip into `blackbox-recordings/originals/` before replacing it. If a sibling
-`capture_<timestamp>_privileged/` package exists, it is sliced to the same kept
-frame window and rewritten against the trimmed source metadata.
+clip assets into `blackbox-recordings/capture_<timestamp>/backups/<timestamp>/`
+before replacing them. If a sibling `privileged/` package exists, it is sliced
+to the same kept frame window and rewritten against the trimmed source
+metadata.
 
 This is the current usable dataset path for Atlas Stage 1A and related
 inference-time training work.
@@ -444,23 +453,23 @@ Where:
 - `rgb_mid` is the sparse long-horizon summary input
 - `actions_hist` and `dt_hist` carry the long action/ego prior
 
-Blackbox `*_video.mkv + *_metadata.json` recordings are the canonical student
-training source. Runtime blackbox collection stays at `60 Hz` for both video
-and action packets, and the Stage 1 clip loader resamples those recordings onto
-the model-time grids:
+Blackbox `capture_<timestamp>/video.mkv` plus `metadata.json` and `actions.json`
+are the canonical student training source. Runtime blackbox collection stays at
+`60 Hz` for both video and action packets, and the Stage 1 clip loader
+resamples those recordings onto the model-time grids:
 
 - student recent / older / action history at `24 Hz`
 - teacher recent / older / action history at `36 Hz`
 - mid-summary sampling at `6 Hz`
 
 Frame selection uses the latest source frame at or before each desired model
-timestamp, and action history is built from the raw blackbox `actions` stream.
-The per-frame `action_vector` remains in the same schema-2 manifest as a
-convenience aligned field while still preserving exact `dt`.
+timestamp, and action history is built from the raw blackbox `actions.json`
+stream. Frame-aligned action vectors are retained in `actions.json` as a
+convenience aligned view while still preserving exact `dt`.
 
 Privileged Stage 1B / Stage 1C targets are a separate sibling package:
 
-- `capture_<timestamp>_privileged/`
+- `capture_<timestamp>/privileged/`
 - built with `python -m gtapilot.atlas.data.build_stage1b_privileged_dataset ...`
 - indexed through `AtlasTemporalClipIndex.privileged_dir`
 
@@ -520,13 +529,12 @@ for Atlas. It is enabled by setting `BLACKBOX_ENABLED = True` in
 
 Current blackbox outputs:
 
-- an MKV video clip encoded via ffmpeg
-- a JSON manifest containing:
-  - session, capture-session, video-session, and input-session summaries
-  - integrity, transport, writer, and native-capture timing summaries
-  - sparse native telemetry samples and sparse session events
-  - per-frame timeline rows with aligned `action_vector`
-  - the raw action stream seen during capture
+- a clip directory containing:
+  - `video.mkv`
+  - `metadata.json`
+  - `actions.json`
+  - optional `privileged/`
+  - optional `backups/`
 
 This gives us a usable interim dataset for Atlas training and replay using only
 the sources available at inference time. Privileged sensor capture is a later

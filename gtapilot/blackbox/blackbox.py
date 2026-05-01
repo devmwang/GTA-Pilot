@@ -7,7 +7,6 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -39,19 +38,24 @@ from gtapilot.ipc.types import (
     ChannelTransportStats,
 )
 from gtapilot.blackbox.constants import (
+    ACTIONS_METADATA_FILE_NAME,
+    ACTIONS_METADATA_KIND,
     DEFAULT_OUTPUT_DIR,
     INTEGRITY_EDGE_GRACE_NS,
     INTEGRITY_EDGE_GRACE_SECONDS,
     INPUT_MAPPING_VERSION,
     INPUT_NOMINAL_HZ,
     SCHEMA_VERSION,
+    VIDEO_FILE_NAME,
     VIDEO_CODEC,
     VIDEO_CONTAINER,
     VIDEO_CRF,
-    VIDEO_FILE_SUFFIX,
+    VIDEO_METADATA_FILE_NAME,
+    VIDEO_METADATA_KIND,
     VIDEO_PIXEL_FORMAT,
     VIDEO_PRESET,
 )
+from gtapilot.blackbox.layout import BlackboxClipPaths, build_session_paths
 from gtapilot.blackbox.manifest_utils import (
     _active_devices_seen,
     _native_capture_timing_summary,
@@ -80,15 +84,6 @@ INGEST_MODE_INACTIVE = "inactive"
 INGEST_MODE_ACTIVE = "active"
 
 T = TypeVar("T")
-
-
-@dataclass(slots=True)
-class BlackboxSessionPaths:
-    video_path: Path
-    metadata_path: Path
-    frames_journal_path: Path
-    actions_journal_path: Path
-    session_timestamp: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -127,18 +122,6 @@ class RawSocketMessage:
     envelope: ChannelEnvelope
     payload_bytes: bytes
     subscriber_received_timestamp_ns: int
-
-
-def _build_session_paths(output_dir: Path) -> BlackboxSessionPaths:
-    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output_prefix = f"capture_{session_timestamp}"
-    return BlackboxSessionPaths(
-        video_path=output_dir / f"{output_prefix}_video{VIDEO_FILE_SUFFIX}",
-        metadata_path=output_dir / f"{output_prefix}_metadata.json",
-        frames_journal_path=output_dir / f"{output_prefix}_frames.tmp.jsonl",
-        actions_journal_path=output_dir / f"{output_prefix}_actions.tmp.jsonl",
-        session_timestamp=session_timestamp,
-    )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -272,17 +255,6 @@ def _action_payload_dict(payload: Any) -> dict[str, Any]:
     }
 
 
-def _action_vector_from_payload(payload: dict[str, Any]) -> list[float]:
-    return [
-        float(payload.get("steer", 0.0)),
-        float(payload.get("throttle", 0.0)),
-        float(payload.get("brake", 0.0)),
-        float(payload.get("handbrake", 0.0)),
-        float(payload.get("reverse", 0.0)),
-        float(payload.get("pilot_active", 0.0)),
-    ]
-
-
 def _optional_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -326,7 +298,7 @@ def _action_stream_entry(action_message: ChannelMessage) -> dict[str, Any]:
     }
 
 
-def _frame_entry_from_task(
+def _frame_journal_entry_from_task(
     *,
     task: FrameWriteTask,
     video_frame_index: int,
@@ -360,6 +332,30 @@ def _frame_entry_from_task(
     if isinstance(pipeline_stats, dict):
         frame_entry["pipeline_stats"] = dict(pipeline_stats)
     return frame_entry
+
+
+def _frame_action_entry(frame_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "video_frame_index": int(frame_payload["video_frame_index"]),
+        "frame_id": int(frame_payload.get("frame_id", -1)),
+        "capture_frame_id": int(
+            frame_payload.get("capture_frame_id", frame_payload.get("frame_id", -1))
+        ),
+        "capture_timestamp_ns": int(frame_payload.get("capture_timestamp_ns", 0)),
+        "action_vector": list(frame_payload.get("action_vector", [0.0] * 6)),
+        "action_message_timestamp_ns": (
+            None
+            if frame_payload.get("action_message_timestamp_ns") is None
+            else int(frame_payload["action_message_timestamp_ns"])
+        ),
+    }
+
+
+def _video_frame_entry(frame_payload: dict[str, Any]) -> dict[str, Any]:
+    trimmed_payload = dict(frame_payload)
+    trimmed_payload.pop("action_vector", None)
+    trimmed_payload.pop("action_message_timestamp_ns", None)
+    return trimmed_payload
 
 
 def _capture_session_payload(
@@ -602,9 +598,10 @@ class FFmpegVideoWriter:
 
 
 class BlackboxSessionWriter:
-    def __init__(self, *, paths: BlackboxSessionPaths, config: VideoSessionConfig):
+    def __init__(self, *, paths: BlackboxClipPaths, config: VideoSessionConfig):
         self.paths = paths
         self.config = config
+        self.paths.clip_dir.mkdir(parents=True, exist_ok=False)
         self._video_writer = FFmpegVideoWriter(output_path=paths.video_path, config=config)
         self._frames_journal = paths.frames_journal_path.open("w", encoding="utf-8")
         self._actions_journal = paths.actions_journal_path.open("w", encoding="utf-8")
@@ -739,7 +736,7 @@ class BlackboxSessionWriter:
         self._video_writer.write_frame(task.frame_rgb)
         writer_committed_timestamp_ns = time.time_ns()
         self._frames_written += 1
-        frame_entry = _frame_entry_from_task(
+        frame_entry = _frame_journal_entry_from_task(
             task=task,
             video_frame_index=self._frames_written,
             writer_committed_timestamp_ns=writer_committed_timestamp_ns,
@@ -922,7 +919,7 @@ class BlackboxRecorder:
             collections.deque()
         )
 
-        self.paths: BlackboxSessionPaths | None = None
+        self.paths: BlackboxClipPaths | None = None
         self.session_config: VideoSessionConfig | None = None
         self.session_writer: BlackboxSessionWriter | None = None
         self._written_action_keys: set[tuple[str, int]] = set()
@@ -1280,7 +1277,7 @@ class BlackboxRecorder:
         if self._session_active():
             return
 
-        self.paths = _build_session_paths(self.output_dir)
+        self.paths = build_session_paths(self.output_dir)
         self.session_config = session_config
         self.session_writer = BlackboxSessionWriter(
             paths=self.paths,
@@ -1318,19 +1315,25 @@ class BlackboxRecorder:
         self.preroll_actions.clear()
         self._append_matching_preroll_frames()
 
-    def _final_manifest_payload(
+    def _final_session_payloads(
         self,
         *,
         frame_payloads: list[dict[str, Any]],
         action_payloads: list[dict[str, Any]],
         writer_stats: dict[str, Any],
         writer_drop_events: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         if self.paths is None or self.session_config is None:
             raise RuntimeError("Blackbox session paths/config are not available.")
 
-        normalized_frame_payloads = [dict(frame_payload) for frame_payload in frame_payloads]
-        native_pipeline_samples = _native_pipeline_samples(normalized_frame_payloads)
+        frame_journal_payloads = [dict(frame_payload) for frame_payload in frame_payloads]
+        frame_action_payloads = [
+            _frame_action_entry(frame_payload) for frame_payload in frame_journal_payloads
+        ]
+        video_frame_payloads = [
+            _video_frame_entry(frame_payload) for frame_payload in frame_journal_payloads
+        ]
+        native_pipeline_samples = _native_pipeline_samples(video_frame_payloads)
         transport_stats = {
             "vision": _delta_transport_stats(
                 self.vision_transport_tracker.snapshot(),
@@ -1345,7 +1348,7 @@ class BlackboxRecorder:
         native_capture_stats = _native_capture_timing_summary(native_pipeline_samples)
 
         session_start_timestamp_ns, session_end_timestamp_ns = _session_data_window_ns(
-            frame_payloads=normalized_frame_payloads,
+            frame_payloads=video_frame_payloads,
             action_payloads=action_payloads,
             created_timestamp_ns=self._session_created_timestamp_ns,
         )
@@ -1355,6 +1358,7 @@ class BlackboxRecorder:
             session_end_timestamp_ns=session_end_timestamp_ns,
             grace_window_ns=INTEGRITY_EDGE_GRACE_NS,
         )
+        finalized_timestamp_ns = time.time_ns()
 
         capture_session = dict(self._session_capture_metadata)
         capture_session.setdefault("capture_source", None)
@@ -1364,24 +1368,27 @@ class BlackboxRecorder:
         capture_session.setdefault("frame_height", int(self.session_config.height))
         capture_session.setdefault("frame_channels", 3)
         capture_session.setdefault("frame_dtype", "uint8")
-        return {
+        shared_session = {
+            "session_timestamp": self.paths.session_timestamp,
+            "created_timestamp_ns": int(self._session_created_timestamp_ns),
+            "finalized_timestamp_ns": int(finalized_timestamp_ns),
+            "timeline_start_timestamp_ns": int(session_start_timestamp_ns),
+            "timeline_end_timestamp_ns": int(session_end_timestamp_ns),
+        }
+        video_manifest = {
             "schema_version": SCHEMA_VERSION,
+            "kind": VIDEO_METADATA_KIND,
+            "clip_id": self.paths.clip_id,
+            "actions_file": ACTIONS_METADATA_FILE_NAME,
             "session": {
-                "session_timestamp": self.paths.session_timestamp,
-                "created_timestamp_ns": int(self._session_created_timestamp_ns),
-                "finalized_timestamp_ns": time.time_ns(),
-                "timeline_start_timestamp_ns": int(session_start_timestamp_ns),
-                "timeline_end_timestamp_ns": int(session_end_timestamp_ns),
-                "frame_count": int(len(normalized_frame_payloads)),
-                "action_count": int(len(action_payloads)),
+                **shared_session,
+                "frame_count": int(len(video_frame_payloads)),
                 "frame_channel": self.vision_channel.name,
                 "frame_topic": self.vision_channel.topic.decode("utf-8"),
-                "action_channel": self.action_channel.name,
-                "action_topic": self.action_channel.topic.decode("utf-8"),
             },
             "capture_session": capture_session,
             "video_session": {
-                "file_name": self.paths.video_path.name,
+                "file_name": VIDEO_FILE_NAME,
                 "codec": VIDEO_CODEC,
                 "container": VIDEO_CONTAINER,
                 "pixel_format": VIDEO_PIXEL_FORMAT,
@@ -1389,14 +1396,8 @@ class BlackboxRecorder:
                 "encoded_height": int(self.session_config.height),
                 "nominal_fps": float(self.session_config.nominal_fps),
             },
-            "input_session": {
-                "input_nominal_hz": INPUT_NOMINAL_HZ,
-                "record_hotkey": BLACKBOX_RECORD_HOTKEY,
-                "input_mapping_version": INPUT_MAPPING_VERSION,
-                "active_devices_seen": _active_devices_seen(action_payloads),
-            },
             "session_integrity": _session_integrity_payload(
-                frame_payloads=normalized_frame_payloads,
+                frame_payloads=video_frame_payloads,
                 drop_events=drop_events,
                 ignored_drop_events=ignored_drop_events,
                 edge_grace_window_seconds=INTEGRITY_EDGE_GRACE_SECONDS,
@@ -1408,9 +1409,30 @@ class BlackboxRecorder:
             "drop_events": drop_events,
             "ignored_drop_events": ignored_drop_events,
             "session_events": list(self._session_events),
-            "frames": normalized_frame_payloads,
+            "frames": video_frame_payloads,
+        }
+        actions_manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": ACTIONS_METADATA_KIND,
+            "clip_id": self.paths.clip_id,
+            "metadata_file": VIDEO_METADATA_FILE_NAME,
+            "session": {
+                **shared_session,
+                "action_count": int(len(action_payloads)),
+                "frame_action_count": int(len(frame_action_payloads)),
+                "action_channel": self.action_channel.name,
+                "action_topic": self.action_channel.topic.decode("utf-8"),
+            },
+            "input_session": {
+                "input_nominal_hz": INPUT_NOMINAL_HZ,
+                "record_hotkey": BLACKBOX_RECORD_HOTKEY,
+                "input_mapping_version": INPUT_MAPPING_VERSION,
+                "active_devices_seen": _active_devices_seen(action_payloads),
+            },
+            "frame_actions": frame_action_payloads,
             "actions": action_payloads,
         }
+        return video_manifest, actions_manifest
 
     def stop_session(self) -> None:
         if not self._session_active() or self.session_writer is None or self.paths is None:
@@ -1421,14 +1443,18 @@ class BlackboxRecorder:
             writer_stats = writer.close()
             frame_payloads = _read_jsonl(self.paths.frames_journal_path)
             action_payloads = _read_jsonl(self.paths.actions_journal_path)
-            manifest = self._final_manifest_payload(
+            video_manifest, actions_manifest = self._final_session_payloads(
                 frame_payloads=frame_payloads,
                 action_payloads=action_payloads,
                 writer_stats=writer_stats,
                 writer_drop_events=writer.drop_events,
             )
             self.paths.metadata_path.write_text(
-                json.dumps(manifest, indent=2),
+                json.dumps(video_manifest, indent=2),
+                encoding="utf-8",
+            )
+            self.paths.actions_path.write_text(
+                json.dumps(actions_manifest, indent=2),
                 encoding="utf-8",
             )
         finally:

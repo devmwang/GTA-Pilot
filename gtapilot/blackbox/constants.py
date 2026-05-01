@@ -3,13 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 
 DEFAULT_OUTPUT_DIR = Path("blackbox-recordings")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+VIDEO_METADATA_KIND = "video_metadata"
+ACTIONS_METADATA_KIND = "actions"
 VIDEO_CODEC = "libx264"
 VIDEO_CONTAINER = "matroska"
 VIDEO_FILE_SUFFIX = ".mkv"
 VIDEO_PIXEL_FORMAT = "yuv420p"
 VIDEO_PRESET = "veryfast"
 VIDEO_CRF = 18
+VIDEO_FILE_NAME = f"video{VIDEO_FILE_SUFFIX}"
+VIDEO_METADATA_FILE_NAME = "metadata.json"
+ACTIONS_METADATA_FILE_NAME = "actions.json"
+PRIVILEGED_DIR_NAME = "privileged"
+BACKUPS_DIR_NAME = "backups"
+FRAMES_JOURNAL_FILE_NAME = "frames.tmp.jsonl"
+ACTIONS_JOURNAL_FILE_NAME = "actions.tmp.jsonl"
 INTEGRITY_EDGE_GRACE_SECONDS = 5.0
 INTEGRITY_EDGE_GRACE_NS = int(INTEGRITY_EDGE_GRACE_SECONDS * 1_000_000_000)
 INPUT_NOMINAL_HZ = 60.0

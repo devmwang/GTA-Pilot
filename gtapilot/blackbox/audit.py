@@ -5,6 +5,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from gtapilot.blackbox.constants import (
+    ACTIONS_METADATA_FILE_NAME,
+    ACTIONS_METADATA_KIND,
+    SCHEMA_VERSION,
+    VIDEO_METADATA_KIND,
+)
 
 TIMING_KEYS = (
     ("frame_arrival_wait_ns", "native_frame_arrival_wait_ms"),
@@ -124,6 +130,31 @@ def _format_ms(summary: dict[str, float]) -> str:
     )
 
 
+def _load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_manifests(metadata_path: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    video_manifest = _load_json(metadata_path)
+    if int(video_manifest.get("schema_version", 0)) != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported blackbox manifest schema: {metadata_path}")
+    if str(video_manifest.get("kind")) != VIDEO_METADATA_KIND:
+        raise ValueError(f"Unsupported video metadata kind: {metadata_path}")
+    actions_path = metadata_path.parent / str(
+        video_manifest.get("actions_file", ACTIONS_METADATA_FILE_NAME)
+    )
+    if not actions_path.exists():
+        raise FileNotFoundError(f"Actions metadata not found: {actions_path}")
+    actions_manifest = _load_json(actions_path)
+    if int(actions_manifest.get("schema_version", 0)) != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported actions manifest schema: {actions_path}")
+    if str(actions_manifest.get("kind")) != ACTIONS_METADATA_KIND:
+        raise ValueError(f"Unsupported actions metadata kind: {actions_path}")
+    if str(actions_manifest.get("clip_id", "")) != str(video_manifest.get("clip_id", "")):
+        raise ValueError(f"Actions/video clip_id mismatch: {actions_path}")
+    return video_manifest, actions_manifest, actions_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Audit blackbox clip integrity and cadence from capture metadata.",
@@ -132,16 +163,16 @@ def main() -> None:
     args = parser.parse_args()
 
     metadata_path = Path(args.metadata_path).resolve()
-    manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if int(manifest.get("schema_version", 0)) != 2:
-        raise ValueError(f"Unsupported blackbox manifest schema: {metadata_path}")
-
-    session = dict(manifest.get("session", {}))
-    session_integrity = dict(manifest.get("session_integrity", {}))
-    capture_session = dict(manifest.get("capture_session", {}))
-    native_capture_stats = dict(manifest.get("native_capture_stats", {}))
-    native_pipeline_samples = list(manifest.get("native_pipeline_samples", []))
-    frames = list(manifest.get("frames", []))
+    video_manifest, actions_manifest, actions_path = _load_manifests(metadata_path)
+    session = dict(video_manifest.get("session", {}))
+    session_integrity = dict(video_manifest.get("session_integrity", {}))
+    capture_session = dict(video_manifest.get("capture_session", {}))
+    native_capture_stats = dict(video_manifest.get("native_capture_stats", {}))
+    native_pipeline_samples = list(video_manifest.get("native_pipeline_samples", []))
+    frames = list(video_manifest.get("frames", []))
+    action_session = dict(actions_manifest.get("session", {}))
+    action_entries = list(actions_manifest.get("actions", []))
+    frame_actions = list(actions_manifest.get("frame_actions", []))
 
     frame_ids = [
         int(frame.get("frame_id", -1))
@@ -177,11 +208,10 @@ def main() -> None:
     writer_lag = _summary_ms(writer_lag_ns)
 
     print(f"metadata_path={metadata_path}")
-    print(f"schema_version={manifest.get('schema_version')}")
-    print(
-        "session_integrity_status="
-        f"{session_integrity.get('status', 'unknown')}"
-    )
+    print(f"actions_path={actions_path}")
+    print(f"schema_version={video_manifest.get('schema_version')}")
+    print(f"clip_id={video_manifest.get('clip_id')}")
+    print(f"session_integrity_status={session_integrity.get('status', 'unknown')}")
     print(
         "session_integrity_ignored_drop_event_count="
         f"{int(session_integrity.get('ignored_drop_event_count', 0))}"
@@ -191,7 +221,8 @@ def main() -> None:
         f"{float(session_integrity.get('edge_grace_window_seconds', 0.0)):.1f}"
     )
     print(f"frame_count={int(session.get('frame_count', len(frames)))}")
-    print(f"action_count={int(session.get('action_count', len(manifest.get('actions', []))))}")
+    print(f"action_count={int(action_session.get('action_count', len(action_entries)))}")
+    print(f"frame_action_count={int(action_session.get('frame_action_count', len(frame_actions)))}")
     print(f"repeat_frame_count={repeat_frame_count}")
     print(f"published_dt_ms={_format_ms(published_dt)}")
     print(f"fresh_capture_dt_ms={_format_ms(fresh_dt)}")
@@ -212,26 +243,18 @@ def main() -> None:
         print(f"{metric_name}={_format_ms(native_timing_summary[metric_name])}")
     print(
         "vision_transport="
-        + json.dumps(dict((manifest.get("transport_stats") or {}).get("vision", {})), sort_keys=True)
+        + json.dumps(dict((video_manifest.get("transport_stats") or {}).get("vision", {})), sort_keys=True)
     )
     print(
         "action_transport="
-        + json.dumps(dict((manifest.get("transport_stats") or {}).get("actions", {})), sort_keys=True)
+        + json.dumps(dict((video_manifest.get("transport_stats") or {}).get("actions", {})), sort_keys=True)
     )
-    print(
-        "writer_stats=" + json.dumps(dict(manifest.get("writer_stats", {})), sort_keys=True)
-    )
-    print(
-        "native_capture_stats="
-        + json.dumps(native_capture_stats, sort_keys=True)
-    )
-    print(
-        "capture_session="
-        + json.dumps(capture_session, sort_keys=True)
-    )
-    print(f"drop_event_count={len(manifest.get('drop_events', []))}")
-    print(f"ignored_drop_event_count={len(manifest.get('ignored_drop_events', []))}")
-    print(f"session_event_count={len(manifest.get('session_events', []))}")
+    print("writer_stats=" + json.dumps(dict(video_manifest.get("writer_stats", {})), sort_keys=True))
+    print("native_capture_stats=" + json.dumps(native_capture_stats, sort_keys=True))
+    print("capture_session=" + json.dumps(capture_session, sort_keys=True))
+    print(f"drop_event_count={len(video_manifest.get('drop_events', []))}")
+    print(f"ignored_drop_event_count={len(video_manifest.get('ignored_drop_events', []))}")
+    print(f"session_event_count={len(video_manifest.get('session_events', []))}")
 
 
 if __name__ == "__main__":
